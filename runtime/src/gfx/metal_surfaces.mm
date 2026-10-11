@@ -1,3 +1,4 @@
+#include <chrono>
 #include "gfx/render_mips.h"
 #include "mods/cemu_pack.h"
 #include <tuple>
@@ -718,15 +719,45 @@ static void check_texture(Surface* s) {
 }
 
 // ---------------------------------------------------------------- upload (detile + convert)
-static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<uint8_t>& out, uint32_t& outW,
-                         uint32_t& outH, uint32_t& outSlices) {
+// 2D thin macro tiles (most textures): Cemu's fast path (AddrLibFastDecode.h): one address per 8x8
+// micro tile, the elements by the micro tile's pixel index table; a micro tile larger than the
+// 256-byte pipe interleave has its group bits moved up past the pipe and bank bits. EB = bytes per
+// element, so each copy is one load and store. Writes rows of `rowStride` bytes.
+template <uint32_t EB>
+static void fast_tiles(const uint8_t* src, LatteAddrLib::CachedSurfaceAddrInfo& ci, uint32_t fullX, uint32_t fullY,
+                       uint8_t* dst, size_t rowStride) {
+    const uint16_t* table = ci.microTilePixelIndexTable + ((ci.slice & 7) << 6);
+    constexpr bool split = EB * 64 > 256;
+    for (uint32_t yt = 0; yt < fullY; yt += 8)
+        for (uint32_t xt = 0; xt < fullX; xt += 8) {
+            const uint32_t tileBase = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached_tm04_sample1(xt, yt, &ci);
+            for (uint32_t ry = 0; ry < 8; ry++) {
+                uint8_t* to = dst + (size_t)(yt + ry) * rowStride + (size_t)xt * EB;
+                const uint16_t* idx = table + (ry << 3);
+                for (uint32_t rx = 0; rx < 8; rx++, to += EB) {
+                    uint32_t e = idx[rx] * EB;
+                    if (split) e = (e & 0xFF) | ((e & ~0xFFu) << 3);
+                    memcpy(to, src + tileBase + e, EB);
+                }
+            }
+        }
+}
+
+// the level's size on the host: blocks across and down, slices
+static void level_dims(Surface* s, uint32_t level, uint32_t& w, uint32_t& h, uint32_t& slices, uint32_t& bw, uint32_t& bh) {
     const FormatInfo& f = s->fmt;
-    uint32_t w = std::max(s->width >> level, 1u), h = std::max(s->height >> level, 1u);
-    uint32_t slices = s->dim == (uint32_t)Latte::E_DIM::DIM_3D ? std::max(s->slices >> level, 1u) : s->slices;
-    uint32_t bw = f.compressed ? (w + 3) / 4 : w, bh = f.compressed ? (h + 3) / 4 : h;
-    outW = w;
-    outH = h;
-    outSlices = slices;
+    w = std::max(s->width >> level, 1u);
+    h = std::max(s->height >> level, 1u);
+    slices = s->dim == (uint32_t)Latte::E_DIM::DIM_3D ? std::max(s->slices >> level, 1u) : s->slices;
+    bw = f.compressed ? (w + 3) / 4 : w;
+    bh = f.compressed ? (h + 3) / 4 : h;
+}
+
+// detile and convert one level into `out` (bw * bh * slices * hostBytesPerBlock bytes)
+static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out) {
+    const FormatInfo& f = s->fmt;
+    uint32_t w, h, slices, bw, bh;
+    level_dims(s, level, w, h, slices, bw, bh);
 
     // level geometry from the address library
     LatteAddrLib::AddrSurfaceInfo_OUT info{};
@@ -738,29 +769,75 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<
     uint32_t bpp = f.bytesPerBlock * 8;
     uint32_t pipeSwizzle = (s->swizzle >> 8) & 1, bankSwizzle = (s->swizzle >> 9) & 3;
     // small mips of macro-tiled surfaces drop the swizzle
-    out.assign((size_t)bw * bh * slices * f.hostBytesPerBlock, 0);
-    std::vector<uint8_t> row(bw * f.bytesPerBlock);
     const uint8_t* src = mem::ptr(base);
+    const uint32_t eb = f.bytesPerBlock;
+    // without a conversion the guest bytes are the host bytes: detile straight into the output
+    const bool direct = f.convert == Convert::NONE && f.hostBytesPerBlock == eb;
+    static thread_local std::vector<uint8_t> lin, check;  // one slice, guest format, row-major
+    if (!direct) lin.resize((size_t)bw * bh * eb);
+    static const bool verify = getenv("WWHD_VERIFY_DETILE") != nullptr;
     for (uint32_t z = 0; z < slices; z++) {
+        uint8_t* slice = direct ? out + (size_t)z * bw * bh * eb : lin.data();
+        const size_t rowStride = (size_t)bw * eb;
         LatteAddrLib::CachedSurfaceAddrInfo ci;
         bool macro = Latte::TM_IsMacroTiled(tm);
         if (macro)
             LatteAddrLib::SetupCachedSurfaceAddrInfo(&ci, z, 0, bpp, pitch, height, slices, 1, tm, false, pipeSwizzle, bankSwizzle);
-        for (uint32_t y = 0; y < bh; y++) {
-            for (uint32_t x = 0; x < bw; x++) {
-                uint32_t off;
-                if (tm == Latte::E_HWTILEMODE::TM_LINEAR_GENERAL || tm == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
-                    off = LatteAddrLib::ComputeSurfaceAddrFromCoordLinear(x, y, z, 0, bpp, pitch, height, slices);
-                else if (!macro)
-                    off = LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x, y, z, bpp, pitch, height, tm, false);
-                else
-                    off = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached(x, y, &ci);
-                memcpy(&row[x * f.bytesPerBlock], src + off, f.bytesPerBlock);
+        // the per-block reference: any tile mode, any position
+        auto slow = [&](uint32_t x, uint32_t y, uint8_t* to) {
+            uint32_t off;
+            if (tm == Latte::E_HWTILEMODE::TM_LINEAR_GENERAL || tm == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
+                off = LatteAddrLib::ComputeSurfaceAddrFromCoordLinear(x, y, z, 0, bpp, pitch, height, slices);
+            else if (!macro)
+                off = LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x, y, z, bpp, pitch, height, tm, false);
+            else
+                off = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached(x, y, &ci);
+            memcpy(to, src + off, eb);
+        };
+        bool fast = tm == Latte::E_HWTILEMODE::TM_2D_TILED_THIN1;
+        uint32_t fullX = fast ? bw & ~7u : 0, fullY = fast ? bh & ~7u : 0;
+        if (fast && fullX && fullY) {
+            switch (eb) {
+            case 1: fast_tiles<1>(src, ci, fullX, fullY, slice, rowStride); break;
+            case 2: fast_tiles<2>(src, ci, fullX, fullY, slice, rowStride); break;
+            case 4: fast_tiles<4>(src, ci, fullX, fullY, slice, rowStride); break;
+            case 8: fast_tiles<8>(src, ci, fullX, fullY, slice, rowStride); break;
+            case 16: fast_tiles<16>(src, ci, fullX, fullY, slice, rowStride); break;
+            default: fullX = fullY = 0; break;
             }
-            uint8_t* dst = &out[((size_t)z * bh + y) * bw * f.hostBytesPerBlock];
-            if (f.convert == Convert::NONE) memcpy(dst, row.data(), row.size());
-            else convert_row(f.convert, row.data(), dst, bw);
+        } else {
+            fullX = fullY = 0;
         }
+        // what the fast path didn't cover (edges, other tile modes): per block
+        for (uint32_t y = 0; y < bh; y++)
+            for (uint32_t x = (y < fullY ? fullX : 0); x < bw; x++) slow(x, y, slice + (size_t)y * rowStride + (size_t)x * eb);
+        if (verify && fullX && fullY) {  // debug: the fast path must match the reference exactly
+            check.resize((size_t)bw * bh * eb);
+            for (uint32_t y = 0; y < bh; y++)
+                for (uint32_t x = 0; x < bw; x++) slow(x, y, &check[(size_t)y * rowStride + (size_t)x * eb]);
+            static int bad = 0, good = 0;
+            if (memcmp(slice, check.data(), check.size())) {
+                // the game may be writing this memory right now (streamed texture arrays): decode the
+                // reference again; if it moved too, the difference is the race, not the fast path
+                static thread_local std::vector<uint8_t> again;
+                again.resize(check.size());
+                for (uint32_t y = 0; y < bh; y++)
+                    for (uint32_t x = 0; x < bw; x++) slow(x, y, &again[(size_t)y * rowStride + (size_t)x * eb]);
+                const bool moved = memcmp(again.data(), check.data(), check.size()) != 0;
+                if (bad++ < 20)
+                    LOG("[detile] %s %08X %ux%u fmt %X bpp %u level size %ux%u slice %u", moved ? "memory changed while checking (not a decode error)" : "MISMATCH",
+                        s->addr, s->width, s->height, s->format, bpp, bw, bh, z);
+            } else if (good++ < 5 || good % 500 == 0) {
+                LOG("[detile] ok (%d checked) %ux%u bpp %u", good, bw, bh, bpp);
+            }
+        }
+        if (!direct)
+            for (uint32_t y = 0; y < bh; y++) {
+                const uint8_t* row = &lin[(size_t)y * rowStride];
+                uint8_t* dst = out + ((size_t)z * bh + y) * bw * f.hostBytesPerBlock;
+                if (f.convert == Convert::NONE) memcpy(dst, row, rowStride);
+                else convert_row(f.convert, row, dst, bw);
+            }
     }
 }
 
@@ -789,32 +866,42 @@ static uint64_t content_hash(Surface* s) {
     return h;
 }
 
+// time spent in uploads (render thread), reported with the texture statistics
+double g_stat_hash_ms, g_stat_decode_ms;
+uint64_t g_stat_pass_splits;
+static double ms_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
 void upload_surface(Surface* s) {
     if (!s->tex || s->gpuWritten) return;
     const FormatInfo& f = s->fmt;
     const auto& ranges = level_ranges(s);
+    const double t0 = ms_now();
     uint64_t hash = content_hash(s);
+    g_stat_hash_ms += ms_now() - t0;
     if (hash == s->contentHash && s->writeSeq) return;
     s->contentHash = hash;
     s->writeSeq = next_write_seq();  // fresh CPU data is now the newest version of this memory
     g_stat_uploads++;
 
-    std::vector<uint8_t> data;
-    id<MTLBuffer> staging = nil;
+    if (R.enc) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
     end_encoder();
+    const double t1 = ms_now();
     id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
     for (uint32_t level = 0; level < ranges.size(); level++) {
         uint32_t base = ranges[level].first;
-        uint32_t w, h, slices;
-        decode_level(s, level, base, data, w, h, slices);
-        uint32_t bw = f.compressed ? (w + 3) / 4 : w, bh = f.compressed ? (h + 3) / 4 : h;
-        staging = [R.device newBufferWithBytes:data.data() length:data.size() options:MTLResourceStorageModeShared];
+        uint32_t w, h, slices, bw, bh;
+        level_dims(s, level, w, h, slices, bw, bh);
+        // decode straight into upload-pool memory the blit reads (no temporary copy, no new buffer)
+        uint32_t stagingOffset = 0;
+        uint8_t* dst = nullptr;
+        id<MTLBuffer> staging = upload_reserve((uint32_t)((size_t)bw * bh * slices * f.hostBytesPerBlock), &stagingOffset, &dst);
+        decode_level(s, level, base, dst);
         bool is3D = s->tex.textureType == MTLTextureType3D;
         uint32_t layers = is3D ? 1 : (s->tex.textureType == MTLTextureTypeCube ? 6 : (uint32_t)s->tex.arrayLength);
         uint32_t perSlice = bw * bh * f.hostBytesPerBlock;
         for (uint32_t z = 0; z < (is3D ? 1 : std::min(slices, layers)); z++) {
             [blit copyFromBuffer:staging
-                     sourceOffset:(NSUInteger)z * perSlice
+                     sourceOffset:stagingOffset + (NSUInteger)z * perSlice
                 sourceBytesPerRow:bw * f.hostBytesPerBlock
               sourceBytesPerImage:perSlice
                        sourceSize:MTLSizeMake(f.compressed ? bw * 4 : w, f.compressed ? bh * 4 : h, is3D ? slices : 1)
@@ -825,6 +912,7 @@ void upload_surface(Surface* s) {
         }
     }
     [blit endEncoding];
+    g_stat_decode_ms += ms_now() - t1;
 }
 
 // ---------------------------------------------------------------- GX2CopySurface

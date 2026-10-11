@@ -139,7 +139,7 @@ static id<MTLBuffer> g_pool_cur = nil;
 static uint32_t g_pool_pos = 0;
 constexpr uint32_t kPoolChunk = 8 << 20;
 
-static Upload upload(const void* data, uint32_t size) {
+static Upload reserve(uint32_t size) {
     size = (size + 255) & ~255u;
     if (!g_pool_cur || g_pool_pos + size > g_pool_cur.length) {
         std::lock_guard<std::mutex> lk(g_pool_mutex);
@@ -156,10 +156,22 @@ static Upload upload(const void* data, uint32_t size) {
         g_pool_pos = 0;
     }
     Upload u{g_pool_cur, g_pool_pos};
-    memcpy((uint8_t*)g_pool_cur.contents + g_pool_pos, data, size);
     rprof::add_upload(size);
     g_pool_pos += size;
     return u;
+}
+static Upload upload(const void* data, uint32_t size) {
+    Upload u = reserve(size);
+    memcpy((uint8_t*)u.buf.contents + u.offset, data, size);
+    return u;
+}
+// staging space the caller fills itself (texture uploads decode straight into it); recycled with the
+// command buffer like upload()'s
+id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr) {
+    Upload u = reserve(size);
+    *offset = u.offset;
+    *ptr = (uint8_t*)u.buf.contents + u.offset;
+    return u.buf;
 }
 
 // called before a command buffer commits: buffers used so far are recycled when it completes
@@ -1661,6 +1673,12 @@ void report_skips() {
     extern uint64_t g_stat_hashed_bytes;
     uint64_t faults, protectedPages;
     wwatch::take_stats(faults, protectedPages);
+    extern double g_stat_hash_ms, g_stat_decode_ms;
+    extern uint64_t g_stat_pass_splits;
+    LOG("[gfx] last 300 frames: texture hash %.0f ms, decode+upload %.0f ms, render passes split by uploads %llu",
+        g_stat_hash_ms, g_stat_decode_ms, (unsigned long long)g_stat_pass_splits);
+    g_stat_hash_ms = g_stat_decode_ms = 0;
+    g_stat_pass_splits = 0;
     LOG("[gfx] last 300 frames: %llu full texture checks (%.1f MiB hashed), %llu uploads, %llu invalidates marking %llu surfaces, "
         "%llu texture page write faults, %llu pages protected",
         (unsigned long long)g_stat_full_checks, g_stat_hashed_bytes / 1048576.0, (unsigned long long)g_stat_uploads,

@@ -20,6 +20,8 @@ void peek_z(const uint32_t*, uint32_t);
 // surfaces sharing a 4 KiB page with the range (metal_main.mm); surfaces are never removed
 struct Surface;
 void note_surface_range(Surface* s, uint32_t addr, uint32_t size);
+// staging memory from the upload pool (metal_draw.mm), filled by the caller
+id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr);
 
 struct Surface {
     std::shared_ptr<Surface> mipChain; // sampled companion assembled from GPU-rendered levels
