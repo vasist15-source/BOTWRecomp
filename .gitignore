@@ -1,0 +1,5 @@
+# generated from the user's own game dump; never commit
+build/
+# upstream reference checkouts
+ref/
+.DS_Store

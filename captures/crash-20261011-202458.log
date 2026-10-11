@@ -1,0 +1,103 @@
+
+CRASH: signal 10 at guest address 00000000
+  host pc 0x10ed304ec in wwhd+0xaa144ec (base 0x10431c000) [f_03F92140+0xb8] [game function 03F92140+0xb8]
+  module: ~/botw-mac/build/rt/wwhd
+  guest lr=03F92160 ctr=00000000 cr=40000000
+  r0  03F76884 302E21B8 10008000 00000000 12A700E4 00000003 000000F8 00000004
+  r8  10BF1E60 12A700D4 00000001 302E21D0 FFFFFF80 105E31C0 00000000 00000000
+  r16 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  r24 00000000 00000000 00000000 103337D0 10BEEEB8 12A74C50 12A74C98 12A74C50
+  guest call chain: 03F76884 03800AEC 03800C7C 037D7EEC 030BCB6C 030BBEE0 00000000 00000000
+  host backtrace:
+  #0  0x10432fce8 in wwhd+0x13ce8 (base 0x10431c000) [_ZN10crash_addr14host_backtraceEiPFviPKcmEPKv+0x54]
+  #1  0x10438d7fc in wwhd+0x717fc (base 0x10431c000) [_ZL13crash_handleriP9__siginfoPv+0x1ac]
+  #2  0x1889c8144 in libsystem_platform.dylib+0x4144 (base 0x1889c4000) [_sigtramp+0x38]
+  #3  0x10ed304dc in wwhd+0xaa144dc (base 0x10431c000) [f_03F92140+0xa8] [game function 03F92140+0xa8]
+  #4  0x10ed2e9e4 in wwhd+0xaa129e4 (base 0x10431c000) [f_03F76874+0x80] [game function 03F76874+0x80]
+  #5  0x10b97767c in wwhd+0x765b67c (base 0x10431c000) [f_03800A60+0x280] [game function 03800A60+0x280]
+  #6  0x10b977dc0 in wwhd+0x765bdc0 (base 0x10431c000) [f_03800B08+0x68c] [game function 03800B08+0x68c]
+  #7  0x10b8c845c in wwhd+0x75ac45c (base 0x10431c000) [f_037D7E54+0x228] [game function 037D7E54+0x228]
+  #8  0x10978c9e0 in wwhd+0x54709e0 (base 0x10431c000) [f_030BCB24+0x178] [game function 030BCB24+0x178]
+  #9  0x109788994 in wwhd+0x546c994 (base 0x10431c000) [f_030BBEA8+0x110] [game function 030BBEA8+0x110]
+  #10 0x1043298b0 in wwhd+0xd8b0 (base 0x10431c000) [_Z10guest_callP3CpujSt16initializer_listIjE+0xbc]
+  #11 0x1044ca88c in wwhd+0x1ae88c (base 0x10431c000) [_ZL11thread_mainPv+0x188]
+  #12 0x1889bdd00 in libsystem_pthread.dylib+0x6d00 (base 0x1889b7000) [_pthread_start+0x88]
+  #13 0x1889b8cec in libsystem_pthread.dylib+0x1cec (base 0x1889b7000) [thread_start+0x8]
+
+--- crash context (startup) ---
+WWHD_INSTALL_DIR=~/botw-mac/build
+WWHD_VK_REUSE_UNIFORM_SNAPSHOTS=1
+WWHD_VK_REUSE_FEEDBACK_IMAGES=1
+WWHD_VK_SKIP_REDUNDANT_BINDS=1
+WWHD_VK_DESCRIPTOR_RANKS=1
+WWHD_VK_PIPELINE_LOOKASIDE=1
+WWHD_VK_SHADER_ADDRESS_MEMO=1
+WWHD_VK_FETCH_MEMO=1
+WWHD_VK_SPECIALIZE_INDICES=1
+WWHD_VK_SHADER_STATE_MEMO=1
+WWHD_VK_SKIP_VERTEX_BINDS=1
+WWHD_VK_SAMPLER_MEMO=1
+WWHD_VK_SPARSE_HASH_MEMO=1
+WWHD_VK_SHADER_KEY_DIRTY=<redacted>
+WWHD_VK_REUSE_VERTEX_SNAPSHOTS=1
+WWHD_VK_VERTEX_HISTORY_REUSE=1
+crash recovery: off
+
+--- last log lines ---
+[true60] groups: loco,camera,sword
+[boot] Wind Waker HD dev (unknown), macOS 27.0.1 (26A434)
+[gfx] renderer: Metal (default)
+[mods] direct right-stick camera off
+[mods] mouse camera off
+[mods] first person on R3 / mouse wheel off
+[climb] climb any wall off
+[mods] quick doors off
+[mods] run/swim speed off
+[mods] fast scene changes off
+[mods] camera speed x1.00
+[mods] mouse sensitivity 0.150 degrees per point
+[boot] loaded ~/Hermes/Wii U ROM/The Legend of Zelda Breath of the Wild [Update] [0005000e101c9400]/code/U-King.rpx (USA build, title 00050000101C9400): entry 03C70404 sda 105E31C0 sda2 10008000 data end 105DB1CC
+[mem] default heap 105DC000-50000000
+[interp] display refresh rate 60 Hz: frame interpolation draws up to 60 fps
+[display] TV window starts windowed (as it was left)
+[gfx] Metal device: Apple M4
+[gfx] Metal renderer started
+[thread] start "" core 1 prio 16 affinity 2
+[gfx] internal resolution 1x
+[gfx] ambient occlusion mode 2
+[gfx] full-size occlusion depth on
+[gfx] anisotropic filtering off
+[gfx] edge smoothing (FXAA) off
+[true60] game logic at 60 steps/s off
+[game] 0000002d
+[mem] OSGetMemBound(2) -> 105DC000 size 3FA24000 lr=02C5E674
+[mem] overlay arena enabled: A0000000 size 1C000000 lr=030AA6D8
+[gx2] initialized (native GX2 -> Metal)
+[gx2] TV buffer format 1A
+[hle] unimplemented gx2.GX2SetEventCallback(00000002, 031FA1D8, 00000000, 00000500) lr=031FA258
+[hle] unimplemented gx2.GX2SetEventCallback(00000003, 031FA1F0, 00000000, 00000500) lr=031FA26C
+[thread] start "Prepare Thread" core 1 prio 20 affinity 2
+[hle] unimplemented coreinit.OSGetShutdownReason(105586C8, 00000002, 00000000, 00000003) lr=02C4C00C
+[hle] unimplemented gx2.GX2SetGPUFence(1046D420, FFFFFFFF, 00000006, 00000002) lr=031FAB04
+[thread] start "SoundCalcThread" core 1 prio 16 affinity 2
+[hle] unimplemented coreinit.MCP_Open(10A13228, 4BBDBEF0, 00000140, 00000000) lr=03C706E0
+[hle] unimplemented coreinit.MCP_GetSysProdSettings(00000000, 10A13180, 00000140, 00000000) lr=03C70748
+[hle] unimplemented coreinit.MCP_Close(00000000, 10A13180, 00000140, 00000000) lr=03C707A4
+[config] no content/Common/Pack in ~/Hermes/Wii U ROM/The Legend of Zelda Breath of the Wild [Update] [0005000e101c9400]: the game's languages are unknown, all are offered
+[hle] unimplemented coreinit.OSGetShutdownReason(00003F38, 10A1110C, 00000002, 00003F38) lr=02C4C00C
+[hle] unimplemented gx2.GX2SetGPUFence(1046D420, FFFFFFFF, 00000006, 00000002) lr=031FAB04
+[hle] unimplemented coreinit.__tls_get_addr(1045CC14, 12A6FFB4, 00000003, 000000FC) lr=03F8AA88
+[thread] start "WorkerMgr/Worker1(Any)" core 0 prio 16 affinity 1
+[thread] start "WorkerMgr/Worker2(Any)" core 2 prio 16 affinity 4
+[thread] start "DecompThread" core 2 prio 19 affinity 4
+[thread] start "OverlayArena Prepare" core 1 prio 17 affinity 2
+[thread] start "Resource Loading" core 2 prio 19 affinity 4
+[thread] start "Resource Control" core 0 prio 20 affinity 1
+[thread] start "MovableMemory" core 0 prio 20 affinity 1
+[thread] start "Resource Memory" core 0 prio 20 affinity 1
+[thread] start "res::Compaction" core 0 prio 20 affinity 1
+[hle] unimplemented coreinit.OSPeekMessage(302D7F7C, 600FF070, 00000002, 302F9AF0) lr=030DED1C
+[hle] unimplemented coreinit.OSPeekMessage(302D7F7C, 600FF070, 00000002, 302F9AF0) lr=030DED1C
+[hle] unimplemented coreinit.OSPeekMessage(302D7F7C, 600FF070, 00000002, 302F9AF0) lr=030DED1C
+[hle] unimplemented coreinit.__tls_get_addr(1045CC14, 12A700E4, 00000003, 000000F8) lr=03F8AA88
+[hle] unimplemented coreinit.__tls_get_addr(1045CC14, 12A700E4, 00000003, 000000F8) lr=03F92160
