@@ -64,3 +64,33 @@ GX2SetGPUFence, GX2SetEventCallback, nn_aoc (DLC list), nn_nfp (amiibo), OSGetTh
   The "Nintendo presents" intro plays, then the Shrine of Resurrection with Zelda's voice, and **Link
   renders**. About 290 draws/frame. Missing: music/SFX (only voice plays), plus the base-instance /
   query / depth-only GX2 calls above.
+
+## Audio investigation (parked 2026-10-11)
+Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
+Menu cursor sounds untested.
+- Cemu reference log (`build/cemu_audio.log`, Audio API + PPC context): setup calls are identical to
+  ours; Cemu then calls `AXSetAuxReturnVolume` + `AXRegisterAuxCallback(..., 03C1D838)` from
+  LR 03C1DE5C (f_03C1DCE4) ~1.5 s after AXInit, and acquires voices from the AX frame callback.
+- That code is the handler `03C1EB34` of aal command channels at 105983B0 / 10598870 (two
+  OSMessageQueues each, consumer `03C1525C`). In ours nothing is ever submitted to them.
+- Submit to 10598870 is `03C1942C`, called each frame from `03BE6920` only if
+  `ld32(foundation+0x890)` (here 3DC11910, holder 3DC1190C) is non-null. It is always null; a
+  hardware watchpoint shows nothing ever writes it. The only static setter found (`03C18D04`) is
+  reached only via destructors (037DB2C8, 03BB11B8) or an unconstructed class (vtable 1027BA28).
+- Next: find what writes foundation+0x890 in Cemu (Cemu PPC debugger memory-write breakpoint; an
+  execution breakpoint on 03C18D04 crashed Cemu). Tools: WWHD_TRACE_LIB, WWHD_TRACE_MSG,
+  WWHD_WATCH / WWHD_WATCH_R3, tools/callgraph.py, tools/cemu_gdb_stack.py, lldb recipes in build/*.lldb.
+
+## Session 1 end state (2026-10-11)
+Done after the first commit: point limits, nn_aoc (DLC loads), overlay arena mapped for the GPU,
+stream-out (GX2 regs + OP_STREAMOUT_UPDATE + Metal sb binding, useTFViaSSBO). The last
+stream-out fix (useTFViaSSBO) is built but not play-tested yet.
+Next: play-test stream-out (look for "stream-out draws so far" in the log and shader-failed staying
+at 0), save thumbnails are black (GPU-to-guest readback), performance (~25 fps at 1x), audio (above).
+
+### Audio, later lead (2026-10-12)
+Comparing with Cemu showed the AX frame callback (03C23E1C) is fine: it runs every frame and the init flags
+(1047F1DC, 1047F1DF) are set. Inside it, f_03C23BF8 loops over 96 voice slots and calls f_03C23B50
+(the whole voice/mix subtree, ~30 functions) only for slots whose flag byte (array at 1047F1FC) is nonzero.
+No slot ever becomes active, so the gap is upstream: the game never *requests* a sound. Tools:
+`WWHD_PEEK=addr:len`, build/axcb.json (reachable set), lldb recipe build/axcb.lldb.

@@ -374,6 +374,22 @@ PpcFunc hle_find_any(const char* name) {
     return nullptr;
 }
 
+bool hle_traced(const char* lib) {
+    const char* e = getenv("WWHD_TRACE_LIB");
+    if (!e) return false;
+    std::string list = std::string(",") + e + ",";
+    return list.find(std::string(",") + lib + ",") != std::string::npos;
+}
+void hle_trace_call(const char* name, const uint32_t in[5], uint32_t r3, uint32_t lr) {
+    static std::mutex m;
+    static std::unordered_map<std::string, int> seen;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (seen[name]++ >= 20) return;
+    }
+    log_msg("[trace] %s(%08X, %08X, %08X, %08X, %08X) -> %08X lr=%08X", name, in[0], in[1], in[2], in[3], in[4], r3, lr);
+}
+
 extern "C" void hle_unimplemented(Cpu* c, const char* lib, const char* name) {
     static std::mutex m;
     static std::unordered_map<std::string, int> seen;

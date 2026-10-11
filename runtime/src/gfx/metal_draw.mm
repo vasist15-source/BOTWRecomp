@@ -485,6 +485,8 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     uint64_t base = key;
     key = stage_state_hash(regs, key, vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS);
     if (vertex) key ^= fsKey * 31;
+    if (vertex && regs[mmVGT_STRMOUT_EN])  // stream out: the decompiler emits buffer writes with these strides
+        key = hash_regs(regs, mmVGT_STRMOUT_VTX_STRIDE_0, 13, key ^ 0x5717E0u);
     auto it = g_shaders.find(key);
     if (it != g_shaders.end()) return it->second;
 
@@ -500,6 +502,7 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
     static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
     opt.strictMul = strictMul;
+    opt.useTFViaSSBO = true;  // stream out (BotW): the vertex shader writes guest memory through sb (see StreamoutDraw)
     LatteDecompilerOutput_t out{};
     if (vertex)
         LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
@@ -683,6 +686,8 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
     h = hash_regs(regs, REGADDR::CB_BLEND0_CONTROL, 8, h);
     h = hash_regs(regs, REGADDR::CB_COLOR_CONTROL, 1, h);
     h = hash_regs(regs, REGADDR::CB_TARGET_MASK, 1, h);
+    const bool rasterKill = (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22)) != 0;  // stream-out pass: vertices only
+    h ^= rasterKill ? 0x9E3779B97F4A7C15ull : 0;
     auto it = g_pipelines.find(h);
     Pipeline* pl;
     if (it != g_pipelines.end()) {
@@ -707,7 +712,8 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
 
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = vs->fn;
-    d.fragmentFunction = ps->fn;
+    d.fragmentFunction = rasterKill ? nil : ps->fn;
+    d.rasterizationEnabled = !rasterKill;
     if (!fs->mtlFetchVertexManually) {
         MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
         for (auto& g : fs->bufferGroups) {
@@ -1034,6 +1040,17 @@ static Surface* hires_surface(Surface& dst, const Surface* like) {
 // pixels of the current render target per guest pixel (viewport/scissor/fragment-coordinate scale)
 static float g_target_kx = 1.0f, g_target_ky = 1.0f;
 
+// the stream-out write of the draw being bound (set in draw, read by bind_stage)
+struct StreamoutDraw {
+    bool active = false;
+    uint32_t vertsPerInstance = 0;
+    id<MTLBuffer> buf = nil;  // GPU-visible guest range the shader writes (sb)
+    uint32_t bufBase = 0;     // its first guest address
+    sint32 base[4] = {};      // each buffer's write position, bytes from bufBase
+};
+static StreamoutDraw g_so;
+static uint64_t g_streamout_draws = 0;
+
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
     float texScale[18][2];
@@ -1122,6 +1139,11 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         }
         if (dec->uniform.loc_uniformRegister >= 0)
             memcpy(at(dec->uniform.loc_uniformRegister), &regs[aluBase], dec->uniform.count_uniformRegister * 16);
+        if (vertex && g_so.active) {  // stream out: write positions (bytes into the guest buffer bound as sb)
+            if (dec->uniform.loc_verticesPerInstance >= 0) *(sint32*)at(dec->uniform.loc_verticesPerInstance) = (sint32)g_so.vertsPerInstance;
+            for (int b = 0; b < 4; b++)
+                if (dec->uniform.loc_streamoutBufferBase[b] >= 0) *(sint32*)at(dec->uniform.loc_streamoutBufferBase[b]) = g_so.base[b];
+        }
         if (dec->uniform.loc_windowSpaceToClipSpaceTransform >= 0) {
             float vw = 2.0f * gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XSCALE]);
             float vh = -2.0f * gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YSCALE]);
@@ -1155,6 +1177,9 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             else [enc setFragmentBuffer:u.buf offset:u.offset atIndex:rm.uniformVarsBufferBindingPoint];
         }
     }
+
+    if (vertex && g_so.active && rm.tfStorageBindingPoint >= 0 && g_so.buf)
+        [enc setVertexBuffer:g_so.buf offset:0 atIndex:rm.tfStorageBindingPoint];
 
     // uniform blocks: snapshot at draw time. Our GPU runs a frame after the CPU built it, and games
     // rewrite uniform memory between draws, so binding guest memory directly shows later values.
@@ -1550,6 +1575,7 @@ void report_skips() {
     for (int i = 0; i < SK_COUNT; i++)
         if (g_skip[i]) n += snprintf(buf + n, sizeof buf - n, " %s=%llu", kSkipNames[i], (unsigned long long)g_skip[i]);
     if (n) LOG("[gfx] skipped draws:%s", buf);
+    if (g_streamout_draws) LOG("[gfx] stream-out draws so far: %llu", (unsigned long long)g_streamout_draws);
     LOG("[gfx] %zu shaders, %zu pipelines; ms decompile %.0f, msl %.0f, pipeline %.0f", g_shaders.size(), g_pipelines.size(),
         g_t_decompile, g_t_msl, g_t_pipeline);
     if (g_must_run_waits)
@@ -1581,7 +1607,9 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (!count || !instances) return;
     ((uint32_t*)regs)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
     if (regs[REGADDR::VGT_GS_MODE] & 3) { g_skip[SK_GS]++; return; }  // geometry shaders: not supported yet
-    if (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22)) { g_skip[SK_RASTER_KILL]++; return; }  // rasterization disabled
+    const bool streamout = regs[mmVGT_STRMOUT_EN] != 0;
+    // rasterization disabled: only a stream-out pass (vertex shader writing a buffer) has an effect
+    if ((regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22)) && !streamout) { g_skip[SK_RASTER_KILL]++; return; }
 
     uint64_t fsKey = 0;
     LatteFetchShader* fs = get_fetch_shader(regs, &fsKey);
@@ -1754,6 +1782,20 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     rprof::mark(rprof::kVertex);
     {
         rprof::UploadKind uploads(rprof::kUpUbo);  // Metal: uniform snapshots and bindings of both stages
+        g_so = {};
+        if (streamout && vs->dec->streamoutBufferWriteMask.any()) {
+            // the shader writes guest memory directly: bind the GPU-visible guest range holding buffer 0
+            g_so.active = true;
+            g_so.vertsPerInstance = count;
+            for (int b = 0; b < 4; b++) {
+                if (!vs->dec->streamoutBufferWriteMask[b]) continue;
+                uint32_t addr = (regs[mmVGT_STRMOUT_BUFFER_BASE_0 + b * 4] << 8) + regs[mmVGT_STRMOUT_BUFFER_OFFSET_0 + b * 4];
+                uint32_t off = 0;
+                id<MTLBuffer> gb = guest_buffer(addr, &off);
+                if (!g_so.buf) g_so.buf = gb, g_so.bufBase = addr - off;
+                g_so.base[b] = (sint32)(addr - g_so.bufBase);
+            }
+        }
         R.binding = true;
         bind_stage(enc, regs, vs, true, colors);
         bind_stage(enc, regs, ps, false, colors);
@@ -1780,7 +1822,23 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                  indexBufferOffset:u.offset
                      instanceCount:instances
                         baseVertex:baseVertex
-                      baseInstance:0];
+                      baseInstance:render::g_base_instance];  // [[instance_id]] includes it
+    }
+    if (g_so.active) {
+        // later draws (and the CPU) read what was written; advance each buffer's write offset as the GPU
+        // would: vertices x stride, bounded by the buffer (Cemu: LatteStreamout_FinishDrawcall)
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers afterStages:MTLRenderStageVertex
+                       beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        for (int b = 0; b < 4; b++) {
+            if (!vs->dec->streamoutBufferWriteMask[b]) continue;
+            uint32_t* r = (uint32_t*)regs;
+            uint32_t stride = regs[mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4] << 2, size = regs[mmVGT_STRMOUT_BUFFER_SIZE_0 + b * 4] << 2;
+            uint32_t& offset = r[mmVGT_STRMOUT_BUFFER_OFFSET_0 + b * 4];
+            uint32_t written = count * instances * stride, room = offset < size ? size - offset : 0;
+            offset += std::min(written, room);
+        }
+        g_streamout_draws++;
+        g_so = {};
     }
     for (int i = 0; i < 8; i++)
         if (colors[i] && regs[mmCB_COLOR0_BASE + i]) g_target_drawn[regs[mmCB_COLOR0_BASE + i]] = R.frame;

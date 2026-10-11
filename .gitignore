@@ -3,3 +3,10 @@ build/
 # upstream reference checkouts
 ref/
 .DS_Store
+
+# generated at run time from the user's game: never commit
+failed_shader_*.metal
+shaders/
+captures/
+trace_dump.txt
+build/

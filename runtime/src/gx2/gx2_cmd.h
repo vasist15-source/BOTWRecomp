@@ -19,7 +19,7 @@ enum Op : uint32_t {
     OP_NOP = 0,
     OP_SET_REGS,        // first register, values...
     OP_DRAW,            // prim, count, baseVertex, instances
-    OP_DRAW_INDEXED,    // prim, count, indexType, indexAddr, baseVertex, instances
+    OP_DRAW_INDEXED,    // prim, count, indexType, indexAddr, baseVertex, instances[, baseInstance]
     OP_CLEAR_COLOR,     // GX2ColorBuffer*, r, g, b, a (float bits)
     OP_CLEAR_DEPTH,     // GX2DepthBuffer*, depth (float bits), stencil, flags
     OP_CLEAR_BUFFERS,   // GX2ColorBuffer*, GX2DepthBuffer*, r, g, b, a, depth, stencil, flags
@@ -41,6 +41,7 @@ enum Op : uint32_t {
     OP_LAYOUT_ROOT,     // nw::lyt root pane: drawn into the target bound now (which screen it goes to)
     OP_PEEK_Z,          // signed x/y in 640x480 space, guest result address (triples)
     OP_LAYOUT_CONTENT,  // DrawSelf scope: clip TV menu content to the native layout region
+    OP_STREAMOUT_UPDATE,  // buffer index, mode (0 reset, 1 restore from ctx, 3 save to ctx), ctx address
     OP_COUNT
 };
 

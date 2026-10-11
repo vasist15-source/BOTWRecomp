@@ -268,6 +268,11 @@ void log_stats() {
     LOG("[ax] %d playing: adpcm %d pcm16 %d pcm8 %d | tap %d linear %d none %d | looping %d stream %d | aux cb %d%d%d final mix %d%d",
         n, fmt[0], fmt[1], fmt[2], filt[0], filt[1], filt[2], loops, streams, !!g_aux_cb[0], !!g_aux_cb[1], !!g_aux_cb[2],
         !!g_final_mix_cb[0], !!g_final_mix_cb[1]);
+    extern int32_t g_final_peak, g_input_peak;
+    int app_cbs = 0;
+    for (uint32_t cb : g_app_frame_cb) app_cbs += cb != 0;
+    LOG("[ax] TV peak: voices into final mix %d, final mix output %d (s16 range); app frame callbacks %d", g_input_peak, g_final_peak, app_cbs);
+    g_final_peak = g_input_peak = 0;
     LOG("[ax] GamePad aux cb %d%d%d, host plays %s", !!g_drc.aux_cb[0], !!g_drc.aux_cb[1], !!g_drc.aux_cb[2],
         g_output.play_drc ? (g_output.play_tv ? "TV + GamePad" : "GamePad") : "TV");
 }
@@ -341,6 +346,7 @@ void init_buffers() {
 // TV fader at +0x194 and GamePad fader at +0x1AC (Player_fadeMaster 0202F14C).
 bool guest_obj(uint32_t a) { return a >= mem::kMem2Start && a < mem::kMem2End - 0x400 && !(a & 3); }
 bool read_game_faders(audio::Fader& tv, audio::Fader& drc) {
+    return false;  // BotW: the WWHD sound-manager address below is Wind Waker's; output stays on the TV path
     uint32_t mgr = ld32(GD(0x1018EC64));
     if (!guest_obj(mgr)) return false;
     uint32_t x = ld32(mgr + 0x10);
@@ -501,6 +507,8 @@ void final_mix_lr(uint32_t data, int n, float* hist, int32_t lr[][kSamples48], i
     }
 }
 
+int16_t g_last_out[kSamples48 * 2];  // last TV output frame, stereo (AXGetDeviceFinalOutput)
+int32_t g_final_peak = 0, g_input_peak = 0;  // WWHD_AX_STATS: loudest sample into / out of the TV final mix
 void output_frame(Cpu* c) {
     static int32_t tv[kTvChannels][kSamples], drc[kDrcChannels][kSamples];
     merge_tv(tv);
@@ -517,6 +525,10 @@ void output_frame(Cpu* c) {
     int32_t tv_lr[kTvChannels][kSamples48], drc_lr[2][kSamples48], lr[2][kSamples48];
     final_mix_lr(G.tv48, n_tv, g_post_hist[0], tv_lr, channels);
     final_mix_lr(G.drc48, n_drc, g_post_hist[1], drc_lr);
+    for (int ch = 0; ch < 2; ch++)
+        for (int i = 0; i < kSamples; i++) g_input_peak = std::max(g_input_peak, std::abs(tv[ch][i] >> 8));
+    for (int ch = 0; ch < channels && ch < kTvChannels; ch++)
+        for (int i = 0; i < kSamples48; i++) g_final_peak = std::max(g_final_peak, std::abs(tv_lr[ch][i]));
     int16_t pcm[kSamples48 * kTvChannels];
     if (channels == 2) {
         // Preserve the original stereo path, including its rounding and fader rules.
@@ -534,6 +546,7 @@ void output_frame(Cpu* c) {
                     audio::tv_sample(ax, ch, g_output.play_tv, ch < 2 ? drc_lr[ch][i] : 0, g_output.play_drc);
         }
     }
+    if (channels == 2) { memcpy(g_last_out, pcm, sizeof(int16_t) * kSamples48 * 2); }
     audio::push(pcm, kSamples48);
 }
 
@@ -710,6 +723,34 @@ HLE(snd_core, AXRegisterAuxCallback) {
         g_drc.aux_user[bus] = arg(c, 4);
         g_drc_aux_idle[bus] = 0;
     }
+    ret(c, 0);
+}
+// (device, deviceIndex, auxBus, u32* func, u32* userParam) (BotW saves and restores them)
+HLE(snd_core, AXGetAuxCallback) {
+    uint32_t dev = arg(c, 0), idx = arg(c, 1), bus = arg(c, 2), func = 0, user = 0;
+    if (bus >= kAuxBuses) { ret(c, (uint32_t)-5); return; }
+    if (dev == 0) func = g_aux_cb[bus], user = g_aux_user[bus];
+    else if (dev == 1 && idx == 0) func = g_drc.aux_cb[bus], user = g_drc.aux_user[bus];
+    if (arg(c, 3)) st32(arg(c, 3), func);
+    if (arg(c, 4)) st32(arg(c, 4), user);
+    ret(c, 0);
+}
+// (device, u32* stage)
+HLE(snd_core, AXGetDeviceUpsampleStage) {
+    if (arg(c, 0) > 1) { ret(c, (uint32_t)-1); return; }
+    if (arg(c, 1)) st32(arg(c, 1), g_upsample_stage[arg(c, 0)]);
+    ret(c, 0);
+}
+// (callback): called when a frame's voice processing overruns its budget, which never happens here
+HLE(snd_core, AXRegisterExceedCallback) { ret(c, 0); }
+// (device, s16* out, bufferSize, info*): the device's last output frame (as Cemu: TV stereo / GamePad)
+HLE(snd_core, AXGetDeviceFinalOutput) {
+    uint32_t dev = arg(c, 0), out = arg(c, 1), size = arg(c, 2), info = arg(c, 3);
+    if (dev > 1) { ret(c, (uint32_t)-1); return; }
+    const uint32_t n = kSamples48 * 2;
+    if (size < n * 2) { ret(c, (uint32_t)-11); return; }
+    for (uint32_t i = 0; i < n; i++) st16(out + 2 * i, (uint16_t)(dev == 0 ? g_last_out[i] : 0));
+    if (info) { st32(info + 0, 2); st32(info + 4, 1); st32(info + 0x10, n * 2); }
     ret(c, 0);
 }
 HLE(snd_core, AXSetAuxReturnVolume) {

@@ -187,6 +187,13 @@ HLE(gx2, GX2SetPointSize) {
     set_reg(REGADDR::PA_SU_POINT_SIZE, LATTE_PA_SU_POINT_SIZE().set_WIDTH(w).set_HEIGHT(h).getRawValue());
 }
 
+// (minSize, maxSize) in f1/f2 -> PA_SU_POINT_MINMAX, 12.3 fixed point (as Cemu's GX2InitPointLimitsReg)
+HLE(gx2, GX2SetPointLimits) {
+    float mn = std::max(fa(c, 0), 0.0f), mx = std::max(fa(c, 1), 0.0f);
+    uint32 lo = std::min<uint32>((uint32)(mn * 8.0f), 0xFFFF), hi = std::min<uint32>((uint32)(mx * 8.0f), 0xFFFF);
+    set_reg(REGADDR::PA_SU_POINT_MINMAX, lo | (hi << 16));
+}
+
 HLE(gx2, GX2SetLineWidth) {
     uint32 w = std::min<uint32>((uint32)(fa(c, 0) * 8.0f), 0xFFFF);
     set_reg(mmPA_SU_LINE_CNTL, w);

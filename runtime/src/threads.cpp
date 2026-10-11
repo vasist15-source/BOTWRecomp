@@ -614,8 +614,8 @@ static void* thread_main(void* p) {
     // let macOS park them on efficiency cores, which showed up as the main thread holding its core
     // without getting CPU time
     host::boost_thread_priority();
-    LOG("[thread] start \"%s\" core %d prio %d affinity %X", name.c_str(), ht->core, (int)ld32(ht->guest + osthread::kBasePrio),
-        ld32(ht->guest + osthread::kAffinity));
+    LOG("[thread] start \"%s\" core %d prio %d affinity %X entry %08X arg %08X", name.c_str(), ht->core,
+        (int)ld32(ht->guest + osthread::kBasePrio), ld32(ht->guest + osthread::kAffinity), ht->entry, ht->argv);
     uint32_t rv = 0;
     core_acquire(ht);
     try {
@@ -632,7 +632,7 @@ static void* thread_main(void* p) {
         st8(ht->guest + osthread::kState, osthread::MORIBUND);
     }
     ht->cv.notify_all();
-    TRACE("[thread] %s exited with %08X", name.c_str(), rv);
+    LOG("[thread] exit \"%s\" -> %08X", name.c_str(), rv);
     return nullptr;
 }
 
@@ -1099,6 +1099,17 @@ HLE(coreinit, OSSendMessage) {
     uint32_t m = arg(c, 1), flags = arg(c, 2);
     std::array<uint32_t, 4> msg{ld32(m), ld32(m + 4), ld32(m + 8), ld32(m + 12)};
     if (g_trace_msg) LOG("[msg] send q=%08X msg=%08X %08X flags=%X lr=%08X", arg(c, 0), msg[0], msg[1], flags, c->lr);
+    if (g_trace_msg && msg[0] == 0x7FFFFFFF) {  // sead::Thread quit: who asked for it
+        char buf[256];
+        int n = snprintf(buf, sizeof buf, "[msg] quit q=%08X from lr=%08X", arg(c, 0), c->lr);
+        for (uint32_t sp = c->r[1], i = 0; i < 10 && sp; i++) {
+            uint32_t prev = ld32(sp);
+            if (!prev || prev <= sp) break;
+            n += snprintf(buf + n, sizeof buf - n, " <- %08X", ld32(prev + 4));
+            sp = prev;
+        }
+        LOG("%s", buf);
+    }
     {
         std::unique_lock<std::mutex> lk(q->m);
         if (q->msgs.size() >= q->capacity) {

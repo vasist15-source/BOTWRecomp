@@ -133,12 +133,20 @@ PpcFunc hle_find(const char* lib, const char* name);  // null if not implemented
 PpcFunc hle_find_any(const char* name);
 
 struct GuestExit { uint32_t value; };
+// debug: WWHD_TRACE_LIB=snd_core,gx2 logs the first 20 calls of each function of those libraries
+// (five argument registers, the value left in r3, the caller)
+bool hle_traced(const char* lib);
+void hle_trace_call(const char* name, const uint32_t in[5], uint32_t r3, uint32_t lr);
 #define HLE(lib, name)                                                        \
     static void hle_impl_##lib##_##name(Cpu* c);                               \
     extern "C" void imp_##lib##_##name(Cpu* c) {                               \
+        static const bool traced = hle_traced(#lib);                          \
+        uint32_t in[5];                                                       \
+        if (traced) memcpy(in, &c->r[3], sizeof in);                          \
         exception_report::boundary<GuestExit>("HLE " #lib "." #name, [&] {      \
             hle_impl_##lib##_##name(c);                                       \
         });                                                                  \
+        if (traced) hle_trace_call(#lib "." #name, in, c->r[3], c->lr);        \
     }                                                                        \
     static HleReg hle_reg_##lib##_##name(#lib, #name, imp_##lib##_##name);       \
     static void hle_impl_##lib##_##name(Cpu* c)

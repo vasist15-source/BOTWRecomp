@@ -431,7 +431,11 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     case OP_NOP: break;
     case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1); break;
     case OP_DRAW: render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
-    case OP_DRAW_INDEXED: render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]); break;
+    case OP_DRAW_INDEXED:
+        render::g_base_instance = n > 6 ? p[6] : 0;
+        render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]);
+        render::g_base_instance = 0;
+        break;
     case OP_CLEAR_COLOR: {
         const uint32* q = p + kColorBufferWords;
         float rgba[4] = {bitsf(q[0]), bitsf(q[1]), bitsf(q[2]), bitsf(q[3])};
@@ -496,6 +500,13 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
                 v[4 + i] = fbits(bitsf(v[4 + i]) / ky);
             }
         apply_regs(p[0], v, std::min<uint32>(n - 1, 16));
+        break;
+    }
+    case OP_STREAMOUT_UPDATE: {  // the buffer's write offset (bytes), in command order like the GPU's
+        uint32 reg = mmVGT_STRMOUT_BUFFER_OFFSET_0 + 4 * (p[0] & 3);
+        if (p[1] == 0) g_regs[reg] = 0;
+        else if (p[1] == 1) g_regs[reg] = p[2] ? ld32(p[2]) : 0;
+        else if (p[1] == 3 && p[2]) st32(p[2], g_regs[reg]);
         break;
     }
     case OP_LAYOUT_CONTENT:
@@ -700,6 +711,30 @@ HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 // ---------------------------------------------------------------- draws
 HLE(gx2, GX2DrawEx) { emit(OP_DRAW, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)}); }
 HLE(gx2, GX2DrawIndexedEx) { emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)}); }
+// Stream out (transform feedback, BotW). Registers as Cemu's GX2_Streamout.cpp; the strides come
+// from GX2SetVertexShader. GX2StreamOutBuffer: +0 size, +4 dataPtr, +8 vertexStride, +0xC GX2RBuffer
+// (+0x10 elementSize, +0x14 elementCount, +0x18 ptr; used when dataPtr is null), +0x1C ctxPtr.
+HLE(gx2, GX2SetStreamOutEnable) { set_reg(mmVGT_STRMOUT_EN, arg(c, 0) & 1); }
+HLE(gx2, GX2SetStreamOutBuffer) {
+    uint32 i = arg(c, 0), b = arg(c, 1);
+    if (i > 3 || !b) return;
+    uint32 addr = ld32(b + 4), size = ld32(b);
+    if (!addr) { addr = ld32(b + 0x18); size = ld32(b + 0x10) * ld32(b + 0x14); }
+    set_reg(mmVGT_STRMOUT_BUFFER_SIZE_0 + i * 4, size >> 2);
+    set_reg(mmVGT_STRMOUT_BUFFER_BASE_0 + i * 4, addr >> 8);
+}
+// (index, buffer, reset): reset != 0 starts writing at 0, otherwise continues from the saved context
+HLE(gx2, GX2SetStreamOutContext) {
+    uint32 i = arg(c, 0), b = arg(c, 1);
+    if (i > 3) return;
+    emit(OP_STREAMOUT_UPDATE, {i, arg(c, 2) ? 0u : 1u, b ? ld32(b + 0x1C) : 0u});
+}
+HLE(gx2, GX2SaveStreamOutContext) {
+    uint32 i = arg(c, 0), b = arg(c, 1);
+    if (i > 3 || !b) return;
+    emit(OP_STREAMOUT_UPDATE, {i, 3u, ld32(b + 0x1C)});
+}
+
 // Occlusion queries (BotW): no GPU queries on the Metal backend yet, so every query reports
 // "visible" (0x100000 samples) and conditional rendering always draws. Nothing is wrongly culled;
 // the cost is drawing some things the game could have skipped.
@@ -712,14 +747,8 @@ HLE(gx2, GX2QueryGetOcclusionResult) {  // (GX2Query*, u64* result) -> ready
 HLE(gx2, GX2QueryBeginConditionalRender) {}
 HLE(gx2, GX2QueryEndConditionalRender) {}
 
-// GX2DrawIndexedEx2(prim, count, indexType, indices, baseVertex, instances, baseInstance) (BotW).
-// The renderer has no base instance yet; nonzero ones are reported so we know if the game needs it.
-HLE(gx2, GX2DrawIndexedEx2) {
-    if (arg(c, 6)) {
-        static std::atomic<int> n{0};
-        if (n++ < 5) LOG("[gx2] GX2DrawIndexedEx2 base instance %u ignored lr=%08X", arg(c, 6), c->lr);
-    }
-    emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)});
+HLE(gx2, GX2DrawIndexedEx2) {  // (prim, count, indexType, indices, baseVertex, instances, baseInstance)
+    emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), arg(c, 6)});
 }
 
 // ---------------------------------------------------------------- clears and copies
@@ -863,6 +892,15 @@ HLE(gx2, GX2SwapScanBuffers) {
         double s = std::chrono::duration<double>(now - last).count();
         last = now;
         LOG("[gx2] frame %llu, %.1f swaps/s, swap interval %u", (unsigned long long)g_swap_count, 300 / s, g_swap_interval);
+        // debug: WWHD_PEEK=<hex addr>:<bytes> logs that guest memory with every frame report
+        if (const char* pk = getenv("WWHD_PEEK")) {
+            unsigned a = 0, n = 16;
+            if (sscanf(pk, "%x:%u", &a, &n) >= 1) {
+                char hex[256] = {};
+                for (unsigned i = 0; i < n && i < 64; i++) snprintf(hex + i * 3, sizeof hex - i * 3, "%02X ", ld8(a + i));
+                LOG("[peek] %08X: %s", a, hex);
+            }
+        }
         if (getenv("WWHD_SCHED_STATS")) threads::report_sched();
     }
 }

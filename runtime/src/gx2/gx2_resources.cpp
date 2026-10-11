@@ -156,6 +156,8 @@ HLE(gx2, GX2SetVertexShader) {
         set_reg(mmPA_CL_VS_OUT_CNTL, tmp[mmPA_CL_VS_OUT_CNTL]);
         if (n) set_regs(mmSPI_VS_OUT_ID_0, &tmp[mmSPI_VS_OUT_ID_0], n);
     }
+    if (ld32(vs + 0x110))  // usesStreamOut: the strides of its stream-out buffers (as Cemu)
+        for (uint32 i = 0; i < 4; i++) set_reg(mmVGT_STRMOUT_VTX_STRIDE_0 + i * 4, ld32(vs + 0x114 + 4 * i) >> 2);
     if (nsem) {
         set_reg(mmSQ_VTX_SEMANTIC_CLEAR, 0xFFFFFFFF);
         set_regs(mmSQ_VTX_SEMANTIC_0, &tmp[mmSQ_VTX_SEMANTIC_0], nsem);
