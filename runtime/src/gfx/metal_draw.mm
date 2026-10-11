@@ -395,7 +395,10 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
 }
 
 // registers that influence how a shader stage is translated (gathered, then hashed in one pass)
-static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase) {
+// unitMask: the texture units the program samples (all 18 until its first translation is known); units
+// it never reads must not change its key, or every stale binding the game leaves behind makes a new
+// "shader" (BotW: hundreds of thousands of identical translations)
+static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase, uint32_t unitMask = 0x3FFFF) {
     // most lookups gather the same words as the previous one for this stage (the state generation
     // also moves for registers that don't end up here): gather into the spare buffer and compare
     // instead of rehashing. Render thread only.
@@ -430,6 +433,7 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     buf[n++] = regs[REGADDR::DB_DEPTH_CONTROL] & 0x83;
     // texture types and formats; sampling a bound render target switches to framebuffer fetch
     for (int t = 0; t < 18; t++) {
+        if (!((unitMask >> t) & 1)) { buf[n++] = 0; buf[n++] = 0; buf[n++] = 0; continue; }
         const uint32_t* w = &regs[texBase + t * 7];
         buf[n++] = (w[0] & 7) | (w[4] & 0x300);
         buf[n++] = w[1] & 0x3F00000;
@@ -440,7 +444,9 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
         buf[n++] = fb;
     }
     // depth-compare samplers
-    for (int i = 0; i < 18 * 3; i++) buf[n++] = regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + i * 3] & 0xF8000000;
+    // (the unit's sampler in every stage's block: a superset of the one the decompiler reads)
+    for (int i = 0; i < 18 * 3; i++)
+        buf[n++] = ((unitMask >> (i % 18)) & 1) ? regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + i * 3] & 0xF8000000 : 0;
     if (L.n == n && L.in == h && !memcmp(L.buf[L.cur], buf, n * 4)) return L.out;
     L.cur ^= 1;
     L.in = h;
@@ -486,10 +492,20 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     if (!addr || !size) return nullptr;
     uint64_t key = program_hash(addr, size) ^ (vertex ? 0x1111 : 0x2222);
     uint64_t base = key;
-    key = stage_state_hash(regs, key, vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS);
+    // texture units this program samples, known after its first translation (see stage_state_hash)
+    static std::unordered_map<uint64_t, uint32_t> usedUnits;
+    auto uu = usedUnits.find(base);
+    const uint32_t unitMask = uu != usedUnits.end() ? uu->second : 0x3FFFF;
+    key = stage_state_hash(regs, key ^ (unitMask == 0x3FFFF ? 0 : 0x5EED0001u),
+                           vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask);
     if (vertex) key ^= fsKey * 31;
-    if (vertex && regs[mmVGT_STRMOUT_EN])  // stream out: the decompiler emits buffer writes with these strides
-        key = hash_regs(regs, mmVGT_STRMOUT_VTX_STRIDE_0, 13, key ^ 0x5717E0u);
+    if (vertex && regs[mmVGT_STRMOUT_EN]) {  // stream out: the decompiler emits buffer writes with these strides
+        // only the four stride registers (+4 apart): the buffer bases and write offsets between them
+        // change every frame and must not make new shaders
+        uint32_t strides[4];
+        for (int b = 0; b < 4; b++) strides[b] = regs[mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4];
+        key = hash_bytes(strides, sizeof strides, key ^ 0x5717E0u);
+    }
     auto it = g_shaders.find(key);
     if (it != g_shaders.end()) return it->second;
 
@@ -517,6 +533,11 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         return s;
     }
     s->dec = FinishDecompiledShader(out);
+    if (uu == usedUnits.end()) {
+        uint32_t m = 0;
+        for (int u = 0; u < s->dec->textureUnitListCount; u++) m |= 1u << s->dec->textureUnitList[u];
+        usedUnits.emplace(base, m);
+    }
     if (opt.areaSampledTextures) {
         std::string src = s->dec->strBuf_shaderSource->c_str();
         if (gfx::area_sample::rewrite(src, opt.areaSampledTextures, true) > 0) {
