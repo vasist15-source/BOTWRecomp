@@ -1049,7 +1049,7 @@ struct StreamoutDraw {
     sint32 base[4] = {};      // each buffer's write position, bytes from bufBase
 };
 static StreamoutDraw g_so;
-static uint64_t g_streamout_draws = 0;
+static uint64_t g_streamout_draws = 0, g_streamout_notarget = 0;  // the latter: ran with no render target
 
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
@@ -1204,7 +1204,7 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
 }
 
 // ---------------------------------------------------------------- render pass
-static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Surface* depth, uint32_t depthSlice) {
+static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Surface* depth, uint32_t depthSlice, bool noAttachments = false) {
     if (R.enc) {
         bool same = R.passDepth == depth && (!depth || R.passDepthSlice == depthSlice);
         for (int i = 0; i < 8 && same; i++)
@@ -1239,7 +1239,13 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
         mark_gpu_written(depth);
         any = true;
     }
-    if (!any) return false;
+    if (!any) {
+        if (!noAttachments) return false;
+        // a stream-out pass with rasterization off: only the vertex stage runs, nothing is attached
+        rp.renderTargetWidth = 1;
+        rp.renderTargetHeight = 1;
+        rp.defaultRasterSampleCount = 1;
+    }
     R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     for (int i = 0; i < 8; i++) {
         R.passColor[i] = colors[i];
@@ -1575,7 +1581,7 @@ void report_skips() {
     for (int i = 0; i < SK_COUNT; i++)
         if (g_skip[i]) n += snprintf(buf + n, sizeof buf - n, " %s=%llu", kSkipNames[i], (unsigned long long)g_skip[i]);
     if (n) LOG("[gfx] skipped draws:%s", buf);
-    if (g_streamout_draws) LOG("[gfx] stream-out draws so far: %llu", (unsigned long long)g_streamout_draws);
+    if (g_streamout_draws) LOG("[gfx] stream-out draws so far: %llu (%llu without a render target)", (unsigned long long)g_streamout_draws, (unsigned long long)g_streamout_notarget);
     LOG("[gfx] %zu shaders, %zu pipelines; ms decompile %.0f, msl %.0f, pipeline %.0f", g_shaders.size(), g_pipelines.size(),
         g_t_decompile, g_t_msl, g_t_pipeline);
     if (g_must_run_waits)
@@ -1658,7 +1664,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
     uint32_t guestW = colors[0] ? colors[0]->width : 0;  // the game's target size (viewport registers refer to it)
     uint32_t guestH = colors[0] ? colors[0]->height : 0;
-    if (g_hires_redraw) {
+    if (g_hires_redraw && colors[0]) {
         g_hires_src = colors[0]->addr;
         colors[0] = hires_surface(g_hires_color, colors[0]);
         colorSlices[0] = 0;
@@ -1674,7 +1680,9 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (!w && depth) { w = (uint32_t)depth->tex.width; h = (uint32_t)depth->tex.height; kx = depth->sx; ky = depth->sy; }
     for (auto& c : colors)
         if (c && (c->tex.width != w || c->tex.height != h)) { c = nullptr; g_skip[SK_DROPPED_COLOR]++; }
-    if (!w) { g_skip[SK_NO_TARGET]++; return; }
+    const bool noAttachments = !w && streamout && (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22));
+    if (noAttachments) { w = h = 1; g_streamout_notarget++; }
+    else if (!w) { g_skip[SK_NO_TARGET]++; return; }
     if (g_hires_redraw && guestW) {  // the viewport registers describe the game's smaller buffer
         kx = (float)colors[0]->tex.width / guestW;
         ky = (float)colors[0]->tex.height / guestH;  // differs from kx at other aspect ratios
@@ -1698,7 +1706,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     }
 
     rprof::mark(rprof::kTextures);
-    if (!ensure_pass(colors, colorSlices, depth, depthSlice)) { g_skip[SK_PASS]++; return; }
+    if (!ensure_pass(colors, colorSlices, depth, depthSlice, noAttachments)) { g_skip[SK_PASS]++; return; }
     rprof::mark(rprof::kPass);
     TargetFormats tf;
     for (int i = 0; i < 8; i++)
@@ -1749,7 +1757,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     bool halfZ = clipCntl.get_DX_CLIP_SPACE_DEF();
     MTLViewport vp{xo - xs, yo + ys, xs * 2.0f, ys * -2.0f, halfZ ? zo : zo - zs, zs + zo};
     vp.originX *= kx; vp.originY *= ky; vp.width *= kx; vp.height *= ky;
-    [enc setViewport:vp];
+    if (!noAttachments) [enc setViewport:vp];
     uint32_t tl = regs[REGADDR::PA_SC_GENERIC_SCISSOR_TL], br = regs[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
     auto lo = [](uint32_t v, float k, uint32_t lim) { return std::min<uint32_t>((uint32_t)std::floor(v * k + 0.01f), lim); };
     auto hi = [](uint32_t v, float k, uint32_t lim) { return std::min<uint32_t>((uint32_t)std::ceil(v * k - 0.01f), lim); };
@@ -1758,8 +1766,12 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     float ax, ay;
     if (aspect::content_clip() && target_aspect_factors(regs[mmCB_COLOR0_TILE] & 0xFFFF, regs[mmCB_COLOR0_FRAG], ax, ay))
         aspect::panes::clip(w, h, ax, ay, sx, sy, ex, ey);
-    if (ex <= sx || ey <= sy) { g_skip[SK_SCISSOR]++; return; }
-    [enc setScissorRect:MTLScissorRect{sx, sy, ex - sx, ey - sy}];
+    if (noAttachments) {
+        [enc setScissorRect:MTLScissorRect{0, 0, 1, 1}];
+    } else {
+        if (ex <= sx || ey <= sy) { g_skip[SK_SCISSOR]++; return; }
+        [enc setScissorRect:MTLScissorRect{sx, sy, ex - sx, ey - sy}];
+    }
     rprof::mark(rprof::kRecord);
     rprof::UploadKind vertexUploads(rprof::kUpVertex);
 
