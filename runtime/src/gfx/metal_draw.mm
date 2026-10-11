@@ -1,3 +1,4 @@
+#include <map>
 #include <thread>
 #include <deque>
 #include "aspect.h"
@@ -410,6 +411,10 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
 // unitMask: the texture units the program samples (all 18 until its first translation is known); units
 // it never reads must not change its key, or every stale binding the game leaves behind makes a new
 // "shader" (BotW: hundreds of thousands of identical translations)
+namespace { extern bool g_cache_replaying; }  // shader cache (below)
+static uint32_t g_key_gather[2][400], g_key_gather_n[2];  // debug copy of the latest gather per stage
+static const bool g_key_diff = getenv("WWHD_KEY_DIFF") != nullptr;
+static const uint32_t* last_key_words(bool vertex, uint32_t* n) { *n = g_key_gather_n[vertex ? 0 : 1]; return g_key_gather[vertex ? 0 : 1]; }
 static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase, uint32_t unitMask = 0x3FFFF) {
     // most lookups gather the same words as the previous one for this stage (the state generation
     // also moves for registers that don't end up here): gather into the spare buffer and compare
@@ -419,30 +424,38 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     Last& L = last[texBase == REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS ? 0 : 1];
     uint32_t* buf = L.buf[L.cur ^ 1];
     uint32_t n = 0;
+    // Each stage hashes only what its translation reads (checked against the decompiler: the vertex
+    // attribute semantics are read for vertex fetch only; render-target, colour-output, depth-export
+    // and colour-control state for pixel exports only). The other stage's fields are written as zeros
+    // so the layout (and WWHD_KEY_DIFF's labels) stays fixed. Hashing them anyway split every program
+    // into one variant per pairing: tens of thousands of extra translations in BotW.
+    const bool vs = texBase == REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS;
     auto put = [&](uint32_t first, uint32_t count) { memcpy(&buf[n], &regs[first], count * 4); n += count; };
-    put(mmSQ_VTX_SEMANTIC_0, 32);
-    put(mmSPI_VS_OUT_ID_0, 10);
+    auto skip = [&](uint32_t count) { memset(&buf[n], 0, count * 4); n += count; };
+    auto putIf = [&](bool keep, uint32_t first, uint32_t count) { if (keep) put(first, count); else skip(count); };
+    putIf(vs, mmSQ_VTX_SEMANTIC_0, 32);           // vertex fetch
+    put(mmSPI_VS_OUT_ID_0, 10);                   // VS exports <-> PS inputs (both stages link through these)
     put(mmSPI_VS_OUT_CONFIG, 1);
     put(mmPA_CL_VS_OUT_CNTL, 1);
     put(mmSPI_PS_IN_CONTROL_0, 2);
     put(mmSPI_PS_INPUT_CNTL_0, 32);
     put(REGADDR::SQ_CONFIG, 1);
-    put(mmCB_SHADER_MASK, 1);
-    put(mmCB_SHADER_CONTROL, 1);
-    put(mmDB_SHADER_CONTROL, 1);
-    put(mmSPI_INPUT_Z, 1);
-    put(REGADDR::SX_ALPHA_TEST_CONTROL, 1);
+    putIf(!vs, mmCB_SHADER_MASK, 1);              // pixel exports
+    putIf(!vs, mmCB_SHADER_CONTROL, 1);
+    putIf(!vs, mmDB_SHADER_CONTROL, 1);
+    putIf(!vs, mmSPI_INPUT_Z, 1);
+    put(REGADDR::SX_ALPHA_TEST_CONTROL, 1);       // also read by a vertex path (viewport scale disabled)
     put(REGADDR::PA_CL_VTE_CNTL, 1);
     put(REGADDR::PA_CL_CLIP_CNTL, 1);
-    put(REGADDR::CB_COLOR_CONTROL, 1);
-    put(REGADDR::CB_TARGET_MASK, 1);
-    put(mmCB_COLOR0_INFO, 8);
+    putIf(!vs, REGADDR::CB_COLOR_CONTROL, 1);
+    putIf(!vs, REGADDR::CB_TARGET_MASK, 1);
+    putIf(!vs, mmCB_COLOR0_INFO, 8);
     uint32_t cbBase[8];
     for (int i = 0; i < 8; i++) {
         cbBase[i] = regs[mmCB_COLOR0_BASE + i] & ~0xFFu;
-        buf[n++] = cbBase[i] != 0;
+        buf[n++] = !vs && cbBase[i] != 0;
     }
-    buf[n++] = regs[REGADDR::DB_DEPTH_CONTROL] & 0x83;
+    buf[n++] = vs ? 0 : regs[REGADDR::DB_DEPTH_CONTROL] & 0x83;
     // texture types and formats; sampling a bound render target switches to framebuffer fetch
     for (int t = 0; t < 18; t++) {
         if (!((unitMask >> t) & 1)) { buf[n++] = 0; buf[n++] = 0; buf[n++] = 0; continue; }
@@ -459,11 +472,33 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     // (the unit's sampler in every stage's block: a superset of the one the decompiler reads)
     for (int i = 0; i < 18 * 3; i++)
         buf[n++] = ((unitMask >> (i % 18)) & 1) ? regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + i * 3] & 0xF8000000 : 0;
+    if (g_key_diff) {
+        int st = texBase == REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS ? 0 : 1;
+        memcpy(g_key_gather[st], buf, n * 4);
+        g_key_gather_n[st] = n;
+    }
     if (L.n == n && L.in == h && !memcmp(L.buf[L.cur], buf, n * 4)) return L.out;
     L.cur ^= 1;
     L.in = h;
     L.n = n;
     return L.out = hash_bytes(buf, n * 4, h);
+}
+// debug (WWHD_KEY_DIFF): the words the latest stage_state_hash call gathered for this stage
+static const uint32_t* last_key_words(bool vertex, uint32_t* n);
+static const char* key_word_name(uint32_t i) {
+    // the order of stage_state_hash's gather
+    static const struct { uint32_t count; const char* name; } seg[] = {
+        {32, "SQ_VTX_SEMANTIC"}, {10, "SPI_VS_OUT_ID"}, {1, "SPI_VS_OUT_CONFIG"}, {1, "PA_CL_VS_OUT_CNTL"},
+        {2, "SPI_PS_IN_CONTROL"}, {32, "SPI_PS_INPUT_CNTL"}, {1, "SQ_CONFIG"}, {1, "CB_SHADER_MASK"},
+        {1, "CB_SHADER_CONTROL"}, {1, "DB_SHADER_CONTROL"}, {1, "SPI_INPUT_Z"}, {1, "SX_ALPHA_TEST_CONTROL"},
+        {1, "PA_CL_VTE_CNTL"}, {1, "PA_CL_CLIP_CNTL"}, {1, "CB_COLOR_CONTROL"}, {1, "CB_TARGET_MASK"},
+        {8, "CB_COLOR_INFO"}, {8, "CB_BASE_SET"}, {1, "DB_DEPTH_CONTROL"}, {54, "TEXTURE_TYPE_FMT_FB"},
+        {54, "SAMPLER_DEPTH_COMPARE"}};
+    for (auto& g : seg) {
+        if (i < g.count) return g.name;
+        i -= g.count;
+    }
+    return "?";
 }
 
 static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey);
@@ -520,6 +555,35 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     }
     auto it = g_shaders.find(key);
     if (it != g_shaders.end()) return it->second;
+    if (g_key_diff && !g_cache_replaying) {
+        // which part of the key made this program a new shader (compared with its first variant)
+        struct First { std::vector<uint32_t> words; uint64_t fsKey; uint32_t mask; };
+        static std::unordered_map<uint64_t, First> first;
+        static std::map<std::string, uint64_t> tally;
+        static uint64_t newKeys = 0;
+        uint32_t n = 0;
+        const uint32_t* w = last_key_words(vertex, &n);
+        auto f = first.find(base);
+        if (f == first.end()) {
+            first.emplace(base, First{std::vector<uint32_t>(w, w + n), vertex ? fsKey : 0, unitMask});
+        } else {
+            std::set<std::string> diff;
+            if (vertex && f->second.fsKey != fsKey) diff.insert("FETCH_SHADER");
+            if (f->second.mask != unitMask) diff.insert("UNIT_MASK_LEARNED");
+            for (uint32_t i = 0; i < n && i < f->second.words.size(); i++)
+                if (w[i] != f->second.words[i]) diff.insert(key_word_name(i));
+            if (diff.empty()) diff.insert(vertex && regs[mmVGT_STRMOUT_EN] ? "STREAMOUT_STRIDES?" : "OTHER");
+            for (auto& d : diff) tally[std::string(vertex ? "VS " : "PS ") + d]++;
+            if (++newKeys % 300 == 0) {
+                std::vector<std::pair<uint64_t, std::string>> v;
+                for (auto& [k, c] : tally) v.push_back({c, k});
+                std::sort(v.rbegin(), v.rend());
+                std::string line;
+                for (size_t i = 0; i < v.size() && i < 10; i++) line += " " + v[i].second + "=" + std::to_string(v[i].first);
+                LOG("[keydiff] %llu new variants of known programs; fields that differ:%s", (unsigned long long)newKeys, line.c_str());
+            }
+        }
+    }
 
     auto* s = new Shader();
     s->kind = gfx::program_kind(mem::ptr(addr), size, vertex);
@@ -636,6 +700,13 @@ struct Pipeline {
     uint64_t retryFrame = 0;                  // a failed build is retried from this frame on (0: not scheduled)
 };
 static std::unordered_map<uint64_t, Pipeline*> g_pipelines;
+// for the hitch log (metal_main.mm): shader and pipeline work so far
+void compile_counters(size_t* shaders, size_t* pipelines, double* decompileMs, double* mslMs) {
+    *shaders = g_shaders.size();
+    *pipelines = g_pipelines.size();
+    *decompileMs = g_t_decompile;
+    *mslMs = g_t_msl;
+}
 
 // Ambient-occlusion quirks, switchable in game (Graphics menu, O cycles; WWHD_AO_MODE=0..2 sets the start):
 //   0 = as the hardware renders it
@@ -1591,6 +1662,8 @@ static void cache_load() {
 // build queued pipelines whose shaders have finished compiling, at most `budget` of them and only
 // while fewer than `maxInFlight` compiles are running; recipes that can't be resolved are dropped
 static size_t g_recipes_built, g_recipes_dropped;
+// wall-clock time (now_ms) after which the background warm-up stops for this frame; 0 = no limit
+static double g_warm_deadline_ms = 0;
 static void build_pending_pipelines(int budget, int maxInFlight) {
     if (g_pending_pipelines.empty()) return;
     static std::vector<uint32_t> regs(0x10000);
@@ -1602,6 +1675,7 @@ static void build_pending_pipelines(int budget, int maxInFlight) {
     size_t scan = budget == INT_MAX ? SIZE_MAX : 2048;
     size_t i = scan != SIZE_MAX && cursor < g_pending_pipelines.size() ? cursor : 0;
     for (; i < g_pending_pipelines.size() && scan > 0 && budget > 0 && g_compiles_in_flight < maxInFlight; scan--) {
+        if (g_warm_deadline_ms && (scan & 15) == 0 && now_ms() > g_warm_deadline_ms) break;
         PipelineRecipe& r = g_pending_pipelines[i];
         auto vi = g_shaders.find(r.vsKey), pi = g_shaders.find(r.psKey);
         auto fi = g_fetch.find(r.fsKey);
@@ -1631,19 +1705,33 @@ static void build_pending_pipelines(int budget, int maxInFlight) {
     g_cache_replaying = false;
 }
 
-// build cached pipelines whose shaders have finished compiling; a few per frame
+// build cached pipelines whose shaders have finished compiling, within a time budget per frame that
+// follows how much slack the game's frames have: a handful of milliseconds in menus and when standing
+// still (frames well under 33 ms), almost nothing when the game is busy. A fixed 16 + 16 per frame left
+// ~60,000 recorded pipelines unbuilt for minutes, so the game built hundreds of them on demand in a
+// single frame (47 of 62 logged hitches). WWHD_WARM_MS scales the budget; 0 = the old fixed counts.
 void cache_warm_step() {
-    // a few background compiles per frame keep the startup burst from starving the game, and none
-    // start while the game's own compiles keep the compiler busy (WWHD_BG_COMPILES, default 8 in flight)
-    static const int maxInFlight = getenv("WWHD_BG_COMPILES") ? atoi(getenv("WWHD_BG_COMPILES")) : 8;
-    for (int n = 0; n < 16 && !g_deferred_shaders.empty() && g_compiles_in_flight < maxInFlight;) {
+    // background compiles keep the startup burst from starving the game, and none start while the game's
+    // own compiles keep the compiler busy (WWHD_BG_COMPILES, default 24 in flight)
+    static const int maxInFlight = getenv("WWHD_BG_COMPILES") ? atoi(getenv("WWHD_BG_COMPILES")) : 24;
+    static const double warmScale = getenv("WWHD_WARM_MS") ? atof(getenv("WWHD_WARM_MS")) : 1.0;
+    static double lastCall = now_ms();
+    const double t0 = now_ms();
+    const double frameMs = t0 - lastCall;  // the previous frame's wall time
+    lastCall = t0;
+    const double budgetMs = warmScale * (frameMs < 20 ? 8.0 : frameMs < 28 ? 3.0 : 0.5);
+    g_warm_deadline_ms = warmScale > 0 ? t0 + budgetMs : 0;
+    const int perFrame = warmScale > 0 ? 100000 : 16;
+    for (int n = 0; n < perFrame && !g_deferred_shaders.empty() && g_compiles_in_flight < maxInFlight;) {
+        if (g_warm_deadline_ms && now_ms() > g_warm_deadline_ms) break;
         Shader* s = g_deferred_shaders.back();
         g_deferred_shaders.pop_back();
         if (s->state == CS_DEFERRED) { compile_deferred(s); n++; }
     }
     static bool queued = false;
     if (!g_pending_pipelines.empty()) queued = true;
-    build_pending_pipelines(16, maxInFlight);
+    build_pending_pipelines(perFrame, maxInFlight);
+    g_warm_deadline_ms = 0;
     if (queued && g_pending_pipelines.empty()) {
         queued = false;
         LOG("[gfx] background pipelines done by frame %llu: %zu built, %zu unresolved", (unsigned long long)R.frame,

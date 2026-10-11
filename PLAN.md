@@ -94,3 +94,23 @@ Comparing with Cemu showed the AX frame callback (03C23E1C) is fine: it runs eve
 (the whole voice/mix subtree, ~30 functions) only for slots whose flag byte (array at 1047F1FC) is nonzero.
 No slot ever becomes active, so the gap is upstream: the game never *requests* a sound. Tools:
 `WWHD_PEEK=addr:len`, build/axcb.json (reachable set), lldb recipe build/axcb.lldb.
+
+## State at the end of session 1 (2026-10-12)
+Playable: boots, intro, Great Plateau, menus, NPCs, saving, DLC mounted, ~30 fps at 1x on an M4.
+Not working / open, in the order I would take them:
+1. **Hitches.** `[hitch]` log lines (frames over 45 ms, WWHD_HITCH_MS) showed 47 of 62 hitches came with
+   bursts of new pipelines (hundreds in one frame). Cause: the cache replay queues ~60k pipelines but
+   built 16 + 16 shaders per frame. cache_warm_step now has a time budget scaled by frame slack
+   (WWHD_WARM_MS=0 restores the old fixed counts, WWHD_BG_COMPILES caps compiles in flight).
+   **UNTESTED**: compare `[hitch]` counts with the previous session (62 hitches, 47 with >=20 pipelines).
+2. **Vertex shader variants.** The remaining shader-variant growth is vertex shaders split by the pixel
+   shader's input layout (WWHD_KEY_DIFF=1 prints the fields). Fix idea: name VS outputs / PS inputs by
+   semantic id so the two stages do not depend on each other (Metal links `[[user(...)]]` by name);
+   unfed PS inputs become constants (see linkPSInputsToVS, GLSL header). Touches LatteDecompilerEmitMSLHeader.hpp.
+3. **Audio** (see "Audio investigation"): the game never requests a sound.
+4. Black save thumbnails (GPU -> guest readback), real occlusion queries, 60 fps / resolution options.
+Done this session beyond the first commits: base instance, point limits, DLC, stream-out (also without a
+render target), per-page surface index for texture invalidation, shader cache writer thread, shader keys
+limited to the texture units and stage registers a program reads (cache 1.1 GB -> 0.25 GB), Cemu's fast
+tile decode written straight into staging memory (verified on 27k textures).
+Debug switches: WWHD_TRACE_LIB, WWHD_PEEK, WWHD_AX_STATS, WWHD_KEY_DIFF, WWHD_VERIFY_DETILE, WWHD_HITCH_MS.

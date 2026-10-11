@@ -1,3 +1,4 @@
+#include <chrono>
 #include "perf_metrics.h"
 #include "gfx/capture_schedule.h"
 #include "savestate.h"
@@ -520,6 +521,37 @@ void swap() {
         flush();
     }
     perf::gpu_advance(R.frame);
+    {
+        // Hitch log: a frame over 45 ms of wall time gets one line saying what the render thread did
+        // in it (texture work, new shaders/pipelines, passes split), so stutters can be attributed.
+        // WWHD_HITCH_MS changes the threshold; 0 turns it off.
+        static const double threshold = getenv("WWHD_HITCH_MS") ? atof(getenv("WWHD_HITCH_MS")) : 45.0;
+        extern double g_stat_hash_ms, g_stat_decode_ms;
+        extern uint64_t g_stat_pass_splits, g_stat_uploads;
+        void compile_counters(size_t*, size_t*, double*, double*);
+        struct Snap { double wall, cpu, hash, decode, decompile, msl; uint64_t uploads, splits; size_t shaders, pipelines; };
+        static Snap last{};
+        Snap now{};
+        now.wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        now.cpu = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+        now.hash = g_stat_hash_ms;
+        now.decode = g_stat_decode_ms;
+        now.uploads = g_stat_uploads;
+        now.splits = g_stat_pass_splits;
+        compile_counters(&now.shaders, &now.pipelines, &now.decompile, &now.msl);
+        // the 300-frame report resets hash/decode/splits: never let a reset look negative
+        auto d = [](double a, double b) { return a >= b ? a - b : a; };
+        auto du = [](uint64_t a, uint64_t b) { return a >= b ? a - b : a; };
+        if (threshold > 0 && last.wall > 0 && now.wall - last.wall > threshold)
+            LOG("[hitch] frame %llu: %.0f ms (render thread CPU %.0f ms) | textures: %llu uploads, decode %.0f ms, hash %.0f ms | "
+                "shaders +%zu (%.0f ms translate, %.0f ms compile), pipelines +%zu | passes split %llu",
+                (unsigned long long)R.frame, now.wall - last.wall, now.cpu - last.cpu, (unsigned long long)du(now.uploads, last.uploads),
+                d(now.decode, last.decode), d(now.hash, last.hash), now.shaders - last.shaders, now.decompile - last.decompile,
+                now.msl - last.msl, now.pipelines - last.pipelines, (unsigned long long)du(now.splits, last.splits));
+        last = now;
+    }
     if (R.frame % 300 == 1) {
         // render thread CPU time (excludes sleeping and GPU waits), for performance comparisons
         timespec ts{};
