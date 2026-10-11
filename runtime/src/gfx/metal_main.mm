@@ -19,6 +19,8 @@
 // gameplay mods (runtime/src/mods): HUD drawn into the TV image
 namespace mods { void draw_overlay(id<MTLCommandBuffer> cmd, id<MTLTexture> tex); }
 
+// texture invalidation statistics (see invalidate, note_surface_range)
+static uint64_t g_inval_texture = 0, g_inval_passed = 0, g_pages_marked = 0;
 namespace gfx {
 Renderer R;
 // GPU depth peeks for the game's sun visibility test (fork 73b54e1, Metal adaptation).
@@ -527,8 +529,33 @@ void swap() {
         LOG("[gfx] frame %llu, %llu draws so far, GPU %.1f ms/frame, render thread CPU %.2f ms/frame", (unsigned long long)R.frame,
             (unsigned long long)R.drawCount, g_gpu_ns.exchange(0) / 1e6 / 300.0, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
         lastCpu = cpu;
+        LOG("[inval] texture invalidates %llu, with candidates %llu, surfaces examined %llu",
+            (unsigned long long)g_inval_texture, (unsigned long long)g_inval_passed, (unsigned long long)g_pages_marked);
         void report_skips();
         report_skips();
+    }
+}
+
+// Index for invalidate(): page (4 KiB) -> surfaces whose checked range (invalidate's size estimate or
+// its level ranges) touches it. BotW has thousands of surfaces and invalidates ~460 times a frame,
+// nearly always over texture memory but overlapping no surface; walking the whole table each time
+// was the largest single cost of the render thread. A range over kBigPages pages goes in a short list
+// that every invalidation checks instead of filling thousands of buckets.
+static constexpr uint64_t kBigPages = 256;
+static std::unordered_map<uint32_t, std::vector<Surface*>> g_page_surfaces;
+static std::vector<Surface*> g_big_surfaces;
+void note_surface_range(Surface* s, uint32_t addr, uint32_t size) {
+    if (!size) return;
+    uint64_t first = addr >> 12, last = ((uint64_t)addr + size - 1) >> 12;
+    if (last - first >= kBigPages) {
+        static int big = 0;
+        if (big++ < 12) LOG("[inval] large surface range %08X+%X", addr, size);
+        if (std::find(g_big_surfaces.begin(), g_big_surfaces.end(), s) == g_big_surfaces.end()) g_big_surfaces.push_back(s);
+        return;
+    }
+    for (uint64_t pg = first; pg <= last; pg++) {
+        auto& v = g_page_surfaces[(uint32_t)pg];
+        if (v.empty() || v.back() != s) v.push_back(s);
     }
 }
 
@@ -544,6 +571,8 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
     // "invalidate everything" (sent several times per frame) carries no information about CPU writes;
     // changed textures are caught by the write tracking (write_watch.h, metal_surfaces.mm check_texture)
     if (size >= 0x10000000) return;
+    g_inval_texture++;
+    if (!size) return;
     uint64_t end = (uint64_t)addr + size;
     auto hits = [&](Surface* s) {
         // every level once known (after the first check), else the base level estimate
@@ -552,9 +581,10 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
             if (addr < (uint64_t)b + n && b < end) return true;
         return false;
     };
-    for (auto& [a, s] : R.surfaces)
+    auto mark = [&](Surface* s) {
+        uint32_t a = s->addr;
         // MEM1 holds render targets; CPU-side surfaces there are views of GPU data, not CPU uploads
-        if (!s->gpuWritten && !(a >= 0xF4000000 && a < 0xF6000000) && hits(s.get())) {
+        if (!s->gpuWritten && !(a >= 0xF4000000 && a < 0xF6000000) && hits(s)) {
             s->lastCheckedFrame = ~0ull;
             s->dirty = true;
             g_stat_invalidated_surfaces++;
@@ -562,6 +592,22 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
             if (getenv("WWHD_LOG_INVALIDATE") && lg++ < 300)
                 LOG("[inval]   marks %08X %ux%u fmt %X size %X (range %08X+%X)", a, s->width, s->height, s->format, s->dataSize, addr, size);
         }
+    };
+    uint64_t firstPage = addr >> 12, lastPage = (end - 1) >> 12;
+    if (lastPage - firstPage > 4 * kBigPages) {  // a huge invalidation: look at everything
+        for (auto& [a, s] : R.surfaces) mark(s.get());
+        return;
+    }
+    static thread_local std::vector<Surface*> cand;  // render thread only
+    cand.assign(g_big_surfaces.begin(), g_big_surfaces.end());
+    for (uint64_t pg = firstPage; pg <= lastPage; pg++)
+        if (auto it = g_page_surfaces.find((uint32_t)pg); it != g_page_surfaces.end())
+            cand.insert(cand.end(), it->second.begin(), it->second.end());
+    std::sort(cand.begin(), cand.end());
+    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+    g_inval_passed += !cand.empty();
+    g_pages_marked += cand.size();  // reported as "surfaces examined"
+    for (Surface* c : cand) mark(c);
 }
 
 }  // namespace gfx

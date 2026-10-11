@@ -16,6 +16,11 @@ namespace gfx {
 void peek_z(const uint32_t*, uint32_t);
 
 // A host texture backing a guest surface (render target, depth buffer or sampled texture).
+// index of the guest ranges each surface's texture check reads, so invalidate() only looks at the
+// surfaces sharing a 4 KiB page with the range (metal_main.mm); surfaces are never removed
+struct Surface;
+void note_surface_range(Surface* s, uint32_t addr, uint32_t size);
+
 struct Surface {
     std::shared_ptr<Surface> mipChain; // sampled companion assembled from GPU-rendered levels
     uint64_t mipChainSeq = ~0ull;

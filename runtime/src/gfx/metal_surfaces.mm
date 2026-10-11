@@ -413,6 +413,7 @@ Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering) {
         LOG("[gfx] render target %08X %ux%ux%u fmt %X%s -> %lux%lu", s->addr, s->width, s->height, s->slices, s->format,
             s->isDepth ? " depth" : "", (unsigned long)s->tex.width, (unsigned long)s->tex.height);
     Surface* raw = s.get();
+    note_surface_range(raw, s->addr, std::max<uint32_t>(s->dataSize, s->pitch * s->height * 4));  // as invalidate's estimate
     R.surfaces.emplace(d.addr, std::move(s));
     // format views of one guest surface (adopt_newer_alias): flag them once, so lookups stay cheap
     if (!raw->isDepth && !raw->fmt.compressed && raw->fmt.convert == Convert::NONE) {
@@ -670,6 +671,7 @@ static const std::vector<std::pair<uint32_t, uint32_t>>& level_ranges(Surface* s
         // clamp to the 4 GiB guest space (a bogus descriptor must not make the hash read past it)
         uint32_t size = (uint32_t)std::min<uint64_t>(info.surfSize, 0x100000000ull - base);
         s->levelRanges.push_back({base, size});
+        note_surface_range(s, base, size);
     }
     s->dataSize = s->levelRanges[0].second;
     return s->levelRanges;
