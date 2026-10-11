@@ -1,3 +1,5 @@
+#include <thread>
+#include <deque>
 #include "aspect.h"
 #include "aspect_panes.h"
 #include "renderer.h"
@@ -19,6 +21,7 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "render_prof.h"
 #include "gx2/gx2_cmd.h"
 #include "write_watch.h"
+#include "platform/host.h"
 #include "metal.h"
 #include "runtime.h"
 #include "util/helpers/StringBuf.h"
@@ -1364,8 +1367,7 @@ bool cache_saves_reg(uint32_t r) {
     return (r >= 0x2000 && r < 0x4000) || (r >= 0xA000 && r < 0xC000) || (r >= 0xE000 && r < 0x10000);
 }
 
-void cache_write(uint32_t type, const std::vector<uint8_t>& raw) {
-    if (!g_cache_out) return;
+void cache_write_now(uint32_t type, const std::vector<uint8_t>& raw) {
     uLongf csize = compressBound(raw.size());
     std::vector<uint8_t> comp(csize);
     if (compress2(comp.data(), &csize, raw.data(), raw.size(), 6) != Z_OK) return;
@@ -1373,6 +1375,53 @@ void cache_write(uint32_t type, const std::vector<uint8_t>& raw) {
     fwrite(hdr, sizeof hdr, 1, g_cache_out);
     fwrite(comp.data(), 1, csize, g_cache_out);
     fflush(g_cache_out);
+}
+
+// Records are compressed and appended on a thread of their own: a record holds the draw's
+// registers (~96 KiB raw), and BotW meets new shaders all the time while the world streams in, so
+// compressing them on the render thread made frame-time spikes. Pending records are written at exit.
+struct CacheWriter {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::pair<uint32_t, std::vector<uint8_t>>> queue;
+    bool stop = false;
+    std::thread worker;
+    void run() {
+        host::set_thread_name("shader cache");
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) {
+            cv.wait(lk, [&] { return stop || !queue.empty(); });
+            if (queue.empty()) return;
+            auto item = std::move(queue.front());
+            queue.pop_front();
+            lk.unlock();
+            cache_write_now(item.first, item.second);
+            lk.lock();
+        }
+    }
+    void push(uint32_t type, const std::vector<uint8_t>& raw) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (stop) return;  // shutting down
+            if (!worker.joinable()) worker = std::thread([this] { run(); });
+            queue.emplace_back(type, raw);
+        }
+        cv.notify_one();
+    }
+    ~CacheWriter() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+};
+CacheWriter g_cache_writer;
+
+void cache_write(uint32_t type, const std::vector<uint8_t>& raw) {
+    if (!g_cache_out) return;
+    g_cache_writer.push(type, raw);
 }
 
 template <class T> void put(std::vector<uint8_t>& v, const T& x) {
