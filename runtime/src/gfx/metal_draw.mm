@@ -436,7 +436,8 @@ namespace { extern bool g_cache_replaying; }  // shader cache (below)
 static uint32_t g_key_gather[2][400], g_key_gather_n[2];  // debug copy of the latest gather per stage
 static const bool g_key_diff = getenv("WWHD_KEY_DIFF") != nullptr;
 static const uint32_t* last_key_words(bool vertex, uint32_t* n) { *n = g_key_gather_n[vertex ? 0 : 1]; return g_key_gather[vertex ? 0 : 1]; }
-static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase, uint32_t unitMask = 0x3FFFF) {
+static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase, uint32_t unitMask = 0x3FFFF,
+                                 const LatteFetchShader* fs = nullptr) {
     // most lookups gather the same words as the previous one for this stage (the state generation
     // also moves for registers that don't end up here): gather into the spare buffer and compare
     // instead of rehashing. Render thread only.
@@ -454,7 +455,23 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     auto put = [&](uint32_t first, uint32_t count) { memcpy(&buf[n], &regs[first], count * 4); n += count; };
     auto skip = [&](uint32_t count) { memset(&buf[n], 0, count * 4); n += count; };
     auto putIf = [&](bool keep, uint32_t first, uint32_t count) { if (keep) put(first, count); else skip(count); };
-    putIf(vs, mmSQ_VTX_SEMANTIC_0, 32);           // vertex fetch
+    // vertex fetch: the translator maps each attribute the fetch shader provides to the first semantic
+    // table entry holding its semantic; the other entries (stale or repeated) change nothing, and hashing
+    // them made a variant per leftover table (the largest source of variants after the linkage fix)
+    if (vs && fs) {
+        bool want[256] = {}, seen[256] = {};
+        for (auto* groups : {&fs->bufferGroups, &fs->bufferGroupsInvalid})
+            for (auto& g : *groups)
+                for (uint32_t i = 0; i < g.attribCount; i++) want[g.attrib[i].semanticId] = true;
+        for (uint32_t f = 0; f < 32; f++) {
+            const uint32_t v = regs[mmSQ_VTX_SEMANTIC_0 + f];
+            const bool used = v < 256 && want[v] && !seen[v];
+            if (used) seen[v] = true;
+            buf[n++] = used ? v | 0x100u : 0;
+        }
+    } else {
+        putIf(vs, mmSQ_VTX_SEMANTIC_0, 32);
+    }
     // VS exports <-> PS inputs (both stages link through these). Only the entries in use: the VS's export
     // semantics up to its export count, the PS's inputs up to SPI_PS_IN_CONTROL_0's count (what the GPU and
     // the translator read). The registers past them keep whatever earlier shaders left, and hashing those
@@ -628,7 +645,7 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         if (uu != g_used_units.end()) unitMask = uu->second;
     }
     key = stage_state_hash(regs, key ^ (unitMask == 0x3FFFF ? 0 : 0x5EED0001u),
-                           vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask);
+                           vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask, vertex ? fs : nullptr);
     if (vertex) key ^= fsKey * 31;
     if (vertex && regs[mmVGT_STRMOUT_EN]) {  // stream out: the decompiler emits buffer writes with these strides
         // only the four stride registers (+4 apart): the buffer bases and write offsets between them
@@ -638,7 +655,34 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         key = hash_bytes(strides, sizeof strides, key ^ 0x5717E0u);
     }
     auto it = g_shaders.find(key);
-    if (it != g_shaders.end()) return it->second;
+    if (it != g_shaders.end()) {
+        // debug: WWHD_VERIFY_KEY=1 (with WWHD_KEEP_MSL=1) translates a lookup that hit an existing shader again and
+        // compares the Metal source: a difference means the key dropped something the translation reads
+        static const bool verifyKey = getenv("WWHD_VERIFY_KEY") != nullptr;
+        if (verifyKey && it->second && it->second->dec && it->second->dec->strBuf_shaderSource) {
+            Shader probe;
+            const bool wasDefer = g_defer_compiles;
+            g_defer_compiles = true;  // translate only
+            translate_shader(&probe, regs, vertex, fs, base, addr, size, false);
+            g_defer_compiles = wasDefer;
+            if (!g_deferred_shaders.empty() && g_deferred_shaders.back() == &probe) g_deferred_shaders.pop_back();
+            static std::atomic<uint64_t> checked{0}, differ{0};
+            checked++;
+            if (probe.dec && probe.dec->strBuf_shaderSource &&
+                strcmp(probe.dec->strBuf_shaderSource->c_str(), it->second->dec->strBuf_shaderSource->c_str()) != 0) {
+                if (differ++ < 20) {
+                    char name[96];
+                    snprintf(name, sizeof name, "build/keydiff_%016llx_%llu.metal", (unsigned long long)key, (unsigned long long)differ.load());
+                    if (FILE* f = fopen(name, "w")) { fputs(probe.dec->strBuf_shaderSource->c_str(), f); fclose(f); }
+                    snprintf(name, sizeof name, "build/keydiff_%016llx_kept.metal", (unsigned long long)key);
+                    if (FILE* f = fopen(name, "w")) { fputs(it->second->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
+                    LOG("[verifykey] %s %08X key %016llx: same key, different translation", vertex ? "VS" : "PS", addr, (unsigned long long)key);
+                }
+            }
+            if (checked % 20000 == 0) LOG("[verifykey] %llu duplicate lookups checked, %llu differed", (unsigned long long)checked.load(), (unsigned long long)differ.load());
+        }
+        return it->second;
+    }
     if (g_key_diff && !g_cache_replaying) {
         // which part of the key made this program a new shader (compared with its first variant)
         struct First { std::vector<uint32_t> words; uint64_t fsKey; uint32_t mask; };
