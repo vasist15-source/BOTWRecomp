@@ -45,6 +45,11 @@ struct Surface {
     bool isDepth = false;
     bool gpuWritten = false;   // contents produced by the GPU; never reload from guest memory
     uint64_t writeSeq = 0;     // when the GPU last wrote it (several surfaces can alias one address)
+    // a 2D image the game samples as a cube map: a cube with that image on all six faces (a cube view
+    // of a 2D texture is invalid in Metal), refreshed when the image is written again
+    id<MTLTexture> cubeProxy = nil;
+    uint64_t cubeProxySeq = ~0ull;
+    void* cubeProxySrc = nullptr;
     bool formatViews = false;     // another surface at this address has the same texel bits in another format (adopt_newer_alias)
     uint64_t writtenBackSeq = 0;  // writeSeq when last written back to guest memory (linear surfaces)
     uint64_t contentHash = 0;  // hash of all guest bytes (every level) at the last check

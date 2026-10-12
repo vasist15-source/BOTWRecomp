@@ -1247,6 +1247,41 @@ static id<MTLTexture> null_texture(MTLTextureType type) {
     return t;
 }
 
+static bool whole_cube(id<MTLTexture> t) {
+    return t && t.textureType != MTLTextureType2D && t.textureType != MTLTextureType3D && layer_count(t) >= 6;
+}
+// before the draw's pass opens (it blits): the six-face copy of a 2D image sampled as a cube
+static void update_cube_proxy(Surface* s) {
+    if (!s->tex || whole_cube(s->tex)) return;
+    id<MTLTexture> src = s->tex;
+    if (s->cubeProxySrc == (__bridge void*)src && s->cubeProxySeq == s->writeSeq) return;
+    const NSUInteger edge = std::min(src.width, src.height);  // cube faces are square
+    if (!s->cubeProxy || s->cubeProxy.width != edge || s->cubeProxy.pixelFormat != src.pixelFormat ||
+        s->cubeProxy.mipmapLevelCount != src.mipmapLevelCount) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor new];
+        d.textureType = MTLTextureTypeCubeArray;
+        d.pixelFormat = src.pixelFormat;
+        d.width = d.height = edge;
+        d.arrayLength = 1;
+        d.mipmapLevelCount = src.mipmapLevelCount;
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        s->cubeProxy = [R.device newTextureWithDescriptor:d];
+        if (!s->cubeProxy) return;
+    }
+    end_encoder();
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
+    for (NSUInteger level = 0; level < src.mipmapLevelCount; level++) {
+        const NSUInteger e = std::max<NSUInteger>(edge >> level, 1);
+        for (NSUInteger face = 0; face < 6; face++)
+            [b copyFromTexture:src sourceSlice:0 sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(e, e, 1)
+                     toTexture:s->cubeProxy destinationSlice:face destinationLevel:level destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+    [b endEncoding];
+    s->cubeProxySrc = (__bridge void*)src;
+    s->cubeProxySeq = s->writeSeq;
+}
+
 // texture view with the shader's expected type and the resource's component swizzle
 static std::unordered_map<uint64_t, id<MTLTexture>> g_views;
 void forget_texture_views() { g_views.clear(); }
@@ -1255,34 +1290,32 @@ static id<MTLTexture> texture_view(Surface* s, MTLTextureType type, uint32_t wor
     LATTE_SQ_TEX_RESOURCE_WORD4_N w4;
     memcpy(&w4, &word4, 4);
     uint32_t sel[4] = {(uint32_t)w4.get_DST_SEL_X(), (uint32_t)w4.get_DST_SEL_Y(), (uint32_t)w4.get_DST_SEL_Z(), (uint32_t)w4.get_DST_SEL_W()};
-    uint64_t key = (uint64_t)(uintptr_t)(__bridge void*)s->tex ^ ((uint64_t)type << 56) ^ ((uint64_t)(sel[0] | sel[1] << 4 | sel[2] << 8 | sel[3] << 12) << 40);
+    const bool cube = type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray;
+    id<MTLTexture> base = cube && !whole_cube(s->tex) ? s->cubeProxy : s->tex;  // a 2D image as a cube: its six-face copy
+    if (!base) return nil;
+    uint64_t key = (uint64_t)(uintptr_t)(__bridge void*)base ^ ((uint64_t)type << 56) ^ ((uint64_t)(sel[0] | sel[1] << 4 | sel[2] << 8 | sel[3] << 12) << 40);
     auto it = g_views.find(key);
     if (it != g_views.end()) return it->second;
     static const MTLTextureSwizzle sw[8] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha,
                                             MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleZero, MTLTextureSwizzleZero};
     MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(sw[sel[0]], sw[sel[1]], sw[sel[2]], sw[sel[3]]);
-    NSUInteger slices = layer_count(s->tex);
-    // a cube view needs whole cubes: a 2D texture (or a short array) the game sampled as a cube has
-    // none (an invalid view samples garbage), so it reads as missing (black) instead
-    if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) {
-        if (slices < 6 || s->tex.textureType == MTLTextureType2D) return nil;
-        slices -= slices % 6;
-    }
+    NSUInteger slices = layer_count(base);
+    if (cube) slices -= slices % 6;  // whole cubes
     if ((type == MTLTextureType2D || type == MTLTextureType1D) && slices > 1) slices = 1;
-    if (type == MTLTextureType2DArray && s->tex.textureType == MTLTextureType2D) slices = 1;
-    if (type == MTLTextureType3D && s->tex.textureType != MTLTextureType3D) return nil;
-    if (s->tex.textureType == MTLTextureType3D && type != MTLTextureType3D) return nil;
+    if (type == MTLTextureType2DArray && base.textureType == MTLTextureType2D) slices = 1;
+    if (type == MTLTextureType3D && base.textureType != MTLTextureType3D) return nil;
+    if (base.textureType == MTLTextureType3D && type != MTLTextureType3D) return nil;
     id<MTLTexture> v;
     if (s->fmt.depth) {
         // depth formats can't be swizzled; samplers read .x
-        v = [s->tex newTextureViewWithPixelFormat:s->tex.pixelFormat
+        v = [base newTextureViewWithPixelFormat:base.pixelFormat
                                       textureType:type
-                                           levels:NSMakeRange(0, s->tex.mipmapLevelCount)
+                                           levels:NSMakeRange(0, base.mipmapLevelCount)
                                            slices:NSMakeRange(0, slices)];
     } else {
-        v = [s->tex newTextureViewWithPixelFormat:s->tex.pixelFormat
+        v = [base newTextureViewWithPixelFormat:base.pixelFormat
                                       textureType:type
-                                           levels:NSMakeRange(0, s->tex.mipmapLevelCount)
+                                           levels:NSMakeRange(0, base.mipmapLevelCount)
                                            slices:NSMakeRange(0, slices)
                                           swizzle:ch];
     }
@@ -1290,7 +1323,7 @@ static id<MTLTexture> texture_view(Surface* s, MTLTextureType type, uint32_t wor
         static int warned = 0;
         if (warned++ < 10)
             LOG("[gfx] texture view failed: %ux%u pixel %lu type %lu -> %lu", s->width, s->height, (unsigned long)s->tex.pixelFormat,
-                (unsigned long)s->tex.textureType, (unsigned long)type);
+                (unsigned long)base.textureType, (unsigned long)type);
     }
     g_views[key] = v;
     return v;
@@ -2526,6 +2559,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         for (int u = 0; u < sh->dec->textureUnitListCount; u++) {
             uint8_t unit = sh->dec->textureUnitList[u];
             Surface* s = sampled_texture(&regs[texBase + unit * 7], sh->dec->textureUsesDepthCompare[unit]);
+            if (s && sh->dec->textureUnitDim[unit] == Latte::E_DIM::DIM_CUBEMAP) update_cube_proxy(s);
             if (unit < 18) { g_unit_tex[st][unit] = s; g_unit_tex_valid[st][unit] = true; }
             if (s && nSampled < 64) sampled[nSampled++] = s;
         }
