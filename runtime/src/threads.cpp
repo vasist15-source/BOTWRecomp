@@ -808,6 +808,14 @@ HLE(coreinit, OSSleepTicks) {
     }
 }
 HLE(coreinit, OSSetThreadName) { st32(arg(c, 0) + osthread::kName, arg(c, 1)); }
+// the thread's core mask (OSThread +0x304, set at creation and by OSSetThreadAffinity); the
+// Havok physics workers read it and got 0 ("no core") while it was unimplemented
+HLE(coreinit, OSGetThreadAffinity) {
+    uint32_t m = ld32(arg(c, 0) + osthread::kAffinity) & 7;
+    if (!m)
+        if (HostThread* ht = host_thread(arg(c, 0))) m = 1u << (ht->core & 3);
+    ret(c, m);
+}
 HLE(coreinit, OSSetThreadAffinity) {
     st32(arg(c, 0) + osthread::kAffinity, arg(c, 1));
     if (HostThread* ht = host_thread(arg(c, 0))) ht->core = core_from_affinity(arg(c, 1), ht->core);  // applies at next schedule

@@ -914,6 +914,58 @@ HLE(gx2, GX2GetSwapStatus) {
     if (arg(c, 3)) st64(arg(c, 3), timebase::guest_now());
 }
 HLE(gx2, GX2SetSwapInterval) { g_swap_interval = std::max<uint32>(arg(c, 0), 1); }
+// GX2 event callbacks (GX2SetEventCallback): BotW registers vsync (2) and flip (3) handlers; its
+// vsync handler counts vsyncs (1046D420, also its GX2SetGPUFence value) and the flip handler records
+// that count per frame. A host thread calls them like Cemu's event callback thread: vsync at
+// 59.94 Hz, then one flip callback per flip executed since. callback(eventType, userData).
+static std::atomic<uint32_t> g_event_cb[5], g_event_ud[5];
+static void event_callback_thread() {
+    Cpu* c = threads::make_service_cpu("GX2 event", 0x8000);
+    host::set_thread_name("GX2 event");
+    uint64_t seenFlips;
+    {
+        std::lock_guard<std::mutex> lk(g_flip_mutex);
+        seenFlips = g_flip_count;
+    }
+    auto next = std::chrono::steady_clock::now();
+    for (;;) {
+        next += kVsyncPeriod;
+        std::this_thread::sleep_until(next);
+        if (std::chrono::steady_clock::now() > next + 4 * kVsyncPeriod) next = std::chrono::steady_clock::now();  // fell behind
+        uint64_t flips;
+        {
+            std::lock_guard<std::mutex> lk(g_flip_mutex);
+            update_flips();
+            flips = g_flip_count;
+        }
+        const uint32_t vcb = g_event_cb[2].load(), fcb = g_event_cb[3].load();
+        if (!vcb && !fcb) { seenFlips = flips; continue; }
+        threads::service_begin();
+        threads::set_service_core(1);
+        bool took = threads::ensure_core();
+        if (vcb) guest_call(c, vcb, {2u, g_event_ud[2].load()});
+        if (fcb)
+            for (uint64_t n = std::min<uint64_t>(flips - seenFlips, 2); n > 0; n--) guest_call(c, fcb, {3u, g_event_ud[3].load()});
+        seenFlips = flips;
+        if (took) threads::release_core();
+        threads::service_end();
+    }
+}
+HLE(gx2, GX2SetEventCallback) {
+    const uint32_t type = arg(c, 0);
+    if (type >= 5) return;
+    g_event_cb[type] = arg(c, 1);
+    g_event_ud[type] = arg(c, 2);
+    LOG("[gx2] event callback %u: %08X (user data %08X)", type, arg(c, 1), arg(c, 2));
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(event_callback_thread).detach(); });
+}
+HLE(gx2, GX2GetEventCallback) {
+    const uint32_t type = arg(c, 0);
+    if (type >= 5) return;
+    if (arg(c, 1)) st32(arg(c, 1), g_event_cb[type]);
+    if (arg(c, 2)) st32(arg(c, 2), g_event_ud[type]);
+}
 HLE(gx2, GX2WaitForVsync) {
     if(uncapped_benchmark()) {
         BlockingScope b;
