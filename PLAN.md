@@ -123,3 +123,15 @@ system, so the game never sent a real command), and AX voice positions overflowe
 nibble addresses of sample data at 0xA5xxxxxx). Open: a burst of noise was heard once after loading
 a save; if it recurs, suspects are the per-voice biquad/LPF filters (BotW updates them constantly,
 WWHD never used them) and stream voices (type 1).
+
+## State 2026-10-12 (end of day)
+
+Fixed today: GX2DrawDone stall (2x 10 -> ~28 fps), audio (rendezvous per core, 64-bit AX positions),
+save thumbnails, 463 failed pipelines, async linear write-back, render-pass merging (-25% attachment
+traffic), GX2 vsync/flip callbacks + GX2SetGPUFence (menus ran at 60 fps, now the game's own 30 cap),
+OSGetThreadAffinity.
+Open: white pond water (lighting pass PS 3C44E300 adds it; its depth/normal/albedo inputs check out,
+cube-array index fine; next: compare that shader's MSL with Cemu's GLSL / render it in Cemu);
+foliage looks flat/bright; first-visit shader hitches; GPU ~30 ms/frame at 2x.
+Tools: F12 capture (draws.log, full-screen pass targets, their inputs and PS MSL), WWHD_PASS_DUMP,
+WWHD_FUNC_COUNT, WWHD_ORDER, WWHD_MSG_DUMP, WWHD_PROFILE=1.
