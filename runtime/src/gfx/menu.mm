@@ -47,7 +47,7 @@ static void cycle_res() {
 
 
 
-namespace gx2 { uint64_t flips_presented(); bool uncapped(); }
+namespace gx2 { uint64_t flips_presented(); bool uncapped(); int fps_target(); void set_fps_target(int fps); }
 #include "../mods/mods.h"
 #include "../overlay/overlay.h"
 namespace ax { void start_sound_trace(const char* path, double seconds); }
@@ -98,12 +98,9 @@ static void load_prefs() {
     if (saved(@"aniso", {"WWHD_ANISO"})) render::set_aniso([pref(@"aniso") boolValue]);
     if (saved(@"bloomStrength", {"WWHD_BLOOM_STRENGTH"})) render::set_bloom_strength([pref(@"bloomStrength") floatValue]);
     if (saved(@"fxaa", {"WWHD_FXAA"})) render::set_fxaa([pref(@"fxaa") boolValue]);
-    // frame rate: fps60 is the mode (0 30 fps, 1 frame interpolation, 2 true 60; the key predates
-    // 120/240 fps), interpFps the interpolation's rate; "keep game speed" for 60 and for 120/240 fps
-    if (saved(@"interpFps", {"WWHD_INTERP_FPS"})) interp::set_fps([pref(@"interpFps") intValue]);
-    if (saved(@"fps60", {"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"})) interp::set_mode([pref(@"fps60") intValue]);
-    if (saved(@"fps60Paced", {"WWHD_INTERP_PACED"})) interp::set_paced_interpolation_at(60, [pref(@"fps60Paced") boolValue]);
-    if (saved(@"fpsHighPaced", {"WWHD_INTERP_PACED"})) interp::set_paced_interpolation_at(120, [pref(@"fpsHighPaced") boolValue]);
+    // frame rate (BotW): 30 (the game's own), 60, or 0 (no cap). The Wind Waker interpolation modes
+    // (fps60, interpFps) do not apply to this game and are not loaded.
+    if (saved(@"botwFps", {"WWHD_FPS"})) gx2::set_fps_target([pref(@"botwFps") intValue]);
 #ifdef WWHD_HAS_VULKAN
     if (saved(@"vkPresentMode", {"WWHD_VK_PRESENT_MODE"})) gfxvk::set_present_mode([pref(@"vkPresentMode") intValue]);
 #endif
@@ -116,12 +113,7 @@ static void save_prefs() {
     if (!env_set({"WWHD_ANISO"})) set_pref(@"aniso", @(render::aniso()));
     if (!env_set({"WWHD_BLOOM_STRENGTH"})) set_pref(@"bloomStrength", @(render::bloom_strength()));
     if (!env_set({"WWHD_FXAA"})) set_pref(@"fxaa", @(render::fxaa()));
-    if (!env_set({"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"})) set_pref(@"fps60", @(interp::mode()));
-    if (!env_set({"WWHD_INTERP_FPS"})) set_pref(@"interpFps", @(interp::fps()));
-    if (!env_set({"WWHD_INTERP_PACED"})) {
-        set_pref(@"fps60Paced", @(interp::paced_interpolation_at(60)));
-        set_pref(@"fpsHighPaced", @(interp::paced_interpolation_at(120)));
-    }
+    if (!env_set({"WWHD_FPS"})) set_pref(@"botwFps", @(gx2::fps_target()));
 #ifdef WWHD_HAS_VULKAN
     if (!env_set({"WWHD_VK_PRESENT_MODE"})) set_pref(@"vkPresentMode", @(gfxvk::present_mode()));
 #endif
@@ -273,6 +265,7 @@ static WWStateMenu* g_state_menu;
     else input_map::apply_face_layout(m, item.tag == 1 ? input_map::FaceLayout::kLabels : input_map::FaceLayout::kPosition);
     input_map::set_current(m);
 }
+- (void)setFps:(NSMenuItem*)item { gx2::set_fps_target((int)item.tag); update_title(); }
 - (void)toggleInterp:(NSMenuItem*)item { interp::set_mode(interp::mode() == item.tag ? 0 : (int)item.tag); update_title(); }
 - (void)toggleInterpFps:(NSMenuItem*)item { interp::toggle_fps((int)item.tag); update_title(); }
 - (void)toggleDrcWindow:(NSMenuItem*)item { gfx::show_drc_window(!gfx::drc_window_shown()); }
@@ -307,6 +300,7 @@ static WWStateMenu* g_state_menu;
         bool on = fl == (item.tag == 1 ? input_map::FaceLayout::kLabels : input_map::FaceLayout::kPosition);
         item.state = on ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    if (item.action == @selector(setFps:)) item.state = gx2::fps_target() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
     if (item.action == @selector(toggleInterp:)) item.state = interp::mode() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
     if (item.action == @selector(toggleInterpFps:))
         item.state = interp::mode() == 1 && interp::fps() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
@@ -443,10 +437,9 @@ void install_menu(NSWindow* tv) {
     add(bloomMenu, @"200%", @selector(setBloom:), @"", 200);
     add(g, @"16x anisotropic filtering (N)", @selector(toggleAniso:), @"N");
     add(g, @"Edge smoothing, FXAA (8)", @selector(toggleFxaa:), @"8");
-    add(g, @"60 fps: frame interpolation (6)", @selector(toggleInterpFps:), @"6", 60);
-    add(g, @"120 fps: frame interpolation", @selector(toggleInterpFps:), @"", 120);
-    add(g, @"240 fps: frame interpolation", @selector(toggleInterpFps:), @"", 240);
-    add(g, @"60 fps: true 60, game logic at 60 steps/s (7, experimental)", @selector(toggleInterp:), @"7", 2);
+    add(g, @"Frame rate: 30 fps (original)", @selector(setFps:), @"", 30);
+    add(g, @"Frame rate: 60 fps (6)", @selector(setFps:), @"6", 60);
+    add(g, @"Frame rate: uncapped (7)", @selector(setFps:), @"7", 0);
     [g addItem:[NSMenuItem separatorItem]];
     add(g, @"Take Screenshot (F10)", @selector(screenshot:), @"").toolTip =
         @"Saves the TV picture as a PNG (internal resolution, without the settings overlay) in the screenshots folder. "
@@ -582,8 +575,8 @@ bool menu_hotkey(uint16_t code) {
     case kVK_ANSI_O: if (render::feature_available(render::kFeatureAO)) render::set_ao_mode((render::ao_mode() + 1) % 3); break;
     case kVK_ANSI_N: if (render::feature_available(render::kFeatureAniso)) render::set_aniso(!render::aniso()); break;
     case kVK_ANSI_M: if (render::feature_available(render::kFeatureAOHires)) render::set_ao_hires(!render::ao_hires()); break;
-    case kVK_ANSI_6: interp::toggle_fps(60); break;
-    case kVK_ANSI_7: interp::set_mode(interp::mode() == 2 ? 0 : 2); break;
+    case kVK_ANSI_6: gx2::set_fps_target(gx2::fps_target() == 60 ? 30 : 60); break;
+    case kVK_ANSI_7: gx2::set_fps_target(gx2::fps_target() == 0 ? 30 : 0); break;
     case kVK_ANSI_8: if (render::feature_available(render::kFeatureFXAA)) render::set_fxaa(!render::fxaa()); break;
     case kVK_ANSI_R: cycle_res(); break;
     case kVK_ANSI_P: case kVK_F12: render::request_capture(); return true;

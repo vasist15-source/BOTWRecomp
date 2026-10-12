@@ -69,7 +69,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../build_info.h"
 #include "../report_header.h"
 
-namespace gx2 { uint64_t flips_presented(); bool uncapped(); void set_uncapped(bool on); }
+namespace gx2 { uint64_t flips_presented(); bool uncapped(); void set_uncapped(bool on); int fps_target(); void set_fps_target(int fps); }
 
 namespace overlay {
 namespace {
@@ -663,43 +663,16 @@ void tab_graphics() {
         }
     }
     heading("Frame rate");
-    int m = interp::mode(), f = interp::fps();
-    if (radio("30 fps (original)", m == 0)) post_changed([] { interp::set_mode(0); });
-    for (int r : {60, 120, 240}) {
+    {
+        const int t = gx2::fps_target();
+        if (radio("30 fps (original)", t == 30)) post_changed([] { gx2::set_fps_target(30); });
         ImGui::SameLine();
-        char label[16];
-        snprintf(label, sizeof label, "%d fps", r);
-        if (radio(label, m == 1 && f == r)) post_changed([r] { interp::set_fps(r); interp::set_mode(1); });
-    }
-    help("60, 120 and 240 fps: frame interpolation. The game logic keeps its 30 steps a second, and the\n"
-         "frames in between are drawn blended (1 in-between frame per step at 60 fps, 3 at 120 fps,\n"
-         "7 at 240 fps). The display shows at most its refresh rate: higher choices draw that many.");
-    if (radio("True 60 (experimental)", m == 2)) post_changed([] { interp::set_mode(2); });
-    help("True 60 runs the game logic at 60 steps per second");
-    // the display's refresh rate, and what the chosen rate draws on it (interp::output_fps)
-    if (const int hz = interp::display_hz(); hz > 0) {
-        const int out = interp::output_fps();
-        if (m == 1 && out < f)
-            note("Your display: %d Hz. %d fps needs a %d Hz display; %d fps are drawn (the display cannot show more).", hz, f, f, out);
-        else if (m == 1 && f > hz + 2)
-            note("Your display: %d Hz. Frames beyond %d a second are drawn but not shown (presentation without vsync).", hz, hz);
-        else
-            note("Your display: %d Hz", hz);
-    } else if (m == 1 && f > 60) {
-        note("Display refresh rate unknown: %d fps are drawn; frames beyond the display's rate are not shown.", f);
-    }
-    if (m == 1) {
-        bool paced;
-        if (check("Keep game speed (recommended)", interp::paced_interpolation(), &paced, !getenv("WWHD_INTERP_PACED")))
-            post_changed([paced] { interp::set_paced_interpolation(paced); });
-        help("When the computer cannot draw all frames, skip in-between frames instead of slowing the\n"
-             "whole game down. The performance overlay shows how many are drawn.\n"
-             "Off: every logic step waits for all of its frames, so if the frame target is not reached\n"
-             "(e.g. 120/240 fps at a high internal resolution) the whole game runs in slow motion.\n"
-             "Saved separately for 60 fps (off by default) and 120/240 fps (on by default).");
-        if (!interp::paced_interpolation())
-            note("Off: if this computer cannot reach %d fps, the whole game slows down (the performance\n"
-                 "overlay then shows fewer than 30 logic steps/s). Turn it on to keep the game's speed.", interp::fps());
+        if (radio("60 fps", t == 60)) post_changed([] { gx2::set_fps_target(60); });
+        ImGui::SameLine();
+        if (radio("Uncapped", t == 0)) post_changed([] { gx2::set_fps_target(0); });
+        help("Above 30 fps the game's own frame-time scaling follows the real frame time, so it keeps its\n"
+             "normal speed at any frame rate (and no longer slows down when frames take longer than 1/30 s,\n"
+             "down to 20 fps). Uncapped: as many frames as this computer can draw, without vsync.");
     }
     // debug only, not saved (gx2::uncapped)
     bool unc;
