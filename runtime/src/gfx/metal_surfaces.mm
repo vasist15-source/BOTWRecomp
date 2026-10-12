@@ -32,9 +32,7 @@ static MTLTextureType texture_type(uint32_t dim, uint32_t slices) {
     switch ((Latte::E_DIM)dim) {
     case Latte::E_DIM::DIM_1D: return MTLTextureType1D;
     case Latte::E_DIM::DIM_3D: return MTLTextureType3D;
-    // cube maps are cube arrays: the shader translator declares every cube texture texturecube_array,
-    // and a cube texture bound there (or viewed as one) is undefined (white water reflections)
-    case Latte::E_DIM::DIM_CUBEMAP: return MTLTextureTypeCubeArray;
+    case Latte::E_DIM::DIM_CUBEMAP: return MTLTextureTypeCube;
     case Latte::E_DIM::DIM_1D_ARRAY: return MTLTextureType1DArray;
     case Latte::E_DIM::DIM_2D_ARRAY: case Latte::E_DIM::DIM_2D_ARRAY_MSAA: return MTLTextureType2DArray;
     default: return slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
@@ -168,7 +166,6 @@ static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, bool forRend
     td.depth = type == MTLTextureType3D ? s->slices : 1;
     td.arrayLength = (type == MTLTextureType2DArray || type == MTLTextureType1DArray) ? s->slices : 1;
     if (type == MTLTextureTypeCube) td.arrayLength = 1;
-    if (type == MTLTextureTypeCubeArray) td.arrayLength = std::max<uint32_t>(s->slices / 6, 1);
     td.mipmapLevelCount = s->mips;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | format_view_usage();
     td.storageMode = MTLStorageModePrivate;
@@ -640,7 +637,7 @@ static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
     static const bool off = getenv("WWHD_NO_ARRAY_LAYERS") != nullptr;
     const auto dim = (Latte::E_DIM)d.dim;
     if (off || !s || !s->tex || !s->gpuWritten || s->fmt.depth || s->fmt.compressed || d.slices < 2 || d.slices > 64 ||
-        (dim != Latte::E_DIM::DIM_2D_ARRAY && dim != Latte::E_DIM::DIM_CUBEMAP) || layer_count(s->tex) >= d.slices ||
+        dim != Latte::E_DIM::DIM_2D_ARRAY || layer_count(s->tex) >= d.slices ||
         s->tex.textureType != MTLTextureType2D)
         return s;
     const uint32_t w = (uint32_t)s->tex.width, h = (uint32_t)s->tex.height;
