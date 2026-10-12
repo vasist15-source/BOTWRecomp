@@ -390,13 +390,14 @@ static uint32 unpack_struct(const uint32* words, uint32 count, int slot) {
     return addr;
 }
 
-// Vulkan: GX2DrawDone queues the work instead of waiting for an idle device (the default on every
-// platform since 2026-10-07; WWHD_VK_LAZY_DRAW_DONE=0 restores the full wait). The Metal renderer
-// reads large vertex buffers straight from guest memory, so it keeps the real GPU wait.
+// GX2DrawDone queues the work instead of waiting for an idle GPU. WWHD kept the full wait on Metal
+// (its renderer reads large vertex buffers straight from guest memory); in BotW that wait was 55% of
+// the main thread's time. Flips still wait for the GPU frame (frames_completed), so the CPU stays at
+// most a frame ahead. WWHD_LAZY_DRAW_DONE=0 (Vulkan: WWHD_VK_LAZY_DRAW_DONE=0) restores the full wait.
 static bool lazy_draw_done() {
     static const bool on = [] {
-        const char* e = getenv("WWHD_VK_LAZY_DRAW_DONE");
-        return render::vulkan() && (!e || atoi(e) != 0);
+        const char* e = getenv(render::vulkan() ? "WWHD_VK_LAZY_DRAW_DONE" : "WWHD_LAZY_DRAW_DONE");
+        return !e || atoi(e) != 0;
     }();
     return on;
 }
