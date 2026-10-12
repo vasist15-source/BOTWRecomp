@@ -746,6 +746,7 @@ static bool g_draw_must_run = false;  // the current draw writes a target that i
 static std::unordered_map<uint32_t, uint64_t> g_target_drawn;  // render target address -> frame of its last draw
 static uint64_t g_must_run_waits = 0;
 static double g_must_run_wait_ms = 0;
+std::atomic<double> g_compile_wait_ms{0};  // render thread time spent waiting for compiles (hitch log)
 static bool wait_compiled(const std::atomic<int>& st) {
     static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 25.0;
     if (g_building_ahead) return st.load(std::memory_order_acquire) == CS_READY;
@@ -761,6 +762,7 @@ static bool wait_compiled(const std::atomic<int>& st) {
         }
         double dt = now_ms() - t0;
         spent += dt;
+        g_compile_wait_ms = g_compile_wait_ms.load() + dt;
         g_must_run_waits++;
         g_must_run_wait_ms += dt;
         static int logged = 0;
@@ -776,6 +778,7 @@ static bool wait_compiled(const std::atomic<int>& st) {
                               [&] { return st.load(std::memory_order_acquire) != CS_PENDING; });
     }
     spent += now_ms() - t0;
+    g_compile_wait_ms = g_compile_wait_ms.load() + (now_ms() - t0);
     return st.load(std::memory_order_acquire) == CS_READY;
 }
 
@@ -1159,6 +1162,7 @@ static Surface* hires_surface(Surface& dst, const Surface* like) {
             rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         }
+        time_render_pass(rp, __FILE_NAME__, __LINE__);
         [[command_buffer() renderCommandEncoderWithDescriptor:rp] endEncoding];
     }
     return &dst;
@@ -1338,28 +1342,46 @@ std::atomic<uint64_t> g_pass_stats_merged{0};  // draws kept in a pass whose tar
 static id<MTLCounterSampleBuffer> g_pt_buf = nil;
 static std::vector<std::string> g_pt_desc;
 static std::vector<uint64_t> g_pt_draws;
+// WWHD_GPU_PASS_TIMES=auto: the frame after a slow one (over 40 ms) is timed, from frame 1500 on,
+// up to 5 times, 300+ frames apart (pass_timing_arm, from swap)
+static uint64_t g_pt_auto_frame = 0;
 static uint64_t g_pt_frame() {
-    static const uint64_t f = getenv("WWHD_GPU_PASS_TIMES") ? strtoull(getenv("WWHD_GPU_PASS_TIMES"), nullptr, 10) : 0;
-    return f;
+    static const char* e = getenv("WWHD_GPU_PASS_TIMES");
+    static const uint64_t f = e && strcmp(e, "auto") ? strtoull(e, nullptr, 10) : 0;
+    return f ? f : g_pt_auto_frame;
 }
 static bool pass_timing_on() { return g_pt_frame() && R.frame == g_pt_frame(); }
-static void pass_timing_attach(MTLRenderPassDescriptor* rp, const std::string& desc) {
+void pass_timing_arm(double lastFrameMs) {
+    static const bool autoMode = getenv("WWHD_GPU_PASS_TIMES") && !strcmp(getenv("WWHD_GPU_PASS_TIMES"), "auto");
+    static int armed = 0;
+    if (!autoMode || armed >= 5 || R.frame < 1500 || lastFrameMs < 40) return;
+    if (g_pt_auto_frame && R.frame < g_pt_auto_frame + 300) return;
+    g_pt_auto_frame = R.frame + 1;
+    armed++;
+    LOG("[gputime] timing frame %llu (frame %llu took %.1f ms)", (unsigned long long)g_pt_auto_frame, (unsigned long long)R.frame, lastFrameMs);
+}
+static std::vector<uint8_t> g_pt_blit;  // 1: a blit encoder (only samples 4i+2, 4i+3 are written)
+static std::vector<const Shader*> g_pt_shader;  // the first draw's pixel shader (render passes from draws)
+static bool pass_timing_buffer() {
     if (!g_pt_buf) {
-        if (![R.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { LOG("[gputime] no stage-boundary counters"); return; }
+        if (![R.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { LOG("[gputime] no stage-boundary counters"); return false; }
         id<MTLCounterSet> ts = nil;
         for (id<MTLCounterSet> cs in R.device.counterSets)
             if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
-        if (!ts) { LOG("[gputime] no timestamp counter set"); return; }
+        if (!ts) { LOG("[gputime] no timestamp counter set"); return false; }
         MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
         d.counterSet = ts;
         d.sampleCount = 4096;
         d.storageMode = MTLStorageModeShared;
         NSError* err = nil;
         g_pt_buf = [R.device newCounterSampleBufferWithDescriptor:d error:&err];
-        if (!g_pt_buf) { LOG("[gputime] sample buffer: %s", err.localizedDescription.UTF8String); return; }
+        if (!g_pt_buf) { LOG("[gputime] sample buffer: %s", err.localizedDescription.UTF8String); return false; }
     }
+    return 4 * g_pt_desc.size() + 3 < 4096;
+}
+static void pass_timing_attach(MTLRenderPassDescriptor* rp, const std::string& desc) {
+    if (!pass_timing_buffer()) return;
     const size_t i = g_pt_desc.size();
-    if (4 * i + 3 >= 4096) return;
     rp.sampleBufferAttachments[0].sampleBuffer = g_pt_buf;
     rp.sampleBufferAttachments[0].startOfVertexSampleIndex = 4 * i;
     rp.sampleBufferAttachments[0].endOfVertexSampleIndex = 4 * i + 1;
@@ -1367,12 +1389,39 @@ static void pass_timing_attach(MTLRenderPassDescriptor* rp, const std::string& d
     rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = 4 * i + 3;
     g_pt_desc.push_back(desc);
     g_pt_draws.push_back(R.drawCount);
+    g_pt_blit.push_back(0);
+    g_pt_shader.push_back(nullptr);
+}
+// the other GPU work of a timed frame: blits (copies, mip chains, readbacks) and render passes outside draws
+id<MTLBlitCommandEncoder> timed_blit_encoder(const char* file, int line) {
+    if (!pass_timing_on() || !pass_timing_buffer()) return [command_buffer() blitCommandEncoder];
+    const size_t i = g_pt_desc.size();
+    MTLBlitPassDescriptor* bp = [MTLBlitPassDescriptor blitPassDescriptor];
+    bp.sampleBufferAttachments[0].sampleBuffer = g_pt_buf;
+    bp.sampleBufferAttachments[0].startOfEncoderSampleIndex = 4 * i + 2;
+    bp.sampleBufferAttachments[0].endOfEncoderSampleIndex = 4 * i + 3;
+    char b[96];
+    snprintf(b, sizeof b, "blit %s:%d", file, line);
+    g_pt_desc.push_back(b);
+    g_pt_draws.push_back(R.drawCount);
+    g_pt_blit.push_back(1);
+    g_pt_shader.push_back(nullptr);
+    return [command_buffer() blitCommandEncoderWithDescriptor:bp];
+}
+void time_render_pass(MTLRenderPassDescriptor* rp, const char* file, int line) {
+    if (!pass_timing_on()) return;
+    char b[96];
+    snprintf(b, sizeof b, "pass %s:%d", file, line);
+    pass_timing_attach(rp, b);
 }
 // swap(), at the end of the timed frame: report once its command buffers have completed
 void pass_timing_end_frame(id<MTLCommandBuffer> last) {
     if (!pass_timing_on() || !g_pt_buf || g_pt_desc.empty()) return;
     auto desc = g_pt_desc;
+    auto shaders = g_pt_shader;
+    struct Clear { ~Clear() { g_pt_desc.clear(); g_pt_draws.clear(); g_pt_blit.clear(); g_pt_shader.clear(); } } clearAfter;
     auto draws = g_pt_draws;
+    auto blit = g_pt_blit;
     draws.push_back(R.drawCount);
     id<MTLCounterSampleBuffer> buf = g_pt_buf;
     [last addCompletedHandler:^(id<MTLCommandBuffer>) {
@@ -1386,10 +1435,10 @@ void pass_timing_end_frame(id<MTLCommandBuffer> last) {
         auto span = [&](uint64_t a, uint64_t b) { return (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) ? 0.0 : (b - a) / 1e6; };
         for (size_t i = 0; i < desc.size(); i++) {
             const uint64_t* x = &t[4 * i].timestamp;
-            double vs = span(x[0], x[1]), fs = span(x[2], x[3]);  // Apple GPUs: nanoseconds
+            double vs = blit[i] ? 0.0 : span(x[0], x[1]), fs = span(x[2], x[3]);  // Apple GPUs: nanoseconds
             tv += vs;
             tf += fs;
-            for (int k = 0; k < 4; k++)
+            for (int k = blit[i] ? 2 : 0; k < 4; k++)
                 if (x[k] != MTLCounterErrorValue && x[k]) { first = std::min(first, x[k]); lastEnd = std::max(lastEnd, x[k]); }
             rows.push_back({vs, fs, i});
         }
@@ -1399,7 +1448,7 @@ void pass_timing_end_frame(id<MTLCommandBuffer> last) {
         std::vector<Iv> iv;
         for (size_t i = 0; i < desc.size(); i++) {
             const uint64_t* x = &t[4 * i].timestamp;
-            for (int k = 0; k < 4; k += 2)
+            for (int k = blit[i] ? 2 : 0; k < 4; k += 2)
                 if (x[k] != MTLCounterErrorValue && x[k + 1] != MTLCounterErrorValue && x[k] && x[k + 1] >= x[k]) iv.push_back({x[k], x[k + 1], i});
         }
         std::sort(iv.begin(), iv.end(), [](const Iv& a, const Iv& b) { return a.a < b.a; });
@@ -1429,9 +1478,17 @@ void pass_timing_end_frame(id<MTLCommandBuffer> last) {
             LOG("[gputime] gap %.2f ms between #%zu (%llu draws) and #%zu (%llu draws %s)", gaps[k].ms, gaps[k].before,
                 (unsigned long long)(draws[gaps[k].before + 1] - draws[gaps[k].before]), gaps[k].after,
                 (unsigned long long)(draws[gaps[k].after + 1] - draws[gaps[k].after]), desc[gaps[k].after].c_str());
-        for (size_t k = 0; k < rows.size() && k < 30; k++)
+        for (size_t k = 0; k < rows.size() && k < 30; k++) {
             LOG("[gputime] vs %6.2f fs %6.2f ms  #%-3zu %4llu draws  %s", rows[k].vs, rows[k].fs, rows[k].i,
                 (unsigned long long)(draws[rows[k].i + 1] - draws[rows[k].i]), desc[rows[k].i].c_str());
+            // the pixel shader of an expensive pass, for reading
+            const Shader* sh = rows[k].i < shaders.size() ? shaders[rows[k].i] : nullptr;
+            if (rows[k].fs >= 1.0 && sh && sh->dec && sh->dec->strBuf_shaderSource) {
+                char name[96];
+                snprintf(name, sizeof name, "build/slow_ps_%016llx.metal", (unsigned long long)sh->key);
+                if (FILE* f = fopen(name, "w")) { fputs(sh->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
+            }
+        }
     }];
 }
 
@@ -1447,6 +1504,8 @@ bool pass_dump_on() {
 // every attachment: BotW's G-buffer (4 colour targets + depth) switches its 4th target on and off
 // between draws, ~180 MiB per reopened pass at 2x. Not when the draw samples one of the extra
 // attachments (reading an attached texture). WWHD_NO_PASS_MERGE=1 turns it off.
+static uint32_t g_pt_ps = 0;  // pixel shader of the draw being set up (pass timing)
+static Shader* g_pt_ps_shader = nullptr;
 static Surface* const* g_draw_sampled = nullptr;  // surfaces the draw being set up samples
 static int g_draw_sampled_n = 0;
 static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Surface* depth, uint32_t depthSlice, bool noAttachments = false) {
@@ -1553,8 +1612,16 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
             if (colors[i] && colors[i]->tex)
                 n += snprintf(b + n, sizeof b - n, "C%d %lux%lu f%X ", i, (unsigned long)colors[i]->tex.width,
                               (unsigned long)colors[i]->tex.height, colors[i]->format);
-        if (depth && depth->tex) snprintf(b + n, sizeof b - n, "D %lux%lu f%X", (unsigned long)depth->tex.width, (unsigned long)depth->tex.height, depth->format);
+        if (depth && depth->tex)
+            n += snprintf(b + n, sizeof b - n, "D %lux%lu f%X ", (unsigned long)depth->tex.width, (unsigned long)depth->tex.height, depth->format);
+        // the first draw's pixel shader and what it samples
+        n += snprintf(b + n, sizeof b - n, "| PS %08X", g_pt_ps);
+        for (int k = 0; k < g_draw_sampled_n && k < 4 && n < (int)sizeof b - 40; k++)
+            if (g_draw_sampled[k] && g_draw_sampled[k]->tex)
+                n += snprintf(b + n, sizeof b - n, " in %lux%lu f%X", (unsigned long)g_draw_sampled[k]->tex.width,
+                              (unsigned long)g_draw_sampled[k]->tex.height, g_draw_sampled[k]->format);
         pass_timing_attach(rp, b);
+        if (!g_pt_shader.empty()) g_pt_shader.back() = g_pt_ps_shader;
     }
     R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     for (int i = 0; i < 8; i++) {
@@ -2087,6 +2154,8 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     }
     g_draw_sampled = sampled;
     g_draw_sampled_n = nSampled;
+    g_pt_ps = regs[mmSQ_PGM_START_PS] << 8;
+    g_pt_ps_shader = ps;
 
     rprof::mark(rprof::kTextures);
     if (!ensure_pass(colors, colorSlices, depth, depthSlice, noAttachments)) { g_skip[SK_PASS]++; return; }

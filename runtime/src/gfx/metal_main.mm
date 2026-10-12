@@ -42,7 +42,7 @@ void peek_z(const uint32_t* cells, uint32_t n) {
     if (!staging) return;
     std::vector<uint32_t> destinations(points);
     end_encoder();
-    id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     for (uint32_t i=0; i<points; i++) {
         int x = depth_peek::pixel(cells[i*3],(uint32_t)depth->tex.width,640);
         int y = depth_peek::pixel(cells[i*3+1],(uint32_t)depth->tex.height,480);
@@ -193,6 +193,7 @@ static void encode_clear(const PendingClear& c) {
         rp.colorAttachments[0].clearColor = MTLClearColorMake(c.rgba[0], c.rgba[1], c.rgba[2], c.rgba[3]);
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     }
+    time_render_pass(rp, __FILE_NAME__, __LINE__);
     [[raw_command_buffer() renderCommandEncoderWithDescriptor:rp] endEncoding];
 }
 
@@ -415,7 +416,7 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
         d.storageMode = MTLStorageModePrivate;
         scr.tex = [R.device newTextureWithDescriptor:d];
     }
-    id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
             sourceSize:MTLSizeMake(w, h, 1) toTexture:scr.tex destinationSlice:0 destinationLevel:0
      destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -440,7 +441,7 @@ static void dump_depth(id<MTLTexture> src, const char* name) {
     uint32_t bpp = pf == MTLPixelFormatDepth16Unorm ? 2 : 4;
     id<MTLBuffer> buf = [R.device newBufferWithLength:(NSUInteger)w * h * bpp * n options:MTLResourceStorageModeShared];
     end_encoder();
-    id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     for (uint32_t z = 0; z < n; z++)
         [b copyFromTexture:src sourceSlice:z sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
                   toBuffer:buf destinationOffset:(NSUInteger)z * w * h * bpp destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp
@@ -506,7 +507,7 @@ void dump_texture(id<MTLTexture> src, const char* name, bool async, bool srgbEnc
     d.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [R.device newTextureWithDescriptor:d];
     end_encoder();
-    id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
              toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
     [b endEncoding];
@@ -620,7 +621,14 @@ uint64_t frames_completed() { return g_frames_completed; }
 
 void cache_warm_step();
 
+void pass_timing_arm(double lastFrameMs);
 void swap() {
+    {
+        static double prev = 0;
+        const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (prev) pass_timing_arm(t - prev);
+        prev = t;
+    }
     cache_warm_step();
     static bool sync_gpu = getenv("WWHD_SYNC_GPU") != nullptr;  // debug: no CPU/GPU overlap
     if (sync_gpu) wait_idle();
@@ -671,6 +679,8 @@ void swap() {
         void compile_counters(size_t*, size_t*, double*, double*);
         struct Snap { double wall, cpu, hash, decode, decompile, msl; uint64_t uploads, splits; size_t shaders, pipelines; };
         static Snap last{};
+        extern std::atomic<double> g_compile_wait_ms;
+        static double lastWait = 0;
         Snap now{};
         now.wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
         timespec ts{};
@@ -686,11 +696,12 @@ void swap() {
         auto du = [](uint64_t a, uint64_t b) { return a >= b ? a - b : a; };
         if (threshold > 0 && last.wall > 0 && now.wall - last.wall > threshold)
             LOG("[hitch] frame %llu: %.0f ms (render thread CPU %.0f ms) | textures: %llu uploads, decode %.0f ms, hash %.0f ms | "
-                "shaders +%zu (%.0f ms translate, %.0f ms compile), pipelines +%zu | passes split %llu",
+                "shaders +%zu (%.0f ms translate, %.0f ms compile), pipelines +%zu, waited for compiles %.0f ms | passes split %llu",
                 (unsigned long long)R.frame, now.wall - last.wall, now.cpu - last.cpu, (unsigned long long)du(now.uploads, last.uploads),
                 d(now.decode, last.decode), d(now.hash, last.hash), now.shaders - last.shaders, now.decompile - last.decompile,
-                now.msl - last.msl, now.pipelines - last.pipelines, (unsigned long long)du(now.splits, last.splits));
+                now.msl - last.msl, now.pipelines - last.pipelines, g_compile_wait_ms.load() - lastWait, (unsigned long long)du(now.splits, last.splits));
         last = now;
+        lastWait = g_compile_wait_ms.load();
     }
     if (R.frame % 300 == 1) {
         // render thread CPU time (excludes sleeping and GPU waits), for performance comparisons

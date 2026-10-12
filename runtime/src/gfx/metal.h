@@ -104,6 +104,10 @@ extern Renderer R;
 
 // command buffer / encoder management
 id<MTLCommandBuffer> command_buffer();
+// WWHD_GPU_PASS_TIMES: blit encoders and stray render passes are timed too
+id<MTLBlitCommandEncoder> timed_blit_encoder(const char* file, int line);
+void time_render_pass(MTLRenderPassDescriptor* rp, const char* file, int line);
+#define TIMED_BLIT() timed_blit_encoder(__FILE_NAME__, __LINE__)
 void end_encoder();
 
 // guest memory -> (buffer, offset); returns nil if the address is not GPU-visible

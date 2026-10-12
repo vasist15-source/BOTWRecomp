@@ -760,6 +760,7 @@ static void compose_tv(id<MTLTexture> target, const Layout& L) {
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    time_render_pass(rp, __FILE_NAME__, __LINE__);
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     float dw = target.width, dh = target.height;
     MTLPixelFormat fmt = target.pixelFormat;
@@ -790,6 +791,7 @@ static void compose_drc(id<MTLTexture> target) {
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    time_render_pass(rp, __FILE_NAME__, __LINE__);
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     Layout L = layout(target.width, target.height, R.drc.tex.width, R.drc.tex.height, 0, 0, false);
     draw_image(e, target.pixelFormat, target.width, target.height, R.drc.tex, R.drc.srgb, L.tv, 1.0f);
@@ -833,7 +835,7 @@ struct Sig {
             sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
             return [R.device newSamplerStateWithDescriptor:sd];
         }();
-        id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+        id<MTLBlitCommandEncoder> b = TIMED_BLIT();
         [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                 sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:mip destinationSlice:0 destinationLevel:0
          destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -843,6 +845,7 @@ struct Sig {
         rp.colorAttachments[0].texture = small;
         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        time_render_pass(rp, __FILE_NAME__, __LINE__);
         id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
         float rect[4] = {0, 0, 1, 1};
         struct { int aa, conv; float sharp, foot; } p = {0, src_linear ? 2 : 0, 1.0f, 1.0f};
@@ -853,7 +856,7 @@ struct Sig {
         [e setFragmentSamplerState:trilinear atIndex:0];
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         [e endEncoding];
-        b = [command_buffer() blitCommandEncoder];
+        b = TIMED_BLIT();
         [b copyFromTexture:small sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(kSigW, kSigH, 1)
                   toBuffer:buf destinationOffset:0 destinationBytesPerRow:kSigW * 4 destinationBytesPerImage:kSigN * 4];
         [b endEncoding];
@@ -934,11 +937,12 @@ static void screenshot_screen(Screen& scr, const std::string& path, bool tv) {
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    time_render_pass(rp, __FILE_NAME__, __LINE__);
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     draw_image(e, t.pixelFormat, w, h, scr.tex, scr.srgb, Box{0, 0, (float)w, (float)h}, 1.0f);
     [e endEncoding];
     id<MTLBuffer> buf = [R.device newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
-    id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
               toBuffer:buf destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
     [b endEncoding];
