@@ -77,6 +77,44 @@ static bool shader_irrelevant(uint32 reg) {
     }
     return false;
 }
+// Metal: whether a texture or sampler register write can change a shader key (metal_draw.mm's
+// stage_state_hash reads, for texture units 0-17 of the vertex and pixel stages: the type and format
+// bits, and whether the texture's address is a bound colour buffer; for their samplers, the
+// depth-compare bits). Draws rebind textures constantly, and every rebind used to make the next draw
+// recompute both shader keys (~9% of the render thread in busy scenes). WWHD_SHADER_KEY_ALL_TEX=1:
+// every texture write counts, as before.
+static bool metal_key_changes(uint32 reg, uint32 old, uint32 val) {
+    static const bool all = getenv("WWHD_SHADER_KEY_ALL_TEX") != nullptr;
+    if (all) return true;
+    for (uint32 base : {uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS), uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS)}) {
+        if (reg < base || reg >= base + 7 * 160) continue;
+        const uint32 unit = (reg - base) / 7, word = (reg - base) % 7;
+        if (unit >= 18) return false;
+        switch (word) {
+        case 0: return ((old ^ val) & 7) != 0;
+        case 1: return ((old ^ val) & 0x3F00000) != 0;
+        case 4: return ((old ^ val) & 0x300) != 0;
+        case 2: {  // framebuffer fetch: the address against the bound colour buffers (as stage_state_hash)
+            auto fb = [](uint32 w2) {
+                const uint32 b = w2 << 8;
+                if (!b) return 0u;
+                for (uint32 i = 0; i < 8; i++)
+                    if (b == (g_regs[mmCB_COLOR0_BASE + i] & ~0xFFu)) return i + 1;
+                return 0u;
+            };
+            return fb(old) != fb(val);
+        }
+        default: return false;  // mip address, swizzle/LOD words
+        }
+    }
+    if (reg >= uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_GS) && reg < uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_GS) + 7 * 160)
+        return false;  // geometry shaders aren't translated
+    if (reg >= uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0) && reg < uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0) + 3 * 18 * 3) {
+        const uint32 word = (reg - uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0)) % 3;
+        return word == 0 && ((old ^ val) & 0xF8000000) != 0;
+    }
+    return true;
+}
 static ShaderKeyDirtyStats shaderKeyDirtyStats;
 ShaderKeyDirtyStats shader_key_dirty_stats() { return shaderKeyDirtyStats; }
 
@@ -174,7 +212,10 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
         } else
 #endif
         for (uint32 i = 0; i < n; i++)
-            if (g_regs[first + i] != v[i] && !shader_irrelevant(first + i)) { g_shader_state_gen++; break; }
+            if (g_regs[first + i] != v[i] && !shader_irrelevant(first + i) && metal_key_changes(first + i, g_regs[first + i], v[i])) {
+                g_shader_state_gen++;
+                break;
+            }
         memcpy(&g_regs[first], v, n * 4);
     }
     if (g_shadow) memcpy(&g_shadow[first], v, n * 4);
@@ -387,6 +428,7 @@ static void set_context(uint32 ctx) {
     g_register_blocks.touch(uint32(REGADDR::VGT_PRIMITIVE_TYPE), 1);
     if (g_register_blocks.restore(g_regs, g_shadow, [](uint32 reg, uint32 old, uint32 value) {
         if (shader_irrelevant(reg)) return false;
+        if (!render::vulkan() && !metal_key_changes(reg, old, value)) return false;
 #ifdef WWHD_HAS_VULKAN
         static const bool keyDirty = [] {
             const char* e = getenv("WWHD_VK_SHADER_KEY_DIRTY");

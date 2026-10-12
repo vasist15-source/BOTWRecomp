@@ -559,7 +559,18 @@ static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* f
     struct Last { uint64_t gen = 0, frame = ~0ull, fsKey = 0; Shader* s = nullptr; };
     static Last last[2];
     Last& L = last[vertex ? 0 : 1];
-    if (L.gen == g_shader_state_gen && L.frame == R.frame && (!vertex || L.fsKey == fsKey)) return L.s;
+    if (L.gen == g_shader_state_gen && L.frame == R.frame && (!vertex || L.fsKey == fsKey)) {
+        // debug: WWHD_VERIFY_SHADER_GEN=1 recomputes the lookup anyway and logs a register filter that missed a change
+        static const bool verify = getenv("WWHD_VERIFY_SHADER_GEN") != nullptr;
+        if (verify) {
+            Shader* fresh = get_shader_uncached(regs, vertex, fs, fsKey);
+            static int logged = 0;
+            if (fresh != L.s && logged++ < 50)
+                LOG("[gfx] shader generation missed a change: %s %016llx -> %016llx", vertex ? "VS" : "PS",
+                    (unsigned long long)(L.s ? L.s->key : 0), (unsigned long long)(fresh ? fresh->key : 0));
+        }
+        return L.s;
+    }
     Shader* s = get_shader_uncached(regs, vertex, fs, fsKey);
     L = Last{g_shader_state_gen, R.frame, fsKey, s};
     return s;
@@ -1291,6 +1302,10 @@ struct StreamoutDraw {
 static StreamoutDraw g_so;
 static uint64_t g_streamout_draws = 0, g_streamout_notarget = 0;  // the latter: ran with no render target
 
+// each texture unit's surface as the current draw's preflight found it ([0] vertex, [1] pixel stage)
+static Surface* g_unit_tex[2][18];
+static bool g_unit_tex_valid[2][18];
+
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
     float texScale[18][2];
@@ -1307,7 +1322,9 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         uint32_t binding = rm.getTextureBaseBindingPoint() + i;
         MTLTextureType type = texture_type_for_dim(dec->textureUnitDim[unit]);
         const uint32_t* tw = &regs[texBase + unit * 7];
-        Surface* s = sampled_texture(tw, dec->textureUsesDepthCompare[unit]);
+        // the draw's texture preflight looked this unit up already (same registers, same draw)
+        Surface* s = unit < 18 && g_unit_tex_valid[vertex ? 0 : 1][unit] ? g_unit_tex[vertex ? 0 : 1][unit]
+                                                                        : sampled_texture(tw, dec->textureUsesDepthCompare[unit]);
         if (!vertex && s && g_hires_src && s->addr == g_hires_src && g_hires_frame == R.frame && ao_hires_enabled() &&
             sh->kind == gfx::ProgramKind::OcclusionPixel)
             s = &g_hires_color;
@@ -2318,11 +2335,14 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     rprof::mark(rprof::kIndices);
     static Surface* sampled[64];
     int nSampled = 0;
+    memset(g_unit_tex_valid, 0, sizeof g_unit_tex_valid);
     for (Shader* sh : {vs, ps}) {
+        const int st = sh == vs ? 0 : 1;
         uint32_t texBase = sh == vs ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
         for (int u = 0; u < sh->dec->textureUnitListCount; u++) {
             uint8_t unit = sh->dec->textureUnitList[u];
             Surface* s = sampled_texture(&regs[texBase + unit * 7], sh->dec->textureUsesDepthCompare[unit]);
+            if (unit < 18) { g_unit_tex[st][unit] = s; g_unit_tex_valid[st][unit] = true; }
             if (s && nSampled < 64) sampled[nSampled++] = s;
         }
     }
