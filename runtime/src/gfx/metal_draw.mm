@@ -828,10 +828,9 @@ static uint64_t g_must_run_waits = 0;
 static double g_must_run_wait_ms = 0;
 std::atomic<double> g_compile_wait_ms{0};  // render thread time spent waiting for compiles (hitch log)
 static bool wait_compiled(const std::atomic<int>& st) {
-    // 4 ms: new areas bring hundreds of shaders a frame for many frames; waiting 25 (then 10) ms for them
-    // each frame made the game wait on the render thread, while skipping a few object draws for a frame
-    // or two goes unnoticed
-    static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 4.0;
+    // 12 ms: a draw skipped while its compile runs shows as a glitched frame; waiting made dips when new
+    // areas brought hundreds of shaders a frame, which (with the variant key fixed) they no longer do
+    static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 12.0;
     if (g_building_ahead) return st.load(std::memory_order_acquire) == CS_READY;
     static uint64_t frame = ~0ull;
     static double spent = 0;
