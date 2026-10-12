@@ -114,3 +114,13 @@ render target), per-page surface index for texture invalidation, shader cache wr
 limited to the texture units and stage registers a program reads (cache 1.1 GB -> 0.25 GB), Cemu's fast
 tile decode written straight into staging memory (verified on 27k textures).
 Debug switches: WWHD_TRACE_LIB, WWHD_PEEK, WWHD_AX_STATS, WWHD_KEY_DIFF, WWHD_VERIFY_DETILE, WWHD_HITCH_MS.
+
+## Audio status (2026-10-12)
+
+Fixed: OSWaitRendezvous counted callers instead of cores, so aal initialized nw::snd's
+SoundArchivePlayer before its launcher thread had set up the sound system (flag 1047F1DC);
+the player never became available and the game sent only empty command batches.
+Now: the game sends real nw::snd commands and plays AX voices (ADPCM, offsets struct in the
+0x68xxxxxx range), but our AX mixer's final mix stays at 0. Next: the first-voices log
+("[ax] voice ... plays") shows format/address/volumes; suspects are the ADPCM nibble address
+(samples*2 in 32 bits), sample data above MEM2, or device-mix volumes.
