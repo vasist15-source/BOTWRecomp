@@ -503,6 +503,29 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         apply_regs(p[0], v, std::min<uint32>(n - 1, 16));
         break;
     }
+    case OP_WAIT_MEM: {
+        // the command processor waits until guest memory meets the condition (BotW: its vsync counter,
+        // kept by the vsync callback, >= 2: the game's 30 fps cap; without it menus ran at 60 fps
+        // and their animations at double speed). Work recorded so far is submitted first; 100 ms at
+        // most, so a counter nobody updates can't hang the GPU.
+        render::guest_flush();
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        auto met = [&] {
+            const uint32 v = ld32(p[0]) & p[1], ref = p[3];
+            switch (p[2] & 7) {
+            case 0: return false;
+            case 1: return v < ref;
+            case 2: return v == ref;
+            case 3: return v <= ref;
+            case 4: return v > ref;
+            case 5: return v != ref;
+            case 6: return v >= ref;
+            default: return true;
+            }
+        };
+        while (!met() && std::chrono::steady_clock::now() < give_up) std::this_thread::sleep_for(std::chrono::microseconds(250));
+        break;
+    }
     case OP_STREAMOUT_UPDATE: {  // the buffer's write offset (bytes), in command order like the GPU's
         uint32 reg = mmVGT_STRMOUT_BUFFER_OFFSET_0 + 4 * (p[0] & 3);
         if (p[1] == 0) g_regs[reg] = 0;
@@ -927,11 +950,13 @@ static void event_callback_thread() {
         std::lock_guard<std::mutex> lk(g_flip_mutex);
         seenFlips = g_flip_count;
     }
-    auto next = std::chrono::steady_clock::now();
     for (;;) {
-        next += kVsyncPeriod;
-        std::this_thread::sleep_until(next);
-        if (std::chrono::steady_clock::now() > next + 4 * kVsyncPeriod) next = std::chrono::steady_clock::now();  // fell behind
+        // wake just after the next vsync of the clock flips execute on (vsync_index), so a flip that
+        // executes at that vsync is reported at once, like the hardware's interrupt: the game's fence
+        // target is "count at the last flip + swap interval"
+        const auto sinceEpoch = std::chrono::steady_clock::now() - g_vsync_epoch;
+        const auto k = sinceEpoch / kVsyncPeriod + 1;
+        std::this_thread::sleep_until(g_vsync_epoch + k * kVsyncPeriod + std::chrono::microseconds(200));
         uint64_t flips;
         {
             std::lock_guard<std::mutex> lk(g_flip_mutex);
@@ -943,13 +968,21 @@ static void event_callback_thread() {
         threads::service_begin();
         threads::set_service_core(1);
         bool took = threads::ensure_core();
-        if (vcb) guest_call(c, vcb, {2u, g_event_ud[2].load()});
+        // flip before vsync: the flip records the count of the vsync it executed on before that
+        // vsync is counted (the game's fence target, last flip + 2, then means 2 vsyncs per frame;
+        // the other order gave 3, vsync callbacks unaligned with flips gave 1-2)
         if (fcb)
             for (uint64_t n = std::min<uint64_t>(flips - seenFlips, 2); n > 0; n--) guest_call(c, fcb, {3u, g_event_ud[3].load()});
+        if (vcb) guest_call(c, vcb, {2u, g_event_ud[2].load()});
         seenFlips = flips;
         if (took) threads::release_core();
         threads::service_end();
     }
+}
+// (address, mask, compare op, value): the GPU waits there until the condition holds (see OP_WAIT_MEM)
+HLE(gx2, GX2SetGPUFence) {
+    static const bool off = getenv("WWHD_NO_GPU_FENCE") && atoi(getenv("WWHD_NO_GPU_FENCE"));
+    if (!off && arg(c, 0)) emit(OP_WAIT_MEM, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)});
 }
 HLE(gx2, GX2SetEventCallback) {
     const uint32_t type = arg(c, 0);

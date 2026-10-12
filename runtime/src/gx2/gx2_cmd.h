@@ -42,6 +42,7 @@ enum Op : uint32_t {
     OP_PEEK_Z,          // signed x/y in 640x480 space, guest result address (triples)
     OP_LAYOUT_CONTENT,  // DrawSelf scope: clip TV menu content to the native layout region
     OP_STREAMOUT_UPDATE,  // buffer index, mode (0 reset, 1 restore from ctx, 3 save to ctx), ctx address
+    OP_WAIT_MEM,        // GX2SetGPUFence: address, mask, compare op, value; waits until (mem & mask) op value
     OP_COUNT
 };
 
