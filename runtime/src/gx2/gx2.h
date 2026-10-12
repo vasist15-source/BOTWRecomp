@@ -30,6 +30,7 @@ void set_uncapped(bool on);
 int fps_target();
 void set_fps_target(int fps);
 bool present_unsynced();  // presentation does not wait for the display (uncapped, or no fps cap)
+bool fps_pacing();        // above 30 fps and in gameplay: the 30 fps fence and vsync pacing are lifted
 }  // namespace gx2
 
 // The renderer backend (Metal). All calls come from the thread executing GX2

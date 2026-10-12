@@ -364,6 +364,7 @@ static void render_sync(int site = kSyncShutdown) {
     g_q_done_cv.wait(lk, [&] { return g_fence_done >= id; });
 }
 
+static std::atomic<uint64_t> g_draws_executed{0};  // render thread; the frame-rate code tells loading screens apart
 void emit(Op op, const uint32* payload, uint32 n) {
     if (t_rec.start) {
         uint32 bytes = 4 * (n + 1);
@@ -515,8 +516,9 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     switch (op) {
     case OP_NOP: break;
     case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1); break;
-    case OP_DRAW: render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
+    case OP_DRAW: g_draws_executed.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
     case OP_DRAW_INDEXED:
+        g_draws_executed.fetch_add(1, std::memory_order_relaxed);
         render::g_base_instance = n > 6 ? p[6] : 0;
         render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]);
         render::g_base_instance = 0;
@@ -595,7 +597,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         break;
     }
     case OP_WAIT_MEM: {
-        if (gx2::fps_target() != 30) break;  // the game's 30 fps fence (BotW frame rate above 30)
+        if (gx2::fps_pacing()) break;  // the game's 30 fps fence (BotW frame rate above 30)
         // the command processor waits until guest memory meets the condition (BotW: its vsync counter,
         // kept by the vsync callback, >= 2: the game's 30 fps cap; without it menus ran at 60 fps
         // and their animations at double speed). Work recorded so far is submitted first; 100 ms at
@@ -742,7 +744,7 @@ static std::chrono::steady_clock::time_point tick_time(uint64_t tick) {
 // vsyncs after the previous flip
 static uint64_t flip_due(const PendingFlip& f) {
     const uint64_t g = vsync_granule();
-    const uint32_t interval = gx2::fps_target() != 30 ? 1 : interp::effective_swap_interval(g_swap_interval);
+    const uint32_t interval = gx2::fps_pacing() ? 1 : interp::effective_swap_interval(g_swap_interval);
     return std::max((f.vsync / g + 1) * g, g_last_flip_vsync + interval * g);
 }
 // Uncapped (gx2.h): debug, to see how fast the renderer can go; GPU completion ordering is kept
@@ -766,7 +768,7 @@ void gx2::set_uncapped(bool on) {
 }
 // above 30 fps flips don't wait for the 60 Hz virtual vsync (a frame that misses one would wait for the
 // next: 30 fps); fps_limit() paces instead
-static bool uncapped_benchmark() { return gx2::uncapped() || gx2::fps_target() != 30; }
+static bool uncapped_benchmark() { return gx2::uncapped() || gx2::fps_pacing(); }
 
 // ---------------------------------------------------------------- BotW frame rate
 // The game advances one 30 fps step per frame (frame-locked: faster than real time above 30 fps,
@@ -776,57 +778,86 @@ static bool uncapped_benchmark() { return gx2::uncapped() || gx2::fps_target() !
 // over a few frames and clamped (a long hitch must not make one giant step).
 namespace {
 std::atomic<int> g_fps_target{-1};
+std::atomic<bool> g_fps_gameplay{false};  // above 30 fps, and in gameplay (not a loading screen or the title)
 constexpr uint32_t kVfrVtable = 0x10319D4Cu;  // v208: ksys::VFR
-// VFR (Wii U layout): +0x18/+0x1C interval ratio A/B; +0x44 two storages of 4x3 floats (raw delta
+// VFR (Wii U layout, from its vtable pointer): +0x0C pending interval ratio; +0x18/+0x1C interval ratio A/B; +0x44 two storages of 4x3 floats (raw delta
 // frames, delta frames, raw delta times, delta times per core); +0xD4 base interval (2), +0xD8 frame
 // rate (30), +0xDC frame time (1/30)
-std::atomic<uint32_t> g_vfr{0};
-std::atomic<bool> g_vfr_scanning{false};
 bool vfr_valid(uint32_t a) {
     return a && ld32(a) == kVfrVtable && ld32(a + 0xD4) == 2 && ld32(a + 0xD8) == 30 && ld32(a + 0xDC) == 0x3D088889u;
 }
-void vfr_find_async() {
-    bool expected = false;
-    if (!g_vfr_scanning.compare_exchange_strong(expected, true)) return;
-    std::thread([] {
-        uint32_t found = 0;
-        for (uint32_t a = mem::kMem2Start; a < mem::kMem2End - 0x100 && !found; a += 4)
-            if (ld32(a) == kVfrVtable && vfr_valid(a)) found = a;
-        if (found) LOG("[fps] engine frame timing (ksys::VFR) at %08X", found);
-        g_vfr = found;
-        g_vfr_scanning = false;
-    }).detach();
+uint32_t vfr() {  // the VFR singleton's instance pointer (v208: 1047C258); the layout above is from its vtable pointer
+    const uint32_t p = ld32(0x1047C258u);
+    return p && vfr_valid(p + 0x10) ? p + 0x10 : 0;
 }
+// UI animation speed: the game sets it each frame from the VFR interval (an integer, 2) times this
+// constant, and its layouts read it too; scaled by the frame ratio so menus keep their speed
+constexpr uint32_t kUiSpeedConst = 0x102C1DD4u;
+// gyro aiming (bow, runes): the controller's turn rate (per second) is divided by this 30.0 to give the
+// turn per frame; it is that code's only reader. Scaled with the frame time, or gyro aim turns 2x at 60 fps
+constexpr uint32_t kGyroPerFrameConst = 0x101B2D34u;
 void set_f32(uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); st32(a, u); }
 float get_f32(uint32_t a) { uint32_t u = ld32(a); float v; memcpy(&v, &u, 4); return v; }
 // game thread, once per frame (GX2SwapScanBuffers)
 void fps_frame() {
     static auto last = std::chrono::steady_clock::now();
     static double hist[4] = {1 / 30.0, 1 / 30.0, 1 / 30.0, 1 / 30.0};
-    static int hi = 0, sinceScan = 0;
+    static int hi = 0;
     static bool wasActive = false;
     const auto now = std::chrono::steady_clock::now();
     const double dt = std::chrono::duration<double>(now - last).count();
     last = now;
     const bool active = gx2::fps_target() != 30;
-    uint32_t a = g_vfr.load();
+    const uint32_t a = vfr();
+    static uint32_t uiSpeed = 0, gyroRate = 0;  // the constants' original bits
+    if (!uiSpeed) uiSpeed = ld32(kUiSpeedConst);
+    if (!gyroRate) gyroRate = ld32(kGyroPerFrameConst);
+    float gyroOrig;
+    memcpy(&gyroOrig, &gyroRate, 4);
+    float uiOrig;
+    memcpy(&uiOrig, &uiSpeed, 4);
     if (!active) {
-        if (wasActive && vfr_valid(a)) {  // back to the game's own fixed step
-            set_f32(a + 0x18, 1.0f);
-            set_f32(a + 0x1C, 1.0f);
+        if (wasActive) {  // back to the game's own fixed step
+            if (a) {
+                set_f32(a + 0x0C, 1.0f);
+                set_f32(a + 0x18, 1.0f);
+                set_f32(a + 0x1C, 1.0f);
+            }
+            st32(kUiSpeedConst, uiSpeed);
+            st32(kGyroPerFrameConst, gyroRate);
         }
         wasActive = false;
+        g_fps_gameplay = false;
         return;
     }
     wasActive = true;
     hist[hi++ & 3] = std::clamp(dt, 1 / 1000.0, 0.25);
-    if (!vfr_valid(a)) {
-        if (++sinceScan >= 120) { sinceScan = 0; vfr_find_async(); }  // created at boot; found again after a reload
-        return;
-    }
+    if (!a) { g_fps_gameplay = false; return; }
+    // WWHD_FPS_LOAD_GUARD=1: loading screens and the title (~120 draws a frame, gameplay thousands) keep
+    // the game's own step and 30 fps pacing, scaling resumes after a second of gameplay-sized frames.
+    // Off by default: a load that never finished at 60 fps was the limiter holding a guest core while it
+    // slept (starving the loader threads), not the fractional step; menus would drop to 30 fps with it.
+    static uint64_t lastDraws = 0;
+    static int busyFrames = 0;
+    const uint64_t draws = g_draws_executed.load(std::memory_order_relaxed);
+    const uint64_t frameDraws = draws - lastDraws;
+    lastDraws = draws;
+    static const bool loadGuard = getenv("WWHD_FPS_LOAD_GUARD") && atoi(getenv("WWHD_FPS_LOAD_GUARD"));  // off: not needed once the limiter released its core
+    busyFrames = frameDraws < 300 && loadGuard ? 0 : std::min(busyFrames + 1, 1000);
+    const bool gameplay = busyFrames >= 60;
+    g_fps_gameplay = gameplay;
     const double avg = (hist[0] + hist[1] + hist[2] + hist[3]) / 4;
+    static int dbg = 0;
+    if (getenv("WWHD_FPS_DEBUG") && (++dbg % 120) == 0)
+        LOG("[fps] engine at frame end: pending %.3f live %.3f delta frames %.3f; %llu draws, gameplay %d", get_f32(a + 0x0C),
+            get_f32(a + 0x18), get_f32(a + 0x50), (unsigned long long)frameDraws, gameplay);
     static const double maxRatio = getenv("WWHD_FPS_MAX_STEP") ? atof(getenv("WWHD_FPS_MAX_STEP")) : 1.5;  // 20 fps
-    const float ratio = (float)std::clamp(avg * 30.0, 0.125, maxRatio);
+    const float ratio = gameplay ? (float)std::clamp(avg * 30.0, 0.125, maxRatio) : 1.0f;
+    // the engine copies its pending ratio (+0x0C) into the live one at the start of every frame
+    // (updateInterval); setting only the live one was undone before anything used it
+    set_f32(a + 0x0C, ratio);
+    set_f32(kUiSpeedConst, uiOrig * ratio);
+    set_f32(kGyroPerFrameConst, gyroOrig / ratio);
     set_f32(a + 0x18, ratio);
     set_f32(a + 0x1C, ratio);
     const float frameTime = get_f32(a + 0xDC);
@@ -841,14 +872,18 @@ void fps_frame() {
 void fps_limit() {
     static const int envLimit = getenv("WWHD_FPS_LIMIT") ? atoi(getenv("WWHD_FPS_LIMIT")) : 0;
     const int target = gx2::fps_target();
-    const int limit = target == 60 ? 60 : target == 0 ? envLimit : 0;
+    const int limit = !gx2::fps_pacing() ? 0 : target == 60 ? 60 : envLimit;
     if (limit <= 0) return;
     static auto next = std::chrono::steady_clock::now();
     const auto period = std::chrono::nanoseconds(1000000000 / limit);
     next += period;
     const auto now = std::chrono::steady_clock::now();
-    if (next < now - period) next = now;
-    else std::this_thread::sleep_until(next);
+    if (next < now - period) {
+        next = now;
+    } else {
+        BlockingScope b;  // the other guest threads keep this core meanwhile
+        std::this_thread::sleep_until(next);
+    }
 }
 }  // namespace
 int gx2::fps_target() {
@@ -869,7 +904,8 @@ void gx2::set_fps_target(int fps) {
     fps_target();
     if (g_fps_target.exchange(fps) != fps) LOG("[fps] frame rate %s", fps == 30 ? "30 (the game's own)" : fps ? "60" : "uncapped");
 }
-bool gx2::present_unsynced() { return gx2::uncapped() || gx2::fps_target() == 0; }
+bool gx2::present_unsynced() { return gx2::uncapped() || (gx2::fps_target() == 0 && fps_pacing()); }
+bool gx2::fps_pacing() { return gx2::fps_target() != 30 && g_fps_gameplay.load(std::memory_order_relaxed); }
 
 static void update_flips() {  // g_flip_mutex held
     uint64_t now = vsync_index();
