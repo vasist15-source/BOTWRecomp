@@ -2843,8 +2843,21 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             if (done.insert(name).second) dump_texture(t->tex, name, false, false);
         }
         snprintf(name, sizeof name, "%s/ps_%08X.metal", g_capture_dir.c_str(), regs[mmSQ_PGM_START_PS] << 8);
-        if (ps->dec && ps->dec->strBuf_shaderSource && done.insert(name).second)
-            if (FILE* f = fopen(name, "w")) { fputs(ps->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
+        if (done.insert(name).second) {
+            if (ps->dec && ps->dec->strBuf_shaderSource) {
+                if (FILE* f = fopen(name, "w")) { fputs(ps->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
+            } else {  // the source was released after compiling: translate the program again for the capture
+                const uint32_t addr = regs[mmSQ_PGM_START_PS] << 8, size = regs[mmSQ_PGM_START_PS + 1] << 3;
+                Shader probe;
+                const bool wasDefer = g_defer_compiles;
+                g_defer_compiles = true;  // translate only
+                translate_shader(&probe, regs, false, nullptr, program_hash(addr, size) ^ 0x2222, addr, size, false);
+                g_defer_compiles = wasDefer;
+                if (!g_deferred_shaders.empty() && g_deferred_shaders.back() == &probe) g_deferred_shaders.pop_back();
+                if (probe.dec && probe.dec->strBuf_shaderSource)
+                    if (FILE* f = fopen(name, "w")) { fputs(probe.dec->strBuf_shaderSource->c_str(), f); fclose(f); }
+            }
+        }
     }
     if (R.frame == dumpFrame && dumpDraws.count(thisDraw)) {
         void dump_texture(id<MTLTexture>, const char*, bool, bool);
