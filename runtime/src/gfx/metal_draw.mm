@@ -1191,6 +1191,7 @@ static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = fals
                                                                                   : MTLSamplerBorderColorTransparentBlack;
     uint32_t cmp = (uint32_t)w0.get_DEPTH_COMPARE_FUNCTION();
     if (cmp) d.compareFunction = compare_func(cmp);
+    d.supportArgumentBuffers = YES;  // texture bindings 16 and up take their sampler from an argument buffer
     id<MTLSamplerState> s = [R.device newSamplerStateWithDescriptor:d];
     g_samplers[h] = s;
     return s;
@@ -1366,6 +1367,8 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
     uint32_t samplerBase = vertex ? SAMPLER_BASE_INDEX_VERTEX : SAMPLER_BASE_INDEX_PIXEL;
 
     // textures and samplers
+    MTLResourceID extraSamplers[LATTE_NUM_MAX_TEX_UNITS] = {};
+    uint32_t extraCount = 0;
     for (sint32 i = 0; i < rm.getTextureCount(); i++) {
         sint32 unit = rm.getRelativeTextureUnitFromRelativeBindingPoint(i);
         if (unit < 0) continue;
@@ -1399,13 +1402,23 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             sw = patched;
         }
         id<MTLSamplerState> smp = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
+        if (binding >= MAX_MTL_SAMPLERS) {  // past Metal's 16 sampler slots: the shader reads it from a table
+            if (binding - MAX_MTL_SAMPLERS < LATTE_NUM_MAX_TEX_UNITS) extraSamplers[binding - MAX_MTL_SAMPLERS] = smp.gpuResourceID;
+            extraCount = std::max<uint32_t>(extraCount, binding - MAX_MTL_SAMPLERS + 1);
+            smp = nil;
+        }
         if (vertex) {
             [enc setVertexTexture:tex atIndex:binding];
-            [enc setVertexSamplerState:smp atIndex:binding];
+            if (smp) [enc setVertexSamplerState:smp atIndex:binding];
         } else {
             [enc setFragmentTexture:tex atIndex:binding];
-            [enc setFragmentSamplerState:smp atIndex:binding];
+            if (smp) [enc setFragmentSamplerState:smp atIndex:binding];
         }
+    }
+    if (extraCount) {
+        Upload u = upload(extraSamplers, (uint32_t)sizeof extraSamplers);
+        if (vertex) [enc setVertexBuffer:u.buf offset:u.offset atIndex:MTL_EXTRA_SAMPLER_BUFFER];
+        else [enc setFragmentBuffer:u.buf offset:u.offset atIndex:MTL_EXTRA_SAMPLER_BUFFER];
     }
 
     // support buffer (uniform registers, remapped uniforms, helper values)

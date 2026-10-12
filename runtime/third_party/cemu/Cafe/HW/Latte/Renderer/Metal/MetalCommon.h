@@ -37,6 +37,8 @@ struct MetalQueryRange
 
 #define MAX_MTL_TEXTURES 31
 #define MAX_MTL_SAMPLERS 16
+// wwhd: samplers of texture bindings 16 and up (an array of sampler gpuResourceIDs)
+#define MTL_EXTRA_SAMPLER_BUFFER 29
 
 #define GET_HELPER_BUFFER_BINDING(index) (28 + index)
 #define GET_HELPER_TEXTURE_BINDING(index) (29 + index)
