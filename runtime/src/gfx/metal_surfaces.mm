@@ -1,3 +1,4 @@
+#include <set>
 #include <chrono>
 #include "gfx/render_mips.h"
 #include "mods/cemu_pack.h"
@@ -983,6 +984,12 @@ static void write_back_linear_copy(Surface* img, GX2Surface* d, uint32_t dbase, 
     const uint32_t bytes = img->fmt.bytesPerBlock;
     const uint64_t r0 = rprof::now_ns();
     auto texels = read_guest_texels(img, w, h);
+    {
+        uint64_t sum = 0;
+        for (uint8_t v : texels) sum += v;
+        static std::set<std::pair<uint32_t, uint32_t>> seen;
+        if (seen.insert({w, h}).second || sum == 0) LOG("[copy] linear write-back %ux%u to %08X, mean byte %.1f", w, h, dbase, texels.empty() ? 0.0 : (double)sum / texels.size());
+    }
     for (uint32_t y = 0; y < h; y++)
         for (uint32_t x = 0; x < w; x++)
             memcpy(mem::ptr(dbase + element_offset(di, dtm, x, y, dstSlice, bytes * 8, d->swizzle, nullptr)),
@@ -1030,6 +1037,16 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         auto key = [&](Surface* x) { return std::make_pair(x->format == (uint32_t)s->format.value(), x->writeSeq); };
         if (!gpuSrc || key(c) > key(gpuSrc)) gpuSrc = c;
     }
+    // each distinct kind of copy is logged once (size, formats, tile modes, path taken): finds
+    // copies that silently produce nothing (save thumbnails were black)
+    auto note = [&](const char* path) {
+        static std::set<std::string> seen;
+        char k[200];
+        snprintf(k, sizeof k, "%ux%u fmt %X tm %u -> %ux%u fmt %X tm %u: %s", w, h, (uint32_t)s->format.value(),
+                 (uint32_t)s->tileMode.value(), std::max<uint32_t>(d->width >> dstMip, 1), std::max<uint32_t>(d->height >> dstMip, 1),
+                 (uint32_t)d->format.value(), (uint32_t)d->tileMode.value(), path);
+        if (seen.insert(k).second) LOG("[copy] %s", k);
+    };
     if (gpuSrc) {
         Surface* src = adopt_newer_alias(gpuSrc);
         SurfaceDesc dd;
@@ -1040,7 +1057,25 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         dd.format = (uint32_t)d->format.value();
         dd.tileMode = (uint32_t)d->tileMode.value();
         Surface* dst = find_or_create_surface(dd, true);
-        if (!dst || dst->fmt.pixel != src->fmt.pixel) return;
+        if (!dst) {
+            note("GPU source, no destination image (skipped)");
+            return;
+        }
+        // the source's image can be in another host format than a fresh one for the destination
+        // (same GX2 format, e.g. an sRGB view: the save thumbnail, 256x144 1A tm 4 -> linear). Same
+        // texel size: the bits are copied through a view in the destination's format; else drawn.
+        id<MTLTexture> srcTex = src->tex;
+        bool convert = false;
+        if (dst->fmt.pixel != src->fmt.pixel) {
+            if (src->fmt.hostBytesPerBlock == dst->fmt.hostBytesPerBlock && !src->fmt.compressed && !dst->fmt.compressed &&
+                (src->tex.usage & MTLTextureUsagePixelFormatView))
+                srcTex = [src->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat];
+            else
+                convert = true;
+            note(convert ? "GPU source, other format: drawn" : "GPU source, other format: copied through a view");
+        } else {
+            note("GPU source");
+        }
         end_encoder();
         // region in guest pixels, then in each texture's pixels (both may be scaled for the internal resolution)
         uint32_t cw = std::min(w, dst->width), ch = std::min(h, dst->height);
@@ -1048,9 +1083,9 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         uint32_t sph = std::min<uint32_t>((uint32_t)std::lround(ch * src->sy), (uint32_t)src->tex.height);
         uint32_t dpw = std::min<uint32_t>((uint32_t)std::lround(cw * dst->sx), (uint32_t)dst->tex.width);
         uint32_t dph = std::min<uint32_t>((uint32_t)std::lround(ch * dst->sy), (uint32_t)dst->tex.height);
-        if (spw == dpw && sph == dph) {
+        if (spw == dpw && sph == dph && !convert) {
             id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
-            [b copyFromTexture:src->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+            [b copyFromTexture:srcTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                     sourceSize:MTLSizeMake(spw, sph, 1)
                      toTexture:dst->tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [b endEncoding];
@@ -1063,6 +1098,11 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
     }
 
     // CPU-produced source: re-tile in guest memory; texture uploads pick up the change
+    {
+        bool gpuAtAddr = false;
+        for (auto it = range.first; it != range.second; ++it) gpuAtAddr |= it->second->gpuWritten;
+        note(gpuAtAddr ? "CPU path, but a GPU image of another size is at the source" : "CPU path");
+    }
     LatteAddrLib::AddrSurfaceInfo_OUT si{}, di{};
     LatteAddrLib::GX2CalculateSurfaceInfo(s->format, s->width, s->height, s->depth, s->dim, s->tileMode, s->aa, srcMip, &si);
     LatteAddrLib::GX2CalculateSurfaceInfo(d->format, d->width, d->height, d->depth, d->dim, d->tileMode, d->aa, dstMip, &di);
