@@ -105,6 +105,8 @@ id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset) {
 
 // ---------------------------------------------------------------- command buffers
 static uint64_t commandFrame = 0, commandToken = 0;
+static int64_t g_cmd_created_ns = 0;  // when R.cmd was started (time-based commits)
+static std::atomic<int64_t> g_frame_gpu_start[256];  // WWHD_FRAME_TRACE: first GPU start of each swap's work
 struct OverlayGpuTime {
     id<MTLCommandBuffer> buffer = nil; // ARC retains it until a later frame can read the result.
     uint64_t frame = 0, token = 0;
@@ -134,7 +136,21 @@ static id<MTLCommandBuffer> raw_command_buffer() {
     if (!R.cmd) {
         read_overlay_gpu_times();
         R.cmd = [R.queue commandBuffer];
+        g_cmd_created_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         commandFrame = R.frame;
+        static const bool ftrace = getenv("WWHD_FRAME_TRACE") != nullptr;
+        if (ftrace) {
+            const uint64_t swapNo = R.frame + 1;  // the swap this command buffer's work belongs to
+            [R.cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                                // GPUStartTime counts mach_absolute_time (no sleep), steady_clock counts sleep too: shift by now's difference
+                const int64_t off = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() -
+                                    (int64_t)(CACurrentMediaTime() * 1e9);
+                const int64_t t = (int64_t)(b.GPUStartTime * 1e9) + off;
+                std::atomic<int64_t>& slot = g_frame_gpu_start[swapNo & 255];
+                int64_t cur = slot.load();
+                if (t > 0 && (cur == 0 || t < cur || cur < t - 1000000000)) slot = t;
+            }];
+        }
         commandToken = perf::gpu_begin(commandFrame);
     }
     return R.cmd;
@@ -262,8 +278,14 @@ void end_encoder() {
         R.enc = nil;
         // submit work in chunks so the GPU starts while the frame is still being built (like the
         // hardware command processor), instead of all at once on swap
+        // WWHD_COMMIT_DRAWS (default 16) and WWHD_COMMIT_US (default 500) set how much is held: committing
+        // early lets the GPU start on a frame while the rest is still encoded (the GPU idled ~5 ms a frame)
         static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
-        if (chunked && g_draws_since_commit >= 256 && R.cmd) {
+        static const uint32_t commitDraws = getenv("WWHD_COMMIT_DRAWS") ? (uint32_t)atoi(getenv("WWHD_COMMIT_DRAWS")) : 16;
+        static const int64_t commitNs = getenv("WWHD_COMMIT_US") ? atoll(getenv("WWHD_COMMIT_US")) * 1000 : 500000;
+        const int64_t nowNs = commitNs ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+        if (chunked && R.cmd && g_draws_since_commit > 0 &&
+            (g_draws_since_commit >= commitDraws || (commitNs && nowNs - g_cmd_created_ns >= commitNs))) {
             void pool_retire(id<MTLCommandBuffer> cmd);
             pool_retire(R.cmd);
             track_gpu_time(R.cmd);
@@ -593,6 +615,7 @@ void with_autorelease_pool(void (*fn)()) {
 }
 
 static std::atomic<uint64_t> g_frames_completed{0};
+static std::atomic<int64_t> g_frame_done_ns[256];
 uint64_t frames_completed() { return g_frames_completed; }
 
 void cache_warm_step();
@@ -630,7 +653,11 @@ void swap() {
     if (const char* dir = capture_begin_frame()) pendingCapture = dir;
     @autoreleasepool {
         present_screens();
-        [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) { g_frames_completed++; }];
+        [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+            uint64_t n = ++g_frames_completed;
+            g_frame_done_ns[n & 255] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch()).count();
+        }];
         flush();
     }
     perf::gpu_advance(R.frame);
@@ -763,3 +790,10 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
 }
 
 }  // namespace gfx
+
+// frame n's GPU completion time (steady clock ns; 0 when not completed in the last 256 frames)
+extern "C" int64_t wwhd_frame_done_ns(uint64_t n) {
+    return gfx::frames_completed() >= n && gfx::frames_completed() < n + 256 ? gfx::g_frame_done_ns[n & 255].load() : 0;
+}
+
+extern "C" int64_t wwhd_frame_gpu_start_ns(uint64_t n) { return gfx::g_frame_gpu_start[n & 255].load(); }

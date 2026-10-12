@@ -198,6 +198,21 @@ static std::vector<uint32> g_q_pending, g_q_work;
 static bool g_q_waiting = false;
 static uint64_t g_fence_issued = 0, g_fence_done = 0;
 
+// debug: WWHD_FRAME_TRACE=1 logs, for every frame whose flip came over 40 ms after the previous one
+// (and every 60th frame, for comparison), where its time went, in ms from the previous flip: the
+// game's swap call, its GX2DrawDone waits, the render thread's GPU-fence wait, render-thread idle
+// (waiting for the game's commands) after that fence, the end of encoding, GPU completion, the flip
+extern "C" int64_t wwhd_frame_done_ns(uint64_t n);
+extern "C" int64_t wwhd_frame_gpu_start_ns(uint64_t n);  // gfx: when frame n's GPU work completed (0: not yet)
+namespace ftrace {
+static const bool on = getenv("WWHD_FRAME_TRACE") != nullptr;
+struct Rec { int64_t guestSwap, fenceA, fenceB, encoded, firstOp; double drawDoneMs, idleMs, idleAfterFenceMs; };
+static Rec ring[256];
+static uint64_t rframe = 0;  // render thread: swaps executed
+static int64_t now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static Rec& rcur() { return ring[(rframe + 1) & 255]; }
+}
+
 static void render_thread_main() {
     host::set_thread_name("GX2 render");
     host::boost_thread_priority();
@@ -208,8 +223,14 @@ static void render_thread_main() {
             g_q_waiting = true;
             if (g_q_pending.empty()) {
                 const uint64_t idle = rprof::enabled() ? rprof::now_ns() : 0;
+                const int64_t ft0 = ftrace::on ? ftrace::now() : 0;
                 g_q_cv.wait(lk, [] { return !g_q_pending.empty(); });
                 if (idle) rprof::add_idle(rprof::now_ns() - idle);
+                if (ft0) {
+                    double ms = (ftrace::now() - ft0) / 1e6;
+                    ftrace::rcur().idleMs += ms;
+                    if (ftrace::rcur().fenceB) ftrace::rcur().idleAfterFenceMs += ms;
+                }
             }
             g_q_waiting = false;
             g_q_work.swap(g_q_pending);
@@ -421,6 +442,7 @@ static void execute_one(Op op, const uint32* p, uint32 n) {
     case OP_SWAP: kind = rprof::kOpSwap; break;
     default: kind = rprof::kOpOther; break;
     }
+    if (ftrace::on && !ftrace::rcur().firstOp) ftrace::rcur().firstOp = ftrace::now();
     const uint64_t started = rprof::op_begin(kind);
     execute_op(op, p, n);
     rprof::op_end(kind, started);
@@ -487,6 +509,13 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         render::write_back();
         break;
     case OP_SWAP:
+        if (ftrace::on) {
+            ftrace::rcur().encoded = ftrace::now();
+            ftrace::rframe++;
+            ftrace::Rec& next = ftrace::rcur();
+            next.fenceA = next.fenceB = next.encoded = next.firstOp = 0;
+            next.idleMs = next.idleAfterFenceMs = 0;
+        }
         if (n) render::set_frame_aspect(gx2::bitsf(p[0]));  // aspect ratio from the next frame on (aspect.cpp)
         if (n >= 3 && p[2]) render::request_capture();
         render::swap();
@@ -523,7 +552,12 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
             default: return true;
             }
         };
+        const int64_t ft0 = ftrace::on ? ftrace::now() : 0;
         while (!met() && std::chrono::steady_clock::now() < give_up) std::this_thread::sleep_for(std::chrono::microseconds(250));
+        if (ft0) {
+            ftrace::rcur().fenceA = ft0;
+            ftrace::rcur().fenceB = ftrace::now();
+        }
         break;
     }
     case OP_STREAMOUT_UPDATE: {  // the buffer's write offset (bytes), in command order like the GPU's
@@ -668,10 +702,25 @@ static void update_flips() {  // g_flip_mutex held
         uint64_t at = flip_due(g_pending_flips.front());
         if ((!uncapped_benchmark() && at > now) || render::frames_completed() < g_pending_flips.front().swap) break;
         at = now / vsync_granule() * vsync_granule();
+        const uint64_t flipped = g_pending_flips.front().swap;
         g_pending_flips.pop_front();
         g_last_flip_vsync = at;
         g_last_flip_time = timebase::simulation_now();
         g_flip_count++;
+        if (ftrace::on) {
+            static int64_t lastFlip = 0;
+            const int64_t t = ftrace::now();
+            const ftrace::Rec& r = ftrace::ring[flipped & 255];
+            const double since = lastFlip ? (t - lastFlip) / 1e6 : 0;
+            auto rel = [&](int64_t x) { return x && lastFlip ? (x - lastFlip) / 1e6 : -1.0; };
+            if (lastFlip && (since > 40 || flipped % 60 == 0))
+                LOG("[frame] %llu: flip after %.1f ms | game swap %.1f, DrawDone waits %.1f | fence %.1f..%.1f, render idle %.1f "
+                    "(%.1f after fence), first command %.1f, encoded %.1f, GPU start %.1f, GPU done %.1f",
+                    (unsigned long long)flipped, since, rel(r.guestSwap), r.drawDoneMs, rel(r.fenceA), rel(r.fenceB), r.idleMs,
+                    r.idleAfterFenceMs, rel(r.firstOp), rel(r.encoded), rel(wwhd_frame_gpu_start_ns(flipped)), rel(wwhd_frame_done_ns(flipped)));
+            ftrace::ring[(flipped + 128) & 255].drawDoneMs = 0;  // cleared well before frame flipped+128 starts
+            lastFlip = t;
+        }
     }
 }
 #ifdef WWHD_HAS_VULKAN
@@ -847,7 +896,9 @@ HLE(gx2, GX2Flush) { emit_host(OP_FLUSH, {}); }
 HLE(gx2, GX2DrawDone) {
     BlockingScope b;
     emit_host(OP_DRAW_DONE, {});
+    const int64_t ft0 = ftrace::on ? ftrace::now() : 0;
     render_sync(kSyncDrawDone);
+    if (ft0) ftrace::ring[(g_swap_count + 1) & 255].drawDoneMs += (ftrace::now() - ft0) / 1e6;
     ret(c, 1);
 }
 HLE(gx2, GX2SwapScanBuffers) {
@@ -900,6 +951,10 @@ HLE(gx2, GX2SwapScanBuffers) {
         update_flips();
         g_swap_count++;
         g_pending_flips.push_back({vsync_index(), g_swap_count});
+        if (ftrace::on) {
+            ftrace::Rec& r = ftrace::ring[g_swap_count & 255];
+            r.guestSwap = ftrace::now();
+        }
     }
     // debug: WWHD_LOG_SLOW_SWAP=ms logs swaps that came more than ms after the previous one
     static const double slow_ms = getenv("WWHD_LOG_SLOW_SWAP") ? atof(getenv("WWHD_LOG_SLOW_SWAP")) : 0;
