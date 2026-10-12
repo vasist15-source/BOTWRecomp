@@ -232,6 +232,10 @@ static void clear_surface(Surface* s, const float* rgba, bool clearDepth, float 
                           uint32_t firstSlice = 0, uint32_t numSlices = 1) {
     if (!s || !s->tex) return;
     end_encoder();
+    bool pass_dump_on();
+    if (pass_dump_on())
+        LOG("[pass] clear %08X %lux%lu f%X%s%s%s", s->addr, (unsigned long)s->tex.width, (unsigned long)s->tex.height, s->format,
+            s->isDepth ? " depth" : " color", clearDepth ? " d" : "", clearStencil ? " s" : "");
     for (uint32_t slice = firstSlice; slice < firstSlice + numSlices; slice++) {
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.depthAttachment.slice = rp.stencilAttachment.slice = slice;
@@ -558,6 +562,11 @@ void swap() {
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
         static uint64_t lastCpu = 0;
         uint64_t cpu = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        extern std::atomic<uint64_t> g_pass_stats[4], g_pass_stats_merged;
+        LOG("[gfx] last 300 frames: %.0f draws/frame kept in a merged pass", g_pass_stats_merged.exchange(0) / 300.0);
+        LOG("[gfx] last 300 frames: %.0f render passes/frame (%.0f MiB loaded+stored), %.0f of them reopen the previous pass's targets (%.0f MiB)",
+            g_pass_stats[0].exchange(0) / 300.0, g_pass_stats[1].exchange(0) / 300.0 / 1048576.0, g_pass_stats[2].exchange(0) / 300.0,
+            g_pass_stats[3].exchange(0) / 300.0 / 1048576.0);
         LOG("[gfx] frame %llu, %llu draws so far, GPU %.1f ms/frame, render thread CPU %.2f ms/frame", (unsigned long long)R.frame,
             (unsigned long long)R.drawCount, g_gpu_ns.exchange(0) / 1e6 / 300.0, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
         lastCpu = cpu;

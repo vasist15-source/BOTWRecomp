@@ -949,7 +949,9 @@ static bool can_write_back(const Surface* img) {
     return ok;
 }
 // the texels of img at the guest size w x h (its top-left), read from the GPU (waits for it)
-static std::vector<uint8_t> read_guest_texels(Surface* img, uint32_t w, uint32_t h) {
+// encodes the copy of img's texels at the guest size w x h (its top-left) into a shared buffer; the
+// buffer holds them once the current command buffer has completed
+static id<MTLBuffer> encode_texel_read(Surface* img, uint32_t w, uint32_t h) {
     const uint32_t bytes = img->fmt.bytesPerBlock;
     id<MTLTexture> src = img->tex;
     if (src.width != img->width || src.height != img->height) {
@@ -969,9 +971,13 @@ static std::vector<uint8_t> read_guest_texels(Surface* img, uint32_t w, uint32_t
     [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
               toBuffer:buf destinationOffset:0 destinationBytesPerRow:(NSUInteger)w * bytes destinationBytesPerImage:(NSUInteger)w * h * bytes];
     [b endEncoding];
+    return buf;
+}
+static std::vector<uint8_t> read_guest_texels(Surface* img, uint32_t w, uint32_t h) {
+    id<MTLBuffer> buf = encode_texel_read(img, w, h);
     wait_idle();
     const uint8_t* raw = (const uint8_t*)buf.contents;
-    return std::vector<uint8_t>(raw, raw + (size_t)w * h * bytes);
+    return std::vector<uint8_t>(raw, raw + (size_t)w * h * img->fmt.bytesPerBlock);
 }
 // GX2CopySurface done on the GPU into a linear destination: the game reads it once the call returns
 static void write_back_linear_copy(Surface* img, GX2Surface* d, uint32_t dbase, uint32_t dstMip, uint32_t dstSlice, uint32_t w, uint32_t h) {
@@ -998,10 +1004,35 @@ static void write_back_linear_copy(Surface* img, GX2Surface* d, uint32_t dbase, 
     rprof::add_write_back(0, 1, texels.size(), rprof::now_ns() - r0);
 }
 // GX2DrawDone: linear render targets drawn since their last write-back
+// Linear render targets reach guest memory asynchronously: the copy is queued with the frame's GPU
+// work and written to guest memory once that work has completed (a later DrawDone or swap), instead
+// of waiting for an idle GPU at every DrawDone (BotW draws one every frame: 21% of the render
+// thread in waitUntilCompleted). The CPU sees the result a frame or so later, like Cemu's
+// asynchronous readback. WWHD_SYNC_WRITE_BACK=1 restores the wait.
+struct PendingWriteBack {
+    id<MTLBuffer> buf;
+    id<MTLCommandBuffer> cmd;
+    uint32_t addr, w, h, bytes, pitch;
+};
+static std::vector<PendingWriteBack> g_pending_write_backs;
+void drain_write_backs(bool all) {
+    size_t done = 0;
+    for (auto& p : g_pending_write_backs) {
+        if (!all && p.cmd.status < MTLCommandBufferStatusCompleted) break;  // in order: later ones follow
+        if (all) [p.cmd waitUntilCompleted];
+        const uint8_t* raw = (const uint8_t*)p.buf.contents;
+        for (uint32_t y = 0; y < p.h; y++)
+            memcpy(mem::ptr(p.addr + y * p.pitch * p.bytes), raw + (size_t)y * p.w * p.bytes, (size_t)p.w * p.bytes);
+        done++;
+    }
+    g_pending_write_backs.erase(g_pending_write_backs.begin(), g_pending_write_backs.begin() + done);
+}
 void write_back_linear_targets() {
+    static const bool sync = getenv("WWHD_SYNC_WRITE_BACK") && atoi(getenv("WWHD_SYNC_WRITE_BACK")) != 0;
     const uint64_t t0 = rprof::now_ns();
     uint64_t readNs = 0, bytesDone = 0;
     uint32_t count = 0;
+    drain_write_backs(false);
     // linear aligned only: a tile mode of 0 can also be GX2's "default" (a tiled copy destination)
     for (Surface* s : R.linearTargets) {
         if (!s->gpuWritten || s->writtenBackSeq == s->writeSeq || !s->tex) continue;
@@ -1009,6 +1040,17 @@ void write_back_linear_targets() {
         if (s->slices != 1 || !can_write_back(s)) continue;
         const uint32_t addr = s->addr;
         const uint32_t bytes = s->fmt.bytesPerBlock, pitch = std::max(s->pitch, s->width);
+        {
+            static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seen;
+            if (seen.insert({s->width, s->height, s->format}).second)
+                LOG("[gfx] linear render target written back: %ux%u format %X at %08X", s->width, s->height, s->format, addr);
+        }
+        if (!sync) {
+            id<MTLBuffer> buf = encode_texel_read(s, s->width, s->height);
+            g_pending_write_backs.push_back({buf, command_buffer(), addr, s->width, s->height, bytes, pitch});
+            count++;
+            continue;
+        }
         const uint64_t r0 = rprof::now_ns();
         auto texels = read_guest_texels(s, s->width, s->height);
         for (uint32_t y = 0; y < s->height; y++)

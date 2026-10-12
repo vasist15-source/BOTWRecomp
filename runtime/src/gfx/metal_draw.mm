@@ -778,6 +778,9 @@ struct TargetFormats {
     uint32_t depth = 0;
 };
 static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, uint64_t fsKey, const TargetFormats& t);
+// write-mask nibbles cleared for the draw being set up: colour slots of a merged render pass that
+// the draw does not target (see ensure_pass); part of the pipeline key and of its cache recipe
+static uint32_t g_target_mask_clear = 0;
 
 static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, LatteFetchShader* fs,
                                                uint64_t fsKey, const TargetFormats& tf) {
@@ -796,7 +799,8 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
     h = hash_bytes(&df, 4, h);
     h = hash_regs(regs, REGADDR::CB_BLEND0_CONTROL, 8, h);
     h = hash_regs(regs, REGADDR::CB_COLOR_CONTROL, 1, h);
-    h = hash_regs(regs, REGADDR::CB_TARGET_MASK, 1, h);
+    const uint32_t targetMask = regs[REGADDR::CB_TARGET_MASK] & ~g_target_mask_clear;
+    h = hash_bytes(&targetMask, 4, h);
     // vertices only (stream-out passes, both faces culled): follows the vertex shader, which the
     // decompiler built without a position output under the same rule (a raster pipeline would fail to
     // build; cache replays have no rasterizer registers here, the shader's own registers decided)
@@ -857,7 +861,6 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
         d.vertexDescriptor = vd;
     }
     uint32_t blendMask = (regs[REGADDR::CB_COLOR_CONTROL] >> 8) & 0xFF;
-    uint32_t targetMask = regs[REGADDR::CB_TARGET_MASK];
     for (int i = 0; i < 8; i++) {
         if (!tf.color[i]) continue;
         auto ca = d.colorAttachments[i];
@@ -1318,14 +1321,82 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
 }
 
 // ---------------------------------------------------------------- render pass
+std::atomic<uint64_t> g_pass_stats[4];  // passes, bytes loaded+stored, reopened passes, their bytes
+std::atomic<uint64_t> g_pass_stats_merged{0};  // draws kept in a pass whose targets are a superset of theirs
+// debug: WWHD_PASS_DUMP=<frame> logs every render pass and clear of that frame ([pass])
+static uint64_t g_pass_dump_draws = 0;
+bool pass_dump_on() {
+    static const uint64_t f = getenv("WWHD_PASS_DUMP") ? strtoull(getenv("WWHD_PASS_DUMP"), nullptr, 10) : 0;
+    return f && R.frame == f;
+}
+// Merging: a draw whose colour targets are a subset of the open pass's (same slots and slices), with
+// the same depth or none, stays in that pass; the attachments it does not target get a zero write
+// mask (g_target_mask_clear) and, without depth, the depth test is off. Saves reloading and storing
+// every attachment: BotW's G-buffer (4 colour targets + depth) switches its 4th target on and off
+// between draws, ~180 MiB per reopened pass at 2x. Not when the draw samples one of the extra
+// attachments (reading an attached texture). WWHD_NO_PASS_MERGE=1 turns it off.
+static Surface* const* g_draw_sampled = nullptr;  // surfaces the draw being set up samples
+static int g_draw_sampled_n = 0;
 static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Surface* depth, uint32_t depthSlice, bool noAttachments = false) {
+    g_target_mask_clear = 0;
     if (R.enc) {
         bool same = R.passDepth == depth && (!depth || R.passDepthSlice == depthSlice);
         for (int i = 0; i < 8 && same; i++)
             same = R.passColor[i] == colors[i] && (!colors[i] || R.passColorSlice[i] == colorSlices[i]);
         if (same) return true;
+        static const bool merge = !(getenv("WWHD_NO_PASS_MERGE") && atoi(getenv("WWHD_NO_PASS_MERGE")));
+        bool subset = merge && !noAttachments && (R.passDepth == depth ? (!depth || R.passDepthSlice == depthSlice) : !depth);
+        bool any = false;
+        uint32_t clear = 0;
+        for (int i = 0; i < 8 && subset; i++) {
+            if (colors[i]) {
+                subset = R.passColor[i] == colors[i] && R.passColorSlice[i] == colorSlices[i];
+                any = true;
+            } else if (R.passColor[i]) {
+                clear |= 0xFu << (4 * i);
+                for (int k = 0; k < g_draw_sampled_n && subset; k++) subset = g_draw_sampled[k] != R.passColor[i];
+            }
+        }
+        if (subset && !depth && R.passDepth)
+            for (int k = 0; k < g_draw_sampled_n && subset; k++) subset = g_draw_sampled[k] != R.passDepth;
+        if (subset && (any || depth)) {
+            g_target_mask_clear = clear;
+            g_pass_stats_merged++;
+            return true;
+        }
     }
     end_encoder();
+    // stats: passes per frame, the attachment bytes each loads and stores, and how many reopen the
+    // same targets as the pass before (it was ended by something else: an upload, a copy, a clear)
+    {
+        static Surface* lastC[8];
+        static Surface* lastD;
+        bool reopen = lastD == depth;
+        for (int i = 0; i < 8; i++) reopen = reopen && lastC[i] == colors[i];
+        uint64_t bytes = 0;
+        for (int i = 0; i < 8; i++)
+            if (colors[i] && colors[i]->tex) { bytes += (uint64_t)colors[i]->tex.width * colors[i]->tex.height * colors[i]->fmt.hostBytesPerBlock; }
+        if (depth && depth->tex) bytes += (uint64_t)depth->tex.width * depth->tex.height * 5;
+        if (pass_dump_on()) {
+            char b[400];
+            int n = snprintf(b, sizeof b, "[pass] draw pass (prev had %llu draws):", (unsigned long long)(R.drawCount - g_pass_dump_draws));
+            for (int i = 0; i < 8; i++)
+                if (colors[i] && colors[i]->tex)
+                    n += snprintf(b + n, sizeof b - n, " C%d %08X %lux%lu f%X", i, colors[i]->addr, (unsigned long)colors[i]->tex.width,
+                                  (unsigned long)colors[i]->tex.height, colors[i]->format);
+            if (depth && depth->tex)
+                n += snprintf(b + n, sizeof b - n, " D %08X %lux%lu f%X", depth->addr, (unsigned long)depth->tex.width,
+                              (unsigned long)depth->tex.height, depth->format);
+            if (reopen) n += snprintf(b + n, sizeof b - n, " REOPEN");
+            LOG("%s", b);
+            g_pass_dump_draws = R.drawCount;
+        }
+        g_pass_stats[0]++;
+        g_pass_stats[1] += bytes * 2;
+        if (reopen) { g_pass_stats[2]++; g_pass_stats[3] += bytes * 2; }
+        for (int i = 0; i < 8; i++) lastC[i] = colors[i];
+        lastD = depth;
+    }
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     bool any = false;
     for (int i = 0; i < 8; i++) {
@@ -1582,7 +1653,7 @@ static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, 
     r.tf = t;
     for (int i = 0; i < 8; i++) r.blend[i] = regs[REGADDR::CB_BLEND0_CONTROL + i];
     r.colorControl = regs[REGADDR::CB_COLOR_CONTROL];
-    r.targetMask = regs[REGADDR::CB_TARGET_MASK];
+    r.targetMask = regs[REGADDR::CB_TARGET_MASK] & ~g_target_mask_clear;
     for (int i = 0; i < 16; i++) r.strides[i] = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + i * 7 + 2];
     std::vector<uint8_t> v;
     put(v, r);
@@ -1879,22 +1950,26 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     MTLPrimitiveType ptype;
     if (!build_indices(prim, count, indexType, indexAddr, indices, ptype)) { g_skip[SK_PRIM]++; return; }
     rprof::mark(rprof::kIndices);
+    static Surface* sampled[64];
+    int nSampled = 0;
     for (Shader* sh : {vs, ps}) {
         uint32_t texBase = sh == vs ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
         for (int u = 0; u < sh->dec->textureUnitListCount; u++) {
             uint8_t unit = sh->dec->textureUnitList[u];
             Surface* s = sampled_texture(&regs[texBase + unit * 7], sh->dec->textureUsesDepthCompare[unit]);
-            (void)s;
+            if (s && nSampled < 64) sampled[nSampled++] = s;
         }
     }
+    g_draw_sampled = sampled;
+    g_draw_sampled_n = nSampled;
 
     rprof::mark(rprof::kTextures);
     if (!ensure_pass(colors, colorSlices, depth, depthSlice, noAttachments)) { g_skip[SK_PASS]++; return; }
     rprof::mark(rprof::kPass);
-    TargetFormats tf;
+    TargetFormats tf;  // the pass's attachments (a merged pass can have more than the draw targets)
     for (int i = 0; i < 8; i++)
-        if (colors[i]) tf.color[i] = colors[i]->format;
-    if (depth) tf.depth = depth->format;
+        if (R.passColor[i]) tf.color[i] = R.passColor[i]->format;
+    if (R.passDepth) tf.depth = R.passDepth->format;
     id<MTLRenderPipelineState> pipe = get_pipeline(regs, vs, ps, fs, fsKey, tf);
     if (!pipe) { g_skip[SK_PIPE_COMPILING]++; return; }
     rprof::mark(rprof::kPipeline);
