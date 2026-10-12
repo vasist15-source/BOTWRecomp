@@ -1685,6 +1685,8 @@ static uint32_t g_pt_ps = 0;  // pixel shader of the draw being set up (pass tim
 static Shader* g_pt_ps_shader = nullptr;
 static Surface* const* g_draw_sampled = nullptr;  // surfaces the draw being set up samples
 static int g_draw_sampled_n = 0;
+static void occl_attach(MTLRenderPassDescriptor* rp);
+static void occl_new_encoder();
 static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Surface* depth, uint32_t depthSlice, bool noAttachments = false) {
     g_target_mask_clear = 0;
     if (R.enc) {
@@ -1800,7 +1802,9 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
         pass_timing_attach(rp, b);
         if (!g_pt_shader.empty()) g_pt_shader.back() = g_pt_ps_shader;
     }
+    occl_attach(rp);
     R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    occl_new_encoder();
     for (int i = 0; i < 8; i++) {
         R.passColor[i] = colors[i];
         R.passColorSlice[i] = colorSlices[i];
@@ -2232,7 +2236,86 @@ void cache_warm_step() {
 enum Skip { SK_GS, SK_RASTER_KILL, SK_NO_FETCH, SK_NO_SHADER, SK_NO_TARGET, SK_PRIM, SK_PASS, SK_PIPELINE, SK_CULL, SK_SCISSOR, SK_COMPILING,
             SK_DROPPED_DEPTH, SK_DROPPED_COLOR, SK_PIPE_COMPILING, SK_COUNT };
 static uint64_t g_skip[SK_COUNT];
-uint64_t g_alpha_to_mask_draws = 0;  // draws with DB_ALPHA_TO_MASK enabled (render thread)
+uint64_t g_alpha_to_mask_draws = 0;
+// ---------------------------------------------------------------- occlusion queries
+// Every draw pass carries a visibility result buffer; while a query is open each pass counts the
+// samples that pass depth/stencil into its own 8-byte slot (a query can span passes). When the
+// command buffer holding the query's last pass completes, the slots are summed and reported
+// (wwhd_query_result), scaled back to the game's resolution (the samples the guest GPU would count).
+namespace {
+constexpr uint32_t kOcclSlots = 4096;  // ring; a slot is reused only frames after its result was read
+id<MTLBuffer> g_occl_buf = nil;
+uint32_t g_occl_next = 0;
+bool g_occl_open = false;
+uint32_t g_occl_addr = 0;
+std::vector<uint32_t> g_occl_slots;  // the open query's slots
+int64_t g_occl_enc_slot = -1;        // slot counting on R.enc (-1: none)
+uint64_t g_occl_skips_at_begin = 0;
+float g_occl_area = 1.0f;            // target texels per guest pixel of the query's draws (internal resolution)
+id<MTLRenderCommandEncoder> g_occl_enc = nil;
+uint64_t occl_lost_draws() {  // draws that should have counted samples but did not run
+    return g_skip[SK_COMPILING] + g_skip[SK_PIPE_COMPILING] + g_skip[SK_NO_SHADER] + g_skip[SK_PASS] + g_skip[SK_NO_TARGET] +
+           g_skip[SK_GS];
+}
+void occl_count_on_current() {
+    if (!R.enc || !g_occl_buf) return;
+    uint32_t slot = g_occl_next++ % kOcclSlots;
+    ((uint64_t*)g_occl_buf.contents)[slot] = 0;
+    [R.enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:slot * 8];
+    g_occl_enc_slot = slot;
+    g_occl_enc = R.enc;
+    g_occl_slots.push_back(slot);
+}
+}  // namespace
+static void occl_attach(MTLRenderPassDescriptor* rp) {
+    if (!g_occl_buf) {
+        g_occl_buf = [R.device newBufferWithLength:kOcclSlots * 8 options:MTLResourceStorageModeShared];
+        g_occl_buf.label = @"occlusion query results";
+    }
+    rp.visibilityResultBuffer = g_occl_buf;
+}
+static void occl_new_encoder() {
+    g_occl_enc_slot = -1;
+    g_occl_enc = nil;
+    if (g_occl_open) occl_count_on_current();
+}
+void query_begin(uint32_t addr) {
+    if (g_occl_open && g_occl_enc == R.enc && R.enc && g_occl_enc_slot >= 0)  // unbalanced: drop the open one
+        [R.enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+    g_occl_open = true;
+    g_occl_addr = addr;
+    g_occl_slots.clear();
+    g_occl_skips_at_begin = occl_lost_draws();
+    g_occl_area = 1.0f;
+    g_occl_enc_slot = -1;
+    g_occl_enc = nil;
+    // the current pass may predate the buffer (it is attached to every pass, so only the first)
+    if (R.enc) occl_count_on_current();
+}
+void query_end(uint32_t addr, uint32_t gen) {
+    if (!g_occl_open || addr != g_occl_addr) {
+        render::wwhd_query_result(addr, gen, 0, false);
+        return;
+    }
+    if (R.enc && g_occl_enc == R.enc && g_occl_enc_slot >= 0)
+        [R.enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+    g_occl_open = false;
+    g_occl_enc_slot = -1;
+    g_occl_enc = nil;
+    const bool ok = occl_lost_draws() == g_occl_skips_at_begin;
+    const float sc = g_occl_area;
+    std::vector<uint32_t> slots;
+    slots.swap(g_occl_slots);
+    id<MTLBuffer> buf = g_occl_buf;
+    [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        uint64_t sum = 0;
+        if (buf)
+            for (uint32_t s : slots) sum += ((const uint64_t*)buf.contents)[s];
+        if (sc > 0.0f && sc != 1.0f) sum = (uint64_t)((double)sum / sc + 0.5);
+        render::wwhd_query_result(addr, gen, sum, ok && cb.status == MTLCommandBufferStatusCompleted);
+    }];
+}
+  // draws with DB_ALPHA_TO_MASK enabled (render thread)
 static const char* kSkipNames[SK_COUNT] = {"geometry-shader", "raster-kill", "no-fetch-shader", "shader-failed", "no-target",
                                            "unsupported-prim", "no-pass", "pipeline-failed", "cull-all", "empty-scissor",
                                            "compiling", "dropped-depth", "dropped-color", "pipeline-compiling"};
@@ -2379,6 +2462,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     }
     g_target_kx = kx;
     g_target_ky = ky;
+    if (g_occl_open) g_occl_area = kx * ky;
     rprof::mark(rprof::kTargets);
 
     // textures must be uploaded before the render encoder opens

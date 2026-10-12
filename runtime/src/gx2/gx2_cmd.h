@@ -43,6 +43,8 @@ enum Op : uint32_t {
     OP_LAYOUT_CONTENT,  // DrawSelf scope: clip TV menu content to the native layout region
     OP_STREAMOUT_UPDATE,  // buffer index, mode (0 reset, 1 restore from ctx, 3 save to ctx), ctx address
     OP_WAIT_MEM,        // GX2SetGPUFence: address, mask, compare op, value; waits until (mem & mask) op value
+    OP_QUERY_BEGIN,     // GX2QueryBegin: query address
+    OP_QUERY_END,       // GX2QueryEnd: query address, generation (the result is reported per generation)
     OP_COUNT
 };
 

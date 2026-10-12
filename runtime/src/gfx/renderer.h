@@ -46,6 +46,10 @@ struct Backend {
     void (*wait_idle)();           // GX2DrawDone
     void (*write_back)();          // GX2DrawDone: render results the CPU reads (linear targets) to guest memory
     void (*ss_reset)();            // a save state was loaded: forget surfaces and shader memos
+    // occlusion queries: count the samples that pass between begin and end; the result goes to
+    // wwhd_query_result (gx2_core.cpp) once the GPU has it. Optional (null: no results).
+    void (*query_begin)(uint32_t addr);
+    void (*query_end)(uint32_t addr, uint32_t gen);
     // any thread
     uint64_t (*frame_count)();
     void (*request_tv_dump)(const std::string& path, int frames_ahead);
@@ -125,6 +129,12 @@ inline void guest_flush() { g_backend->guest_flush(); }
 inline void wait_idle() { g_backend->wait_idle(); }
 inline void write_back() { if (g_backend->write_back) g_backend->write_back(); }
 inline void ss_reset() { g_backend->ss_reset(); }
+extern "C" void wwhd_query_result(uint32_t addr, uint32_t gen, uint64_t samples, bool ok);
+inline void query_begin(uint32_t addr) { if (g_backend->query_begin) g_backend->query_begin(addr); }
+inline void query_end(uint32_t addr, uint32_t gen) {
+    if (g_backend->query_end) g_backend->query_end(addr, gen);
+    else wwhd_query_result(addr, gen, 0, false);
+}
 uint64_t frame_count();  // 0 before the renderer started
 inline void request_tv_dump(const std::string& path, int frames_ahead) { g_backend->request_tv_dump(path, frames_ahead); }
 inline void request_capture() { g_backend->request_capture(); }

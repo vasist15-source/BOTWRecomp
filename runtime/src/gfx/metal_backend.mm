@@ -23,6 +23,8 @@ void set_aniso(bool v);
 bool fxaa_enabled();
 void set_fxaa(bool v);
 std::string device_name();
+void query_begin(uint32_t addr);
+void query_end(uint32_t addr, uint32_t gen);
 }  // namespace gfx
 
 namespace render {
@@ -49,6 +51,8 @@ const Backend& metal_backend() {
         b.wait_idle = gfx::wait_idle;
         b.write_back = gfx::write_back_linear_targets;
         b.ss_reset = gfx::ss_reset_surfaces;
+        b.query_begin = gfx::query_begin;
+        b.query_end = gfx::query_end;
         b.frame_count = gfx::frame_count;
         b.request_tv_dump = gfx::request_tv_dump;
         b.request_capture = gfx::request_capture;

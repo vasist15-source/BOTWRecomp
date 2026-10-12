@@ -622,6 +622,12 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         }
         break;
     }
+    case OP_QUERY_BEGIN:
+        if (n >= 1) render::query_begin(p[0]);
+        break;
+    case OP_QUERY_END:
+        if (n >= 2) render::query_end(p[0], p[1]);
+        break;
     case OP_STREAMOUT_UPDATE: {  // the buffer's write offset (bytes), in command order like the GPU's
         uint32 reg = mmVGT_STRMOUT_BUFFER_OFFSET_0 + 4 * (p[0] & 3);
         if (p[1] == 0) g_regs[reg] = 0;
@@ -870,18 +876,72 @@ HLE(gx2, GX2SaveStreamOutContext) {
     emit(OP_STREAMOUT_UPDATE, {i, 3u, ld32(b + 0x1C)});
 }
 
-// Occlusion queries (BotW): no GPU queries on the Metal backend yet, so every query reports
-// "visible" (0x100000 samples) and conditional rendering always draws. Nothing is wrongly culled;
-// the cost is drawing some things the game could have skipped.
+// Occlusion queries. BotW reads one result on the CPU (GX2QueryGetOcclusionResult: the sun's lens
+// flare, dimmed by how much of the sun is visible) and uses the rest for conditional rendering.
+// The renderer counts the samples that pass between begin and end (Metal visibility results) and
+// reports them once the GPU finished; until then the query is "not ready" and the game keeps its
+// previous value, as on hardware. A query whose draws were skipped (shader still compiling) keeps
+// the last count. Conditional rendering always draws (Metal has no predication; nothing is culled
+// wrongly, some hidden things are drawn). WWHD_NO_QUERIES=1: every query "fully visible" (before).
 static std::atomic<uint64_t> g_queries{0}, g_cond_renders{0};
 extern "C" uint64_t wwhd_query_counts(uint64_t* conditional) {
     *conditional = g_cond_renders.exchange(0);
     return g_queries.exchange(0);
 }
-HLE(gx2, GX2QueryBegin) { memset(mem::ptr(arg(c, 1)), 0, 0x40); g_queries++; }
-HLE(gx2, GX2QueryEnd) {}
+namespace {
+struct QueryState {
+    uint32 issued = 0, done = 0;  // generations: begun by the game, reported by the renderer
+    uint64_t samples = 0x100000;  // until a real result: fully visible
+    uint64_t issuedFrame = 0;     // a result that never comes (recorded in a display list never run):
+};                                // ready with the last count after a second
+std::mutex g_query_mu;
+std::unordered_map<uint32, QueryState> g_query_state;
+bool queries_off() {
+    static const bool off = getenv("WWHD_NO_QUERIES") && atoi(getenv("WWHD_NO_QUERIES"));
+    return off;
+}
+}  // namespace
+extern "C" void wwhd_query_result(uint32_t addr, uint32_t gen, uint64_t samples, bool ok) {
+    std::lock_guard<std::mutex> l(g_query_mu);
+    QueryState& q = g_query_state[addr];
+    if ((int32_t)(gen - q.done) <= 0) return;
+    static const bool log = getenv("WWHD_QUERY_LOG") && atoi(getenv("WWHD_QUERY_LOG"));
+    if (log) LOG("[query] %08X gen %u: %llu samples%s", addr, gen, (unsigned long long)samples, ok ? "" : " (lost, kept)");
+    q.done = gen;
+    if (ok) q.samples = samples;
+}
+HLE(gx2, GX2QueryBegin) {  // (type, GX2Query*)
+    memset(mem::ptr(arg(c, 1)), 0, 0x40);
+    g_queries++;
+    if (queries_off()) return;
+    emit(OP_QUERY_BEGIN, {arg(c, 1)});
+}
+HLE(gx2, GX2QueryEnd) {  // (type, GX2Query*)
+    if (queries_off()) return;
+    uint32 gen;
+    {
+        std::lock_guard<std::mutex> l(g_query_mu);
+        QueryState& q = g_query_state[arg(c, 1)];
+        gen = ++q.issued;
+        q.issuedFrame = render::frame_count();
+    }
+    emit(OP_QUERY_END, {arg(c, 1), gen});
+}
 HLE(gx2, GX2QueryGetOcclusionResult) {  // (GX2Query*, u64* result) -> ready
-    if (arg(c, 1)) { st32(arg(c, 1), 0); st32(arg(c, 1) + 4, 0x100000); }
+    uint64_t samples = 0x100000;
+    bool ready = true;
+    if (!queries_off()) {
+        std::lock_guard<std::mutex> l(g_query_mu);
+        auto it = g_query_state.find(arg(c, 0));
+        if (it != g_query_state.end()) {
+            ready = it->second.done == it->second.issued || render::frame_count() > it->second.issuedFrame + 60;
+            samples = it->second.samples;
+        }
+    }
+    static const bool log = getenv("WWHD_QUERY_LOG") && atoi(getenv("WWHD_QUERY_LOG"));
+    if (log) LOG("[query] read %08X: %s %llu", arg(c, 0), ready ? "ready" : "not ready", (unsigned long long)samples);
+    if (!ready) { ret(c, 0); return; }
+    if (arg(c, 1)) { st32(arg(c, 1), (uint32)(samples >> 32)); st32(arg(c, 1) + 4, (uint32)samples); }
     ret(c, 1);
 }
 HLE(gx2, GX2QueryBeginConditionalRender) { g_cond_renders++; }
