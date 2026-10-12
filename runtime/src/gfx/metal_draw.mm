@@ -364,8 +364,15 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     const int attempt = ++sh->attempts;
     const bool injectFailure = attempt <= g_test_fail_compiles;
     MTLCompileOptions* opt = [MTLCompileOptions new];
+    // WWHD_MATH_MODE=safe|relaxed|fast (relaxed: reassociation and contraction, Inf/NaN kept)
+    static const MTLMathMode mode = [] {
+        const char* e = getenv("WWHD_MATH_MODE");
+        if (e && !strcmp(e, "relaxed")) return MTLMathModeRelaxed;
+        if (e && !strcmp(e, "fast")) return MTLMathModeFast;
+        return MTLMathModeSafe;
+    }();
     if (@available(macOS 15.0, *)) {
-        opt.mathMode = MTLMathModeSafe;
+        opt.mathMode = mode;
     } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -1386,9 +1393,42 @@ void pass_timing_end_frame(id<MTLCommandBuffer> last) {
                 if (x[k] != MTLCounterErrorValue && x[k]) { first = std::min(first, x[k]); lastEnd = std::max(lastEnd, x[k]); }
             rows.push_back({vs, fs, i});
         }
+        // time with no pass's vertex or fragment work running (the union of all spans vs first to last),
+        // and the largest such gaps, named by the pass that ends them
+        struct Iv { uint64_t a, b; size_t i; };
+        std::vector<Iv> iv;
+        for (size_t i = 0; i < desc.size(); i++) {
+            const uint64_t* x = &t[4 * i].timestamp;
+            for (int k = 0; k < 4; k += 2)
+                if (x[k] != MTLCounterErrorValue && x[k + 1] != MTLCounterErrorValue && x[k] && x[k + 1] >= x[k]) iv.push_back({x[k], x[k + 1], i});
+        }
+        std::sort(iv.begin(), iv.end(), [](const Iv& a, const Iv& b) { return a.a < b.a; });
+        struct Gap { double ms; size_t before, after; };
+        std::vector<Gap> gaps;
+        double covered = 0;
+        uint64_t curA = 0, curB = 0;
+        size_t curI = 0;
+        for (auto& v : iv) {
+            if (!curB) { curA = v.a; curB = v.b; curI = v.i; continue; }
+            if (v.a > curB) {
+                covered += (curB - curA) / 1e6;
+                gaps.push_back({(v.a - curB) / 1e6, curI, v.i});
+                curA = v.a;
+                curB = v.b;
+            } else if (v.b > curB) curB = v.b;
+            curI = v.b >= curB ? v.i : curI;
+        }
+        if (curB) covered += (curB - curA) / 1e6;
+        double idle = 0;
+        for (auto& g : gaps) idle += g.ms;
+        std::sort(gaps.begin(), gaps.end(), [](const Gap& a, const Gap& b) { return a.ms > b.ms; });
         std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.fs + a.vs > b.fs + b.vs; });
-        LOG("[gputime] %zu passes: vertex %.2f ms, fragment %.2f ms summed; %.2f ms first to last timestamp", desc.size(), tv, tf,
-            (lastEnd - first) / 1e6);
+        LOG("[gputime] %zu passes: vertex %.2f ms, fragment %.2f ms summed; %.2f ms first to last timestamp; passes running %.2f ms, "
+            "no pass running %.2f ms in %zu gaps", desc.size(), tv, tf, (lastEnd - first) / 1e6, covered, idle, gaps.size());
+        for (size_t k = 0; k < gaps.size() && k < 12; k++)
+            LOG("[gputime] gap %.2f ms between #%zu (%llu draws) and #%zu (%llu draws %s)", gaps[k].ms, gaps[k].before,
+                (unsigned long long)(draws[gaps[k].before + 1] - draws[gaps[k].before]), gaps[k].after,
+                (unsigned long long)(draws[gaps[k].after + 1] - draws[gaps[k].after]), desc[gaps[k].after].c_str());
         for (size_t k = 0; k < rows.size() && k < 30; k++)
             LOG("[gputime] vs %6.2f fs %6.2f ms  #%-3zu %4llu draws  %s", rows[k].vs, rows[k].fs, rows[k].i,
                 (unsigned long long)(draws[rows[k].i + 1] - draws[rows[k].i]), desc[rows[k].i].c_str());
