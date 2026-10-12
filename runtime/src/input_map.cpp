@@ -184,6 +184,9 @@ Mapping Mapping::defaults() {
     };
     for (int a = 0; a < kActionCount; a++) m.pad[a] = pads[a];
     apply_face_layout(m, FaceLayout::kPosition);
+    // until the user picks a preset, each pad's face buttons follow the letters printed on it: a
+    // Switch Pro pad (reported by label) got A/B and X/Y swapped under the by-position preset
+    m.face_auto = true;
     return m;
 }
 
@@ -580,6 +583,7 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
     if (ps.p != ps.end) return bad("JSON: trailing characters");
     if (root.type != Json::Obj) return bad("JSON: expected an object");
     Mapping m = Mapping::defaults();
+    bool faceSet = false;  // the file binds a face button itself: then it is a manual preset unless it says "auto"
     std::string warn;
     if (const Json* kb = root.get("keyboard"); kb && kb->type == Json::Obj) {
         for (auto& [id, v] : kb->obj) {
@@ -608,6 +612,7 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
             int p = pad_from_id(v.s);
             if (p < 0) { warn += "unknown controller input \"" + v.s + "\"; "; continue; }
             m.pad[a] = p;
+            if (a <= kY) faceSet = true;
         }
     }
     if (const Json* op = root.get("options"); op && op->type == Json::Obj) {
@@ -616,6 +621,9 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
         if (const Json* i = op->get("invert_camera_y"); i && i->type == Json::Bool) m.invert_camera_y = i->b;
         // only "automatic" is stored: the two manual presets are the shape of the face bindings
         if (const Json* f = op->get("face_layout"); f && f->type == Json::Str) m.face_auto = f->s == "auto";
+        else if (faceSet) m.face_auto = false;
+    } else if (faceSet) {
+        m.face_auto = false;
     }
     out = m;
     if (error) *error = warn;

@@ -98,8 +98,8 @@ const char* _getElementStrByIndex(uint32 channel)
 	return "UNDEFINED";
 }
 
-char _tempGenString[64][256];
-uint32 _tempGenStringIndex = 0;
+thread_local char _tempGenString[64][256];
+thread_local uint32 _tempGenStringIndex = 0;
 
 char* _getTempString()
 {

@@ -51,8 +51,8 @@ static const char* _getElementStrByIndex(uint32 channel)
 	return "UNDEFINED";
 }
 
-static char _tempGenString[64][256];
-static uint32 _tempGenStringIndex = 0;
+static thread_local char _tempGenString[64][256];  // per thread: parallel translation
+static thread_local uint32 _tempGenStringIndex = 0;
 
 static char* _getTempString()
 {

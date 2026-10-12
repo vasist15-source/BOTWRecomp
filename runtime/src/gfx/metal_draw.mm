@@ -251,6 +251,7 @@ struct Shader {
     LatteDecompilerShader* dec = nullptr;
     id<MTLFunction> fn = nil;                 // valid once state == CS_READY
     std::atomic<int> state{CS_PENDING};
+    std::atomic<int> tstate{CS_READY};        // translation: CS_PENDING while a worker translates it
     int attempts = 0;                         // Metal compiles started (render thread)
     uint64_t retryFrame = 0;                  // a failed compile is retried from this frame on (0: not scheduled)
     bool noPosition = false;                  // vertex shader built with rasterization off (decompiler rule): no position output
@@ -512,6 +513,20 @@ static const char* key_word_name(uint32_t i) {
 }
 
 static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey);
+static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t base, uint32_t addr,
+                             uint32_t size, bool async);
+static std::mutex g_used_units_mu;  // also guards the translation time counters
+static std::unordered_map<uint64_t, uint32_t> g_used_units;  // program -> texture units it samples (stage_state_hash)
+static dispatch_queue_t translate_queue() {  // shader translation: draws wait on it
+    static dispatch_queue_t q = dispatch_queue_create_with_target("wwhd.translate", DISPATCH_QUEUE_CONCURRENT,
+                                                                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
+    return q;
+}
+static dispatch_queue_t pipeline_queue() {  // pipeline builds: issued after translation, often hundreds at once
+    static dispatch_queue_t q = dispatch_queue_create_with_target("wwhd.pipeline", DISPATCH_QUEUE_CONCURRENT,
+                                                                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    return q;
+}
 
 static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
     // nothing shader-relevant changed since the previous draw: same shader
@@ -550,9 +565,12 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     uint64_t key = program_hash(addr, size) ^ (vertex ? 0x1111 : 0x2222);
     uint64_t base = key;
     // texture units this program samples, known after its first translation (see stage_state_hash)
-    static std::unordered_map<uint64_t, uint32_t> usedUnits;
-    auto uu = usedUnits.find(base);
-    const uint32_t unitMask = uu != usedUnits.end() ? uu->second : 0x3FFFF;
+    uint32_t unitMask = 0x3FFFF;
+    {
+        std::lock_guard<std::mutex> lk(g_used_units_mu);
+        auto uu = g_used_units.find(base);
+        if (uu != g_used_units.end()) unitMask = uu->second;
+    }
     key = stage_state_hash(regs, key ^ (unitMask == 0x3FFFF ? 0 : 0x5EED0001u),
                            vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask);
     if (vertex) key ^= fsKey * 31;
@@ -600,6 +618,33 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     s->kind = gfx::program_kind(mem::ptr(addr), size, vertex);
     s->key = key;
     g_shaders[key] = s;
+    // new shaders during play are translated on worker threads, so a burst (entering a new area: hundreds
+    // in one frame) runs on all cores instead of stalling the render thread; a draw whose shader is still
+    // translating waits within the compile budget (wait_compiled), then is skipped for that frame.
+    // Cache replay stays synchronous. WWHD_SYNC_TRANSLATE=1: translate in place (the old way).
+    static const bool asyncTranslate = !getenv("WWHD_SYNC_TRANSLATE");
+    if (asyncTranslate && !g_cache_replaying && !g_defer_compiles) {
+        cache_record_shader(regs, vertex);
+        s->tstate = CS_PENDING;
+        auto snap = std::make_shared<std::vector<uint32_t>>(regs, regs + 0x10000);  // the render thread moves on
+        dispatch_async(translate_queue(), ^{
+            translate_shader(s, snap->data(), vertex, fs, base, addr, size, true);
+        });
+        return s;
+    }
+    translate_shader(s, regs, vertex, fs, base, addr, size, false);
+    return s;
+}
+
+// translation and compile start of a new shader: on the render thread, or on a worker (async: regs is a
+// snapshot, and s->tstate is published when s->dec is set or translation failed)
+static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t base, uint32_t addr,
+                             uint32_t size, bool async) {
+    struct Publish {
+        Shader* s;
+        bool async;
+        ~Publish() { if (async) compile_done(s->tstate, s->state.load() == CS_FAILED && !s->dec ? CS_FAILED : CS_READY); }
+    } publish{s, async};
     double t0 = now_ms();
     LatteShader_UpdatePSInputs((uint32*)regs);
     LatteDecompilerOptions opt;
@@ -617,13 +662,14 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     if (!out.shader || out.shader->hasError || !out.shader->strBuf_shaderSource) {
         LOG("[gfx] %s shader %08X failed to translate", vertex ? "vertex" : "pixel", addr);
         s->state = CS_FAILED;
-        return s;
+        return;
     }
     s->dec = FinishDecompiledShader(out);
-    if (uu == usedUnits.end()) {
+    {
         uint32_t m = 0;
         for (int u = 0; u < s->dec->textureUnitListCount; u++) m |= 1u << s->dec->textureUnitList[u];
-        usedUnits.emplace(base, m);
+        std::lock_guard<std::mutex> lk(g_used_units_mu);
+        g_used_units.emplace(base, m);  // the first translation's units (later ones don't replace them)
     }
     if (opt.areaSampledTextures) {
         std::string src = s->dec->strBuf_shaderSource->c_str();
@@ -634,25 +680,30 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
             LOG("[gfx] pixel shader %08X: area-sampled taps not applied", addr);
         }
     }
-    cache_record_shader(regs, vertex);
+    if (!async) cache_record_shader(regs, vertex);
     double t1 = now_ms();
-    g_t_decompile += t1 - t0;
+    {
+        std::lock_guard<std::mutex> lk(g_used_units_mu);
+        g_t_decompile += t1 - t0;
+    }
     if (getenv("WWHD_DUMP_SHADERS")) {
         mkdir("shaders", 0755);
         char name[96];
-        snprintf(name, sizeof name, "shaders/%s_%08X_%016llx.metal", vertex ? "vs" : "ps", addr, (unsigned long long)key);
+        snprintf(name, sizeof name, "shaders/%s_%08X_%016llx.metal", vertex ? "vs" : "ps", addr, (unsigned long long)s->key);
         if (FILE* f = fopen(name, "w")) { fputs(s->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
     }
     if (g_defer_compiles) {
         s->state = CS_DEFERRED;  // cache replay: compile on first use or gradually in the background
         g_deferred_shaders.push_back(s);
     } else {
-        compile_msl(s, s->dec->strBuf_shaderSource->c_str(), key);
+        compile_msl(s, s->dec->strBuf_shaderSource->c_str(), s->key);
     }
-    g_t_msl += now_ms() - t1;
-    static uint32_t count = 0;
-    if (++count % 100 == 0) LOG("[gfx] %u shaders translated", count);
-    return s;
+    {
+        std::lock_guard<std::mutex> lk(g_used_units_mu);
+        g_t_msl += now_ms() - t1;
+    }
+    static std::atomic<uint32_t> count{0};
+    if (++count % 100 == 0) LOG("[gfx] %u shaders translated", count.load());
 }
 
 // ---------------------------------------------------------------- conversions
@@ -748,7 +799,9 @@ static uint64_t g_must_run_waits = 0;
 static double g_must_run_wait_ms = 0;
 std::atomic<double> g_compile_wait_ms{0};  // render thread time spent waiting for compiles (hitch log)
 static bool wait_compiled(const std::atomic<int>& st) {
-    static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 25.0;
+    // 10 ms: new areas bring hundreds of shaders in a frame; waiting 25 ms for them made 75+ ms frames
+    // where skipping a few draws for a frame or two went unnoticed
+    static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 10.0;
     if (g_building_ahead) return st.load(std::memory_order_acquire) == CS_READY;
     static uint64_t frame = ~0ull;
     static double spent = 0;
@@ -911,13 +964,21 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
         return pl->state;
     }
     g_compiles_in_flight++;
-    [R.device newRenderPipelineStateWithDescriptor:d completionHandler:^(id<MTLRenderPipelineState> p, NSError* err) {
-        g_compiles_in_flight--;
-        if (injectFailure) p = nil;
-        if (!p) pipelineFailed(err);
-        pl->state = p;
-        compile_done(pl->status, p ? CS_READY : CS_FAILED);
-    }];
+    // even the asynchronous call does real work on the caller (descriptor checks, the GPU-code cache
+    // lookup): ~0.1 ms each, so a burst of hundreds stalled the render thread. Issued from a worker.
+    // WWHD_SYNC_TRANSLATE=1 issues them here.
+    static const bool fromWorker = !getenv("WWHD_SYNC_TRANSLATE");
+    void (^issue)(void) = ^{
+        [R.device newRenderPipelineStateWithDescriptor:d completionHandler:^(id<MTLRenderPipelineState> p, NSError* err) {
+            g_compiles_in_flight--;
+            if (injectFailure) p = nil;
+            if (!p) pipelineFailed(err);
+            pl->state = p;
+            compile_done(pl->status, p ? CS_READY : CS_FAILED);
+        }];
+    };
+    if (fromWorker) dispatch_async(pipeline_queue(), issue);
+    else issue();
     return wait_compiled(pl->status) ? pl->state : nil;
 }
 
@@ -2075,7 +2136,32 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     }
     Shader* vs = get_shader(regs, true, fs, fsKey);
     Shader* ps = get_shader(regs, false, fs, fsKey);
-    if (!vs || !ps || !vs->dec || !ps->dec) { g_skip[SK_NO_SHADER]++; return; }  // translation failed
+    if (!vs || !ps) { g_skip[SK_NO_SHADER]++; return; }
+    // a full-screen pass (a quad or a big triangle, once): skipping it for a frame while its shader
+    // compiles flashes the whole picture (lighting, post effects), so it always waits; objects skip
+    const bool fullScreen = count <= 6 && instances <= 1;
+    if (vs->tstate.load(std::memory_order_acquire) != CS_READY || ps->tstate.load(std::memory_order_acquire) != CS_READY) {
+        // still translating on a worker: wait within the compile budget, or skip the draw this frame. The
+        // pixel shader's outputs aren't known yet, so any bound target not redrawn every frame counts
+        // (those draws wait until done, as for compiles)
+        bool must = false;
+        // colour: outputs the shader exports (CB_SHADER_MASK) that the target mask lets through
+        const uint32_t written = regs[REGADDR::CB_TARGET_MASK] & regs[mmCB_SHADER_MASK];
+        for (int i = 0; i < 8 && !must; i++)
+            if (((written >> (4 * i)) & 0xF) && regs[mmCB_COLOR0_BASE + i]) {
+                auto it = g_target_drawn.find(regs[mmCB_COLOR0_BASE + i]);
+                must = it == g_target_drawn.end() || it->second + 1 < R.frame;
+            }
+        if (!must && LatteMRT::GetActiveDepthBufferMask(*(const LatteContextRegister*)regs) && regs[mmDB_DEPTH_BASE]) {
+            auto it = g_target_drawn.find(regs[mmDB_DEPTH_BASE]);
+            must = it == g_target_drawn.end() || it->second + 1 < R.frame;
+        }
+        g_draw_must_run = must || fullScreen;
+        const bool ready = wait_compiled(vs->tstate) && wait_compiled(ps->tstate);
+        g_draw_must_run = false;
+        if (!ready) { g_skip[vs->tstate == CS_FAILED || ps->tstate == CS_FAILED ? SK_NO_SHADER : SK_COMPILING]++; return; }
+    }
+    if (!vs->dec || !ps->dec) { g_skip[SK_NO_SHADER]++; return; }  // translation failed
     // must this draw run even if its compile takes longer than the budget? (see wait_compiled)
     const LatteContextRegister& lcr = *(const LatteContextRegister*)regs;
     uint8_t mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
@@ -2088,7 +2174,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         for (int i = 0; i < 8 && !must; i++)
             if ((mask & (1 << i)) && regs[mmCB_COLOR0_BASE + i]) must = notRedrawn(regs[mmCB_COLOR0_BASE + i]);
         if (!must && LatteMRT::GetActiveDepthBufferMask(lcr) && regs[mmDB_DEPTH_BASE]) must = notRedrawn(regs[mmDB_DEPTH_BASE]);
-        g_draw_must_run = must;
+        g_draw_must_run = must || fullScreen;
     }
     struct MustRunReset { ~MustRunReset() { g_draw_must_run = false; } } mustRunReset;
     retry_failed_compile(vs, g_draw_must_run);

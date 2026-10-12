@@ -239,7 +239,8 @@ uint32 LatteParsedFetchShaderBufferGroup::getCurrentBufferStride(uint32* context
 }
 
 // ---- from Cemu src/Cafe/HW/Latte/Core/LatteShader.cpp
-LatteShaderPSInputTable _activePSImportTable;
+// per thread: shaders are translated on worker threads (metal_draw.mm)
+thread_local LatteShaderPSInputTable _activePSImportTable;
 
 LatteShaderPSInputTable* LatteSHRC_GetPSInputTable()
 {

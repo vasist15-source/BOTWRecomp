@@ -182,7 +182,8 @@ static void test_face_auto() {
 
     // the Automatic preset follows the noted labels
     Mapping m = Mapping::defaults();
-    CHECK(!m.face_auto && face_layout(m) == FaceLayout::kPosition);
+    CHECK(m.face_auto && face_layout(m) == FaceLayout::kPosition);  // Automatic by default, by position until a pad reports
+    m.face_auto = false;
     note_face_labels(nintendo);
     set_face_auto(m, true);
     CHECK(m.face_auto && face_layout(m) == FaceLayout::kPosition);
@@ -339,7 +340,7 @@ static void test_json_roundtrip() {
     CHECK(press(r, {kVK_UpArrow}).ry == -1);  // inverted camera
     CHECK(press(r, {kVK_ANSI_W}).ly == 1);    // move stick not inverted
     // the Automatic preset is the one face state that is stored
-    CHECK(to_json(Mapping::defaults()).find("face_layout") == std::string::npos);
+    CHECK(to_json(Mapping::defaults()).find("\"face_layout\": \"auto\"") != std::string::npos);  // the default is Automatic
     m.face_auto = true;
     j = to_json(m);
     CHECK(j.find("\"face_layout\": \"auto\"") != std::string::npos);
