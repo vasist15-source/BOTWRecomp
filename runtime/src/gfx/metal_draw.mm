@@ -253,6 +253,7 @@ struct Shader {
     std::atomic<int> state{CS_PENDING};
     int attempts = 0;                         // Metal compiles started (render thread)
     uint64_t retryFrame = 0;                  // a failed compile is retried from this frame on (0: not scheduled)
+    bool noPosition = false;                  // vertex shader built with rasterization off (decompiler rule): no position output
 };
 
 // A Metal compile or pipeline build can fail for reasons that have nothing to do with the source:
@@ -447,6 +448,8 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     put(REGADDR::SX_ALPHA_TEST_CONTROL, 1);       // also read by a vertex path (viewport scale disabled)
     put(REGADDR::PA_CL_VTE_CNTL, 1);
     put(REGADDR::PA_CL_CLIP_CNTL, 1);
+    // rasterization off (kill bit, or both faces culled): the decompiler leaves the position out
+    buf[n++] = vs ? !((const LatteContextRegister*)regs)->IsRasterizationEnabled() : 0;
     putIf(!vs, REGADDR::CB_COLOR_CONTROL, 1);
     putIf(!vs, REGADDR::CB_TARGET_MASK, 1);
     putIf(!vs, mmCB_COLOR0_INFO, 8);
@@ -586,6 +589,7 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     }
 
     auto* s = new Shader();
+    s->noPosition = vertex && !((const LatteContextRegister*)regs)->IsRasterizationEnabled();
     s->kind = gfx::program_kind(mem::ptr(addr), size, vertex);
     s->key = key;
     g_shaders[key] = s;
@@ -793,7 +797,10 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
     h = hash_regs(regs, REGADDR::CB_BLEND0_CONTROL, 8, h);
     h = hash_regs(regs, REGADDR::CB_COLOR_CONTROL, 1, h);
     h = hash_regs(regs, REGADDR::CB_TARGET_MASK, 1, h);
-    const bool rasterKill = (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22)) != 0;  // stream-out pass: vertices only
+    // vertices only (stream-out passes, both faces culled): follows the vertex shader, which the
+    // decompiler built without a position output under the same rule (a raster pipeline would fail to
+    // build; cache replays have no rasterizer registers here, the shader's own registers decided)
+    const bool rasterKill = vs->noPosition;
     h ^= rasterKill ? 0x9E3779B97F4A7C15ull : 0;
     auto it = g_pipelines.find(h);
     Pipeline* pl;
