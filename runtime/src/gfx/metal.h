@@ -35,6 +35,8 @@ id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr);
 struct Surface {
     std::shared_ptr<Surface> mipChain; // sampled companion assembled from GPU-rendered levels
     uint64_t mipChainSeq = ~0ull;
+    std::shared_ptr<Surface> layerArray; // sampled companion: an array assembled from GPU-rendered layers
+    uint64_t layerArraySeq = ~0ull;
     id<MTLTexture> tex = nil;
     uint32_t addr = 0, mipAddr = 0;
     uint32_t width = 0, height = 0, slices = 1, pitch = 0, mips = 1;

@@ -631,6 +631,97 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
     return c;
 }
 
+// A texture array the game samples where only single-layer render targets exist: on the Wii U layer N is
+// the memory at the address of slice N, which the game rendered as a separate 2D target. The companion
+// array copies each layer from the GPU-written surface at that address (same size and format), zero where
+// there is none; a sample past our one-layer texture was undefined before (BotW's water read layer 1 of
+// its quarter-res scene buffer: white water). WWHD_NO_ARRAY_LAYERS=1: off.
+static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
+    static const bool off = getenv("WWHD_NO_ARRAY_LAYERS") != nullptr;
+    const auto dim = (Latte::E_DIM)d.dim;
+    if (off || !s || !s->tex || !s->gpuWritten || s->fmt.depth || s->fmt.compressed || d.slices < 2 || d.slices > 64 ||
+        (dim != Latte::E_DIM::DIM_2D_ARRAY && dim != Latte::E_DIM::DIM_CUBEMAP) || layer_count(s->tex) >= d.slices ||
+        s->tex.textureType != MTLTextureType2D)
+        return s;
+    const uint32_t w = (uint32_t)s->tex.width, h = (uint32_t)s->tex.height;
+    Surface* layer[64] = {};
+    layer[0] = s;
+    uint64_t key = s->writeSeq * 0x9E3779B97F4A7C15ull;
+    for (uint32_t i = 1; i < d.slices; i++) {
+        uint32_t sliceAddr = 0, sliceSize = 0;
+        sint32 sub = 0;
+        LatteAddrLib::CalculateMipAndSliceAddr(d.addr | d.swizzle, d.mipAddr, (Latte::E_GX2SURFFMT)d.format, d.width, d.height, d.slices,
+                                               dim, (Latte::E_HWTILEMODE)d.tileMode, d.swizzle, 0, 0, (sint32)i, &sliceAddr, &sliceSize, &sub);
+        if (sub != 0) continue;  // thick tiling: slices share tiles, not separate targets
+        sliceAddr &= ~0x700u;
+        Surface* best = nullptr;
+        auto range = R.surfaces.equal_range(sliceAddr);
+        for (auto it = range.first; it != range.second; ++it) {
+            Surface* o = it->second.get();
+            if (!o->tex || !o->gpuWritten || o->isDepth || o->tex.pixelFormat != s->tex.pixelFormat || o->tex.width != w ||
+                o->tex.height != h)
+                continue;
+            if (!best || o->writeSeq > best->writeSeq) best = o;
+        }
+        layer[i] = best;
+        key = (key ^ (best ? best->writeSeq + i : i)) * 0xFF51AFD7ED558CCDull;
+    }
+    auto* c = s->layerArray.get();
+    if (c && (layer_count(c->tex) != d.slices || c->tex.width != w || c->tex.height != h || c->tex.pixelFormat != s->tex.pixelFormat ||
+              c->tex.textureType != (dim == Latte::E_DIM::DIM_CUBEMAP ? MTLTextureTypeCubeArray : MTLTextureType2DArray))) {
+        s->layerArray.reset();
+        c = nullptr;
+    }
+    if (R.binding) return c ? c : s;  // prepared by the draw's texture preflight, before its encoder opened
+    if (dim == Latte::E_DIM::DIM_CUBEMAP && (d.slices % 6 || w != h)) return s;
+    if (!c) {
+        auto arr = std::make_shared<Surface>();
+        c = arr.get();
+        c->addr = s->addr; c->mipAddr = d.mipAddr;
+        c->width = s->width; c->height = s->height; c->slices = d.slices; c->mips = 1;
+        c->format = s->format; c->dim = d.dim; c->fmt = s->fmt;
+        c->sx = s->sx; c->sy = s->sy; c->scale = s->scale; c->gpuWritten = true;
+        MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+        td.textureType = dim == Latte::E_DIM::DIM_CUBEMAP ? MTLTextureTypeCubeArray : MTLTextureType2DArray;
+        td.pixelFormat = s->tex.pixelFormat;
+        td.width = w;
+        td.height = h;
+        td.arrayLength = dim == Latte::E_DIM::DIM_CUBEMAP ? d.slices / 6 : d.slices;
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        c->tex = [R.device newTextureWithDescriptor:td];
+        if (!c->tex) return s;
+        s->layerArray = std::move(arr);
+        s->layerArraySeq = ~0ull;
+    }
+    if (s->layerArraySeq == key) return c;
+    end_encoder();
+    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
+    static id<MTLBuffer> zeros = nil;
+    const NSUInteger bpp = s->fmt.hostBytesPerBlock ? s->fmt.hostBytesPerBlock : 16;
+    const NSUInteger need = (NSUInteger)w * bpp * h;
+    if (!zeros || zeros.length < need) zeros = [R.device newBufferWithLength:need options:MTLResourceStorageModePrivate];
+    if (zeros.length >= need) [b fillBuffer:zeros range:NSMakeRange(0, need) value:0];
+    for (uint32_t i = 0; i < d.slices; i++) {
+        if (layer[i])
+            [b copyFromTexture:layer[i]->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                     toTexture:c->tex destinationSlice:i destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        else
+            [b copyFromBuffer:zeros sourceOffset:0 sourceBytesPerRow:w * bpp sourceBytesPerImage:need sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:c->tex destinationSlice:i destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+    [b endEncoding];
+    s->layerArraySeq = key;
+    static int logged = 0;
+    if (logged++ < 20) {
+        int found = 0;
+        for (uint32_t i = 1; i < d.slices; i++) found += layer[i] != nullptr;
+        LOG("[gfx] array %08X %ux%u f%X: %u layers assembled from render targets (%d of %u found)", d.addr, d.width, d.height, d.format,
+            d.slices, found, d.slices - 1);
+    }
+    return c;
+}
+
 Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     Latte::LATTE_SQ_TEX_RESOURCE_WORD0_N w0;
     Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N w1;
@@ -691,6 +782,7 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
         s->lastCheckedFrame = R.frame;
         check_texture(s);
     }
+    if (s && s->gpuWritten && !isDepthSampler && d.slices > 1) return with_array_layers(s, d);
     return s && s->gpuWritten && d.mips > 1 && !isDepthSampler ? with_mip_chain(s, d) : s;
 }
 
