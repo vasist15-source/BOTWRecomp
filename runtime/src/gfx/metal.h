@@ -13,6 +13,15 @@
 #include "formats.h"
 
 namespace gfx {
+// layers of a texture (array slices, cube faces): render-pass slice, blit and upload indices
+inline NSUInteger layer_count(id<MTLTexture> t) {
+    switch (t.textureType) {
+    case MTLTextureType3D: return 1;
+    case MTLTextureTypeCube: return 6;
+    case MTLTextureTypeCubeArray: return 6 * std::max<NSUInteger>(t.arrayLength, 1);
+    default: return std::max<NSUInteger>(t.arrayLength, 1);
+    }
+}
 void peek_z(const uint32_t*, uint32_t);
 
 // A host texture backing a guest surface (render target, depth buffer or sampled texture).

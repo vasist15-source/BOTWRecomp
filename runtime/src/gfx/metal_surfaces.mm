@@ -32,7 +32,9 @@ static MTLTextureType texture_type(uint32_t dim, uint32_t slices) {
     switch ((Latte::E_DIM)dim) {
     case Latte::E_DIM::DIM_1D: return MTLTextureType1D;
     case Latte::E_DIM::DIM_3D: return MTLTextureType3D;
-    case Latte::E_DIM::DIM_CUBEMAP: return MTLTextureTypeCube;
+    // cube maps are cube arrays: the shader translator declares every cube texture texturecube_array,
+    // and a cube texture bound there (or viewed as one) is undefined (white water reflections)
+    case Latte::E_DIM::DIM_CUBEMAP: return MTLTextureTypeCubeArray;
     case Latte::E_DIM::DIM_1D_ARRAY: return MTLTextureType1DArray;
     case Latte::E_DIM::DIM_2D_ARRAY: case Latte::E_DIM::DIM_2D_ARRAY_MSAA: return MTLTextureType2DArray;
     default: return slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
@@ -166,6 +168,7 @@ static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, bool forRend
     td.depth = type == MTLTextureType3D ? s->slices : 1;
     td.arrayLength = (type == MTLTextureType2DArray || type == MTLTextureType1DArray) ? s->slices : 1;
     if (type == MTLTextureTypeCube) td.arrayLength = 1;
+    if (type == MTLTextureTypeCubeArray) td.arrayLength = std::max<uint32_t>(s->slices / 6, 1);
     td.mipmapLevelCount = s->mips;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | format_view_usage();
     td.storageMode = MTLStorageModePrivate;
@@ -193,7 +196,7 @@ static Surface* rescale(Surface* s) {
     if (!t) { s->sx = osx; s->sy = osy; s->scale = oscale; s->ax = oax; s->ay = oay; return s; }
     end_encoder();
     g_resample_why = "rescale";
-    resample(old, t, s->fmt, old.textureType == MTLTextureType2DArray ? (uint32_t)old.arrayLength : 1);
+    resample(old, t, s->fmt, old.textureType == MTLTextureType3D ? 1 : (uint32_t)layer_count(old));
     g_resample_why = nullptr;
     s->tex = t;
     forget_texture_views();
@@ -363,8 +366,7 @@ static Surface* adopt_newer_alias(Surface* s) {
     if (!src) return s;
     end_encoder();
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-    NSUInteger layers = s->tex.textureType == MTLTextureType3D ? 1 : std::max<NSUInteger>(s->tex.arrayLength, 1);
-    if (s->tex.textureType == MTLTextureTypeCube) layers = 6;
+    NSUInteger layers = layer_count(s->tex);
     for (NSUInteger level = 0; level < std::min(s->tex.mipmapLevelCount, newest->tex.mipmapLevelCount); level++)
         for (NSUInteger slice = 0; slice < layers; slice++)
             {
@@ -941,7 +943,7 @@ void upload_surface(Surface* s) {
         id<MTLBuffer> staging = upload_reserve((uint32_t)((size_t)bw * bh * slices * f.hostBytesPerBlock), &stagingOffset, &dst);
         decode_level(s, level, base, dst);
         bool is3D = s->tex.textureType == MTLTextureType3D;
-        uint32_t layers = is3D ? 1 : (s->tex.textureType == MTLTextureTypeCube ? 6 : (uint32_t)s->tex.arrayLength);
+        uint32_t layers = (uint32_t)layer_count(s->tex);
         uint32_t perSlice = bw * bh * f.hostBytesPerBlock;
         for (uint32_t z = 0; z < (is3D ? 1 : std::min(slices, layers)); z++) {
             [blit copyFromBuffer:staging

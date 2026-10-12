@@ -1220,7 +1220,7 @@ static MTLTextureType texture_type_for_dim(Latte::E_DIM dim) {
     switch (dim) {
     case E_DIM::DIM_1D: return MTLTextureType1D;
     case E_DIM::DIM_3D: return MTLTextureType3D;
-    case E_DIM::DIM_CUBEMAP: return MTLTextureTypeCube;
+    case E_DIM::DIM_CUBEMAP: return MTLTextureTypeCubeArray;  // what the translator declares (texturecube_array)
     case E_DIM::DIM_1D_ARRAY: return MTLTextureType1DArray;
     case E_DIM::DIM_2D_ARRAY: case E_DIM::DIM_2D_ARRAY_MSAA: return MTLTextureType2DArray;
     default: return MTLTextureType2D;
@@ -1241,7 +1241,7 @@ static id<MTLTexture> null_texture(MTLTextureType type) {
     d.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> t = [R.device newTextureWithDescriptor:d];
     uint32_t zero = 0;
-    for (int i = 0; i < (type == MTLTextureTypeCube ? 6 : 1); i++)
+    for (NSUInteger i = 0; i < layer_count(t); i++)
         [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:i withBytes:&zero bytesPerRow:4 bytesPerImage:4];
     cache[(int)type] = t;
     return t;
@@ -1261,8 +1261,13 @@ static id<MTLTexture> texture_view(Surface* s, MTLTextureType type, uint32_t wor
     static const MTLTextureSwizzle sw[8] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha,
                                             MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleZero, MTLTextureSwizzleZero};
     MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(sw[sel[0]], sw[sel[1]], sw[sel[2]], sw[sel[3]]);
-    NSUInteger slices = s->tex.textureType == MTLTextureTypeCube ? 6 : s->tex.arrayLength;
-    if (type == MTLTextureTypeCube && slices < 6) type = s->tex.textureType;
+    NSUInteger slices = layer_count(s->tex);
+    // a cube view needs whole cubes: a 2D texture (or a short array) the game sampled as a cube has
+    // none (an invalid view samples garbage), so it reads as missing (black) instead
+    if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) {
+        if (slices < 6 || s->tex.textureType == MTLTextureType2D) return nil;
+        slices -= slices % 6;
+    }
     if ((type == MTLTextureType2D || type == MTLTextureType1D) && slices > 1) slices = 1;
     if (type == MTLTextureType2DArray && s->tex.textureType == MTLTextureType2D) slices = 1;
     if (type == MTLTextureType3D && s->tex.textureType != MTLTextureType3D) return nil;
