@@ -122,8 +122,74 @@ static float target_scale(const Surface* s) {
         return true;
     }();
     (void)shadow_logged;
-    if (shadow && s->isDepth && s->slices > 1) return shadow;
-    return res_scale();
+    if (s->isDepth && s->slices > 1) return shadow ? shadow : res_scale();
+    // which targets follow the internal resolution: the sizes and formats of the BotW "Graphics" pack's
+    // TextureRedefine rules (what Cemu scales; everything else keeps the console's size). Scaling every
+    // target broke data targets the game reads by position (white water at 2x).
+    // WWHD_SCALE_ALL_TARGETS=1: every target as before.
+    struct Rule { uint16_t w, h; std::initializer_list<uint16_t> formats; bool notLinearAligned; };
+    static const Rule kRules[] = {
+        {1280, 720, {0x001,0x005,0x007,0x019,0x01a,0x41a,0x80e,0x806,0x816,0x820}, true},
+        {864, 480, {0x019}, false},
+        {854, 480, {0x019}, false},
+        {640, 368, {0x001,0x005,0x007,0x019,0x01a,0x80e,0x806,0x816,0x820,0x41a}, false},
+        {640, 360, {0x001,0x005,0x007,0x019,0x01a,0x80e,0x806,0x816,0x820,0x41a}, true},
+        {384, 192, {0x001}, false},
+        {320, 192, {0x001,0x005,0x007,0x019,0x01a,0x80e,0x816,0x806,0x820,0x41a}, false},
+        {320, 180, {0x001,0x005,0x007,0x019,0x01a,0x80e,0x816,0x806,0x820,0x41a}, false},
+        {192, 96, {0x007,0x806}, false},
+        {160, 96, {0x001,0x005,0x007,0x806,0x80e,0x816}, false},
+        {160, 90, {0x001,0x005,0x007,0x806,0x80e,0x816}, false},
+        {128, 48, {0x806,0x816,0x005,0x007,0x820}, false},
+        {96, 48, {0x816,0x80e}, false},
+        {80, 45, {0x816,0x806,0x007}, false},
+        {64, 64, {0x80e}, false},
+        {128, 720, {0x019}, false},
+        {110, 720, {0x019}, false},
+        {1024, 512, {0x816}, false},
+        {512, 256, {0x816,0x001}, false},
+        {256, 128, {0x816,0x001}, false},
+        {128, 64, {0x816}, false},
+        {64, 32, {0x816}, false},
+        {32, 16, {0x816}, false},
+        {24, 16, {0x816}, false},
+        {40, 22, {0x816}, false},
+        {20, 11, {0x816}, false},
+        {960, 540, {0x816,0x005,0x007,0x019,0x01a,0x41a,0x80e,0x806}, true},
+        {960, 544, {0x816,0x005,0x007,0x019,0x01a,0x41a,0x80e,0x806}, false},
+        {512, 272, {0x001,0x005}, false},
+        {480, 272, {0x816,0x01a,0x820,0x001,0x80e}, false},
+        {480, 270, {0x816,0x01a,0x820,0x001,0x80e}, false},
+        {512, 512, {0x816}, false},
+        {1504, 720, {0x019}, false},
+        {1500, 720, {0x019}, false},
+        {1280, 608, {0x019}, false},
+        {1280, 400, {0x019}, false},
+        {192, 192, {0x019}, false},
+        {1920, 912, {0x001}, false},
+        {512, 288, {0x01a,0x80e}, false},
+        {1280, 288, {0x019}, false},
+        {1280, 278, {0x019}, false},
+        {293, 185, {0x01a}, false},
+        {512, 96, {0x01a}, false},
+        {500, 94, {0x01a}, false},
+        {480, 32, {0x01a}, false},
+        {464, 28, {0x01a}, false},
+        {768, 720, {0x005}, false},
+        {720, 720, {0x005}, false},
+        {384, 368, {0x005}, false},
+        {384, 360, {0x005}, false},
+        {360, 360, {0x005}, false},
+    };
+    static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
+    if (all) return res_scale();
+    for (const Rule& r : kRules) {
+        if (r.w != s->width || r.h != s->height) continue;
+        if (r.notLinearAligned && s->tileMode == 1) continue;  // tileModesExcluded = 0x001 (video playback)
+        for (uint16_t f : r.formats)
+            if (f == s->format) return res_scale();
+    }
+    return 1.0f;
 }
 bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) {
     Surface s;
