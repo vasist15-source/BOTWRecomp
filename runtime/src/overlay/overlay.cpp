@@ -763,7 +763,9 @@ void tab_graphics() {
     if (!render::vulkan()) {
         bool hud;
         if (check("Metal HUD instead (Apple's: FPS, GPU time, memory)", metal_hud_shown(), &hud)) set_metal_hud_shown(hud);
-        help("Apple's Metal performance HUD in the corner of the game window, in place of the overlay above.");
+        help("Apple's Metal performance HUD in the corner of the game window, in place of the overlay above.\n"
+             "Turning it on takes effect after a restart (Metal starts it with the app).");
+        if (metal_hud_shown() && !getenv("MTL_HUD_ENABLED")) note("Restart the game to show the Metal HUD.");
     }
     if (ImGui::Button("Reset performance averages")) { g_average.reset(); perf::reset(); }
     // the render-thread profiler's latest report (render_prof.h), for performance bug reports

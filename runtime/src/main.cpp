@@ -513,6 +513,11 @@ int main(int argc, char** argv) {
     uint32_t arg0 = mem::runtime_alloc(16);
     mem::write_cstr(arg0, "U-King.rpx", 16);
     st32(argv_arr, arg0);
+    // Apple's Metal HUD (settings overlay > Overlay): Metal reads MTL_HUD_ENABLED when it starts
+    {
+        std::string v;
+        if (!getenv("MTL_HUD_ENABLED") && hostui::get("metalHud", v) && v == "1") setenv("MTL_HUD_ENABLED", "1", 1);
+    }
     // the game runs on its own threads; the process main thread belongs to the window system
     render::init();
     mods::cemu::set_vulkan(render::active()==render::Api::Vulkan);
