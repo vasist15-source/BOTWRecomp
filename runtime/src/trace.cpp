@@ -36,8 +36,33 @@ static uint32_t g_watch_val = 0;
 static uint32_t g_watch_r3 = 0;
 static std::atomic<int> g_watch_r3_count{0};
 
+// WWHD_FUNC_COUNT=<lo>-<hi> (hex): counts entries of the guest functions in [lo, hi); the ones
+// entered are written to build/func_count.txt (address, count) at exit
+static uint32_t g_count_lo = 0, g_count_hi = 0;
+static std::atomic<uint32_t>* g_counts = nullptr;
+static void write_func_counts() {
+    FILE* f = fopen("build/func_count.txt", "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < (g_count_hi - g_count_lo) / 4; i++)
+        if (uint32_t n = g_counts[i].load(std::memory_order_relaxed)) fprintf(f, "%08X %u\n", g_count_lo + 4 * i, n);
+    fclose(f);
+}
+
 void true60_nan_probe(uint32_t addr);  // true60.cpp (WWHD_NAN_PROBE)
+// WWHD_ORDER=<fn>,<fn>,... (hex): logs each entry of those functions (first 20 each) with the
+// thread and, with WWHD_ORDER_BYTE=<addr>, that guest byte: the order of events across threads
+static uint32_t g_order[8];
+static int g_order_n = 0, g_order_count[8];
+static uint32_t g_order_byte = 0;
+
 extern "C" void ppc_trace_enter(uint32_t addr) {
+    for (int i = 0; i < g_order_n; i++)
+        if (addr == g_order[i] && g_order_count[i]++ < 20) {
+            char tn[32] = {};
+            host::get_thread_name(tn, sizeof tn);
+            log_msg("[order] f_%08X thread '%s'%s byte %08X = %u", addr, tn, "", g_order_byte, g_order_byte ? ld8(g_order_byte) : 0);
+        }
+    if (g_counts && addr >= g_count_lo && addr < g_count_hi) g_counts[(addr - g_count_lo) / 4].fetch_add(1, std::memory_order_relaxed);
     static const bool nan_probe = getenv("WWHD_NAN_PROBE") != nullptr;
     if (nan_probe) true60_nan_probe(addr);
     if (g_watch_r3) {
@@ -110,6 +135,25 @@ __attribute__((constructor)) static void trace_init() {
         g_ppc_trace = 1;
     }
     if (getenv("WWHD_NAN_PROBE")) g_ppc_trace = 1;
+    if (const char* o = getenv("WWHD_ORDER")) {
+        for (char* p = (char*)o; *p && g_order_n < 8;) {
+            g_order[g_order_n++] = (uint32_t)strtoul(p, &p, 16);
+            while (*p == ',') p++;
+        }
+        if (const char* b = getenv("WWHD_ORDER_BYTE")) g_order_byte = (uint32_t)strtoul(b, nullptr, 16);
+        g_ppc_trace = 1;
+    }
+    if (const char* r = getenv("WWHD_FUNC_COUNT")) {
+        char* e = nullptr;
+        g_count_lo = (uint32_t)strtoul(r, &e, 16) & ~3u;
+        g_count_hi = e && *e == '-' ? (uint32_t)strtoul(e + 1, nullptr, 16) : 0;
+        if (g_count_hi > g_count_lo) {
+            g_counts = new std::atomic<uint32_t>[(g_count_hi - g_count_lo) / 4]();
+            atexit(write_func_counts);
+            signal(SIGTERM, [](int) { write_func_counts(); _exit(0); });
+            g_ppc_trace = 1;
+        }
+    }
     if (getenv("WWHD_TRACE_FUNCS")) {
         g_ppc_trace = 1;
 #ifndef _WIN32

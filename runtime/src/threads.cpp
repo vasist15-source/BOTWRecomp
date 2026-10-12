@@ -1099,6 +1099,22 @@ HLE(coreinit, OSSendMessage) {
     uint32_t m = arg(c, 1), flags = arg(c, 2);
     std::array<uint32_t, 4> msg{ld32(m), ld32(m + 4), ld32(m + 8), ld32(m + 12)};
     if (g_trace_msg) LOG("[msg] send q=%08X msg=%08X %08X flags=%X lr=%08X", arg(c, 0), msg[0], msg[1], flags, c->lr);
+    // debug: WWHD_MSG_DUMP=<queue hex>: hex dump of what each message's first word points at (the
+    // first 60 sends; nw::snd command lists)
+    static const uint32_t dumpQ = getenv("WWHD_MSG_DUMP") ? (uint32_t)strtoul(getenv("WWHD_MSG_DUMP"), nullptr, 16) : 0;
+    static std::atomic<int> dumped{0};
+    static std::atomic<uint32_t> sends{0}, trivial{0};
+    const bool isQ = dumpQ && arg(c, 0) == dumpQ && msg[0] >= mem::kMem2Start && msg[0] < mem::kMem2End - 0x80;
+    // a lone placeholder (no next command, id -1) is counted, not dumped
+    const bool lone = isQ && ld32(msg[0]) == 0 && ld32(msg[0] + 4) == 0xFFFFFFFFu;
+    if (isQ && (++sends % 1000) == 0) LOG("[msgdump] %u batches, %u only the placeholder", sends.load(), trivial.load());
+    if (lone) trivial++;
+    if (isQ && !lone && dumped++ < 60) {
+        char buf[600];
+        int n = snprintf(buf, sizeof buf, "[msgdump] %08X %08X:", msg[0], msg[1]);
+        for (uint32_t o = 0; o < 0x60; o += 4) n += snprintf(buf + n, sizeof buf - n, " %08X", ld32(msg[0] + o));
+        LOG("%s", buf);
+    }
     if (g_trace_msg && msg[0] == 0x7FFFFFFF) {  // sead::Thread quit: who asked for it
         char buf[256];
         int n = snprintf(buf, sizeof buf, "[msg] quit q=%08X from lr=%08X", arg(c, 0), c->lr);
@@ -1191,7 +1207,7 @@ void os_wakeup_thread_queue(uint32_t queue) {
 struct HRendezvous {
     std::mutex m;
     std::condition_variable cv;
-    uint32_t arrived = 0;
+    uint32_t arrived = 0;  // bit per core that has reached it
 };
 static ObjTable<HRendezvous> g_rdv;
 HLE(coreinit, OSInitRendezvous) {
@@ -1199,14 +1215,17 @@ HLE(coreinit, OSInitRendezvous) {
     std::lock_guard<std::mutex> lk(r->m);
     r->arrived = 0;
 }
+// (rendezvous, core mask): marks the caller's core and waits until every core in the mask has
+// arrived (Cemu's coreinit_Synchronization). Not a count of callers: BotW's aal waits on core 1 with
+// mask 1 for its launcher thread on core 0 to finish setting up the sound system; counted, the main
+// thread's own arrival let it through at once and the sound archive player never initialized.
 HLE(coreinit, OSWaitRendezvous) {
-    // arg1 is a core mask; we treat each set bit as one participant
     HRendezvous* r = g_rdv.get(arg(c, 0));
-    uint32_t need = __builtin_popcount(arg(c, 1) & 7);
+    const uint32_t mask = arg(c, 1) & 7;
     std::unique_lock<std::mutex> lk(r->m);
-    r->arrived++;
+    r->arrived |= 1u << (c->core & 3);
     r->cv.notify_all();
-    park_wait(lk, r->cv, [&] { return r->arrived >= need; }, W_RDV, arg(c, 0));
+    park_wait(lk, r->cv, [&] { return (r->arrived & mask) == mask; }, W_RDV, arg(c, 0));
     ret(c, 1);
 }
 

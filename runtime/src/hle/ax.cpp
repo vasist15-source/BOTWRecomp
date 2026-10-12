@@ -929,6 +929,11 @@ HLE(snd_core, AXSetVoiceState) {
     if (Voice* v = voice(arg(c, 0))) {
         if (v->state != 1 && (arg(c, 1) & 0xFFFF) == 1) {
             if (v->type == 0) g_sfx_started++;
+            static int logged = 0;  // the setup of the first voices played (finds silent ones)
+            if (logged++ < 20)
+                LOG("[ax] voice %08X plays: format %u type %u samples %08X cur %08X end %08X loop %u/%08X ratio %08X ve %04X tv mix L %04X R %04X",
+                    arg(c, 0), v->format, v->type, v->samples, v->cur_abs, v->end_abs, v->loop, v->loop_abs, v->ratio, v->ve_vol,
+                    v->tv[0][0].vol, v->tv[1][0].vol);
             trace_voice_start(c, arg(c, 0), v->samples);
         }
         v->state = arg(c, 1) & 0xFFFF;
