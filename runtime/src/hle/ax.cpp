@@ -53,9 +53,11 @@ struct Voice {
     uint32_t vpb = 0;
     uint32_t state = 0;  // 1 = playing
     uint16_t type = 0;   // 0 normal, 1 stream (keeps ADPCM history across loops)
-    // offsets, absolute in format units (bytes / halfwords / nibbles) like the DSP sees them
+    // offsets, absolute in format units (bytes / halfwords / nibbles) like the DSP sees them; 64-bit:
+    // BotW's sample data sits above 0x80000000 (0xA5xxxxxx), whose nibble addresses need 33 bits
     uint16_t format = 0, loop = 0;
-    uint32_t loop_abs = 0, end_abs = 0, cur_abs = 0, samples = 0;
+    uint64_t loop_abs = 0, end_abs = 0, cur_abs = 0;
+    uint32_t samples = 0;
     uint32_t loop_count = 0;
     // ADPCM decoder
     int16_t coef[16] = {};
@@ -102,9 +104,9 @@ DrcState g_drc = {{}, {}, {}, {0x8000, 0x8000, 0x8000}};
 audio::OutputSelect g_output;  // which device mixes the host hears
 
 // ------------------------------------------------------------------ offsets
-uint32_t base_units(uint16_t fmt, uint32_t samples_ptr) {
+uint64_t base_units(uint16_t fmt, uint32_t samples_ptr) {
     switch (fmt) {
-    case ADPCM: return samples_ptr * 2;
+    case ADPCM: return (uint64_t)samples_ptr * 2;
     case PCM16: return samples_ptr / 2;
     default: return samples_ptr;
     }
@@ -112,12 +114,13 @@ uint32_t base_units(uint16_t fmt, uint32_t samples_ptr) {
 
 // mirror the playback position into the guest VPB (offsets relative to the sample buffer)
 void write_offsets(const Voice& v) {
-    uint32_t o = v.vpb + kVpbOffsets, b = base_units(v.format, v.samples);
+    const uint32_t o = v.vpb + kVpbOffsets;
+    const uint64_t b = base_units(v.format, v.samples);
     st16(o + 0, v.format);
     st16(o + 2, v.loop);
-    st32(o + 4, v.loop_abs - b);
-    st32(o + 8, v.end_abs - b);
-    st32(o + 0xC, v.cur_abs - b);
+    st32(o + 4, (uint32_t)(v.loop_abs - b));
+    st32(o + 8, (uint32_t)(v.end_abs - b));
+    st32(o + 0xC, (uint32_t)(v.cur_abs - b));
     st32(o + 0x10, v.samples);
 }
 
@@ -141,27 +144,27 @@ int32_t next_sample(Voice& v) {
     int32_t s;
     switch (v.format) {
     case ADPCM: {
-        uint32_t off = v.cur_abs;
+        uint64_t off = v.cur_abs;
         if ((off & 15) < 2) {  // frame header: predictor/scale byte
-            off &= ~15u;
-            v.scale = *mem::ptr(off >> 1);
+            off &= ~15ull;
+            v.scale = *mem::ptr((uint32_t)(off >> 1));
             off += 2;
         }
-        uint8_t byte = *mem::ptr(off >> 1);
+        uint8_t byte = *mem::ptr((uint32_t)(off >> 1));
         int32_t nib = (off & 1) ? (int8_t)(byte << 4) >> 4 : (int8_t)byte >> 4;
         int ci = (v.scale >> 4) & 7;
         int32_t val = ((nib << 11) * (1 << (v.scale & 15)) + v.coef[ci * 2] * v.yn1 + v.coef[ci * 2 + 1] * v.yn2 + 0x400) >> 11;
         s = std::clamp(val, -32768, 32767);
         v.yn2 = v.yn1;
         v.yn1 = (int16_t)s;
-        uint32_t end = v.end_abs;
+        uint64_t end = v.end_abs;
         if ((end & 15) < 2) end += 2 - (end & 15);  // unreachable header position (see Cemu)
         if (off == end) voice_end(v);
         else v.cur_abs = off + 1;
         return s;
     }
-    case PCM16: s = (int16_t)ld16(v.cur_abs * 2); break;
-    case PCM8: s = (int8_t)*mem::ptr(v.cur_abs) << 8; break;
+    case PCM16: s = (int16_t)ld16((uint32_t)(v.cur_abs * 2)); break;
+    case PCM8: s = (int8_t)*mem::ptr((uint32_t)v.cur_abs) << 8; break;
     default: v.state = 0; return 0;
     }
     if (v.cur_abs == v.end_abs) voice_end(v);
@@ -301,7 +304,7 @@ void process_voices() {
             for (int b = 0; b < kBuses; b++)
                 if (drc[c][b].vol || drc[c][b].delta) mix_into(buf, g_drc_bus[b][c], drc[c][b]);
         if (!v.state) st32(v.vpb + kVpbState, 0);
-        st32(v.vpb + kVpbOffsets + 0xC, v.cur_abs - base_units(v.format, v.samples));
+        st32(v.vpb + kVpbOffsets + 0xC, (uint32_t)(v.cur_abs - base_units(v.format, v.samples)));
     }
 }
 
@@ -932,7 +935,7 @@ HLE(snd_core, AXSetVoiceState) {
             static int logged = 0;  // the setup of the first voices played (finds silent ones)
             if (logged++ < 20)
                 LOG("[ax] voice %08X plays: format %u type %u samples %08X cur %08X end %08X loop %u/%08X ratio %08X ve %04X tv mix L %04X R %04X",
-                    arg(c, 0), v->format, v->type, v->samples, v->cur_abs, v->end_abs, v->loop, v->loop_abs, v->ratio, v->ve_vol,
+                    arg(c, 0), v->format, v->type, v->samples, (uint32_t)v->cur_abs, (uint32_t)v->end_abs, v->loop, (uint32_t)v->loop_abs, v->ratio, v->ve_vol,
                     v->tv[0][0].vol, v->tv[1][0].vol);
             trace_voice_start(c, arg(c, 0), v->samples);
         }
@@ -956,7 +959,7 @@ HLE(snd_core, AXSetVoiceOffsets) {
     v->loop = ld16(o + 2);
     v->samples = ld32(o + 0x10);
     trace_voice_start(c, arg(c, 0), v->samples);  // new sample data on a voice = a (re)started sound
-    uint32_t b = base_units(v->format, v->samples);
+    const uint64_t b = base_units(v->format, v->samples);
     v->loop_abs = b + ld32(o + 4);
     v->end_abs = b + ld32(o + 8);
     v->cur_abs = b + ld32(o + 0xC);
@@ -967,12 +970,12 @@ HLE(snd_core, AXGetVoiceOffsets) {
     Voice* v = voice(arg(c, 0));
     uint32_t o = arg(c, 1);
     if (!v) return;
-    uint32_t b = base_units(v->format, v->samples);
+    const uint64_t b = base_units(v->format, v->samples);
     st16(o, v->format);
     st16(o + 2, v->loop);
-    st32(o + 4, v->loop_abs - b);
-    st32(o + 8, v->end_abs - b);
-    st32(o + 0xC, v->cur_abs - b);
+    st32(o + 4, (uint32_t)(v->loop_abs - b));
+    st32(o + 8, (uint32_t)(v->end_abs - b));
+    st32(o + 0xC, (uint32_t)(v->cur_abs - b));
     st32(o + 0x10, v->samples);
 }
 HLE(snd_core, AXSetVoiceLoop) {
@@ -1002,7 +1005,7 @@ HLE(snd_core, AXSetVoiceLoopOffsetEx) {
 HLE(snd_core, AXGetVoiceCurrentOffsetEx) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
     Voice* v = voice(arg(c, 0));
-    ret(c, v ? v->cur_abs - base_units(v->format, arg(c, 1)) : 0);
+    ret(c, v ? (uint32_t)(v->cur_abs - base_units(v->format, arg(c, 1))) : 0);
 }
 HLE(snd_core, AXGetVoiceLoopCount) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
