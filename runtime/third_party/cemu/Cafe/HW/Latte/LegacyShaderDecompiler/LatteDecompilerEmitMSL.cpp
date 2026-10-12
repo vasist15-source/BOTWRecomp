@@ -1522,8 +1522,9 @@ static void _emitALUOP2InstructionCode(LatteDecompilerShaderContext* shaderConte
 		}
 		else if( cfInstruction->type == GPU7_CF_INST_ALU_BREAK )
 		{
-			src->add("if (predResult) break;" _CRLF);
-			src->addFmt("{} = false;" _CRLF, _getActiveMaskCVarName(shaderContext, cfInstruction->activeStackDepth + 1));
+			// defer the break until the ALU clause has finished
+			if (aluInstruction->updateExecuteMask)
+				src->add("aluBreak = aluBreak || (predResult == false);" _CRLF);
 		}
 		else
 			cemu_assert_debug(false);
@@ -2507,19 +2508,22 @@ static void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContex
     	// gradient parameters
     	if (texOpcode == GPU7_TEX_INST_SAMPLE_G)
     	{
-    		if (texDim == Latte::E_DIM::DIM_2D ||
-    			texDim == Latte::E_DIM::DIM_1D)
+		if (texDim == Latte::E_DIM::DIM_1D)
+		{
+			src->add(", gradient1d(gradH.x, gradV.x)");
+		}
+		else if (texDim == Latte::E_DIM::DIM_2D)
     		{
     			src->add(", gradient2d(gradH.xy, gradV.xy)");
     		}
-    		else
+		else
     		{
     			cemu_assert_unimplemented();
     		}
     	}
 
     	// offset
-    	if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ || texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C )
+		if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LB || texOpcode == GPU7_TEX_INST_SAMPLE_G || texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ || texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C )
     	{
     		if( hasOffset )
     		{
@@ -3121,7 +3125,7 @@ static void _emitExportCode(LatteDecompilerShaderContext* shaderContext, LatteDe
 			return;
 		}
 
-		if( cfInstruction->exportBurstCount != 0 )
+		if( cfInstruction->exportBurstCount != 0 && cfInstruction->exportType != 2 )
 			debugBreakpoint();
 		if (cfInstruction->exportType == 1 && cfInstruction->exportArrayBase == GPU7_DECOMPILER_CF_EXPORT_BASE_POSITION)
 		{
@@ -3162,17 +3166,43 @@ static void _emitExportCode(LatteDecompilerShaderContext* shaderContext, LatteDe
 		else if( cfInstruction->exportType == 2 && cfInstruction->exportArrayBase < 32 )
 		{
 			// export parameter
-			sint32 paramIndex = cfInstruction->exportArrayBase;
-			uint32 vsSemanticId = _getVertexShaderOutParamSemanticId(shaderContext->contextRegisters, paramIndex);
-			if (vsSemanticId != 0xFF)
+			for (uint32 burstIndex = 0; burstIndex < (cfInstruction->exportBurstCount + 1); burstIndex++)
 			{
-				src->addFmt("out.passParameterSem{} = ", vsSemanticId);
-				_emitExportGPRReadCode(shaderContext, cfInstruction, LATTE_DECOMPILER_DTYPE_FLOAT, 0);
-				src->add(";" _CRLF);
-			}
-			else
-			{
-				src->add("// skipped export to semanticId 255" _CRLF);
+				uint32 paramIndex = cfInstruction->exportArrayBase + burstIndex;
+				if (paramIndex >= 32)
+				{
+					cemu_assert_unimplemented();
+					break;
+				}
+				uint32 vsSemanticId = _getVertexShaderOutParamSemanticId(shaderContext->contextRegisters, paramIndex);
+				if (vsSemanticId != 0xFF)
+				{
+					// preserve earlier exports for masked components
+					char componentMask[5]{};
+					uint32 componentCount = 0;
+					for (uint32 component = 0; component < 4; component++)
+					{
+						if (cfInstruction->exportComponentSel[component] != 7)
+						{
+							componentMask[componentCount] = _getElementStrByIndex(component)[0];
+							componentCount++;
+						}
+					}
+					if (componentCount == 0)
+						continue;
+					src->addFmt("out.passParameterSem{}", vsSemanticId);
+					if (componentCount < 4)
+						src->addFmt(".{}", componentMask);
+					src->add(" = ");
+					_emitExportGPRReadCode(shaderContext, cfInstruction, LATTE_DECOMPILER_DTYPE_FLOAT, burstIndex);
+					if (componentCount < 4)
+						src->addFmt(".{}", componentMask);
+					src->add(";" _CRLF);
+				}
+				else
+				{
+					src->add("// skipped export to semanticId 255" _CRLF);
+				}
 			}
 		}
 		else
@@ -3513,7 +3543,11 @@ void LatteDecompiler_emitClauseCodeMSL(LatteDecompilerShaderContext* shaderConte
 			src->addFmt("{} = {};" _CRLF, _getActiveMaskVarName(shaderContext, cfInstruction->activeStackDepth), _getActiveMaskVarName(shaderContext, cfInstruction->activeStackDepth-1));
 			src->addFmt("{} = {};" _CRLF, _getActiveMaskCVarName(shaderContext, cfInstruction->activeStackDepth + 1), _getActiveMaskCVarName(shaderContext, cfInstruction->activeStackDepth));
 		}
+		if (cfInstruction->type == GPU7_CF_INST_ALU_BREAK)
+			src->add("bool aluBreak = false;" _CRLF);
 		_emitALUClauseCode(shaderContext, cfInstruction);
+		if (cfInstruction->type == GPU7_CF_INST_ALU_BREAK)
+			src->add("if (aluBreak) break;" _CRLF);
 		if( shaderContext->analyzer.modifiesPixelActiveState )
 			src->add("}" _CRLF);
 		cemu_assert_debug(!(shaderContext->analyzer.modifiesPixelActiveState == false && cfInstruction->type != GPU7_CF_INST_ALU));

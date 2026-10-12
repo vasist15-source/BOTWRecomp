@@ -808,6 +808,24 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
         std::lock_guard<std::mutex> lk(g_used_units_mu);
         g_t_decompile += t1 - t0;
     }
+    // debug: WWHD_MSL_PATCH=file.metal with WWHD_MSL_PATCH_MATCH=text replaces the source of every pixel
+    // shader whose translation contains that text (to bisect a shader by editing its output)
+    if (!vertex && s->dec && s->dec->strBuf_shaderSource) {
+        static const char* patchFile = getenv("WWHD_MSL_PATCH");
+        static const char* patchMatch = getenv("WWHD_MSL_PATCH_MATCH");
+        if (patchFile && patchMatch && strstr(s->dec->strBuf_shaderSource->c_str(), patchMatch)) {
+            if (FILE* f = fopen(patchFile, "rb")) {
+                std::string src;
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, f)) > 0) src.append(buf, n);
+                fclose(f);
+                s->dec->strBuf_shaderSource->reset();
+                s->dec->strBuf_shaderSource->add(std::string_view(src));  // the growing overload
+                LOG("[gfx] shader %016llx: source replaced from %s", (unsigned long long)s->key, patchFile);
+            }
+        }
+    }
     if (getenv("WWHD_DUMP_SHADERS")) {
         mkdir("shaders", 0755);
         char name[96];
