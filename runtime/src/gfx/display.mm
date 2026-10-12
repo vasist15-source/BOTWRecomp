@@ -905,7 +905,7 @@ static void present_to_layer(Screen& scr, void (^draw)(id<MTLTexture>)) {
     MTLPixelFormat want = scr.srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
     if (scr.layer.pixelFormat != want) scr.layer.pixelFormat = want;
     // uncapped (gx2::uncapped, debug): presentation does not wait for the display
-    const bool sync = !gx2::uncapped();
+    const bool sync = !gx2::present_unsynced();
     if (scr.layer.displaySyncEnabled != sync) {
         scr.layer.displaySyncEnabled = sync;
         if (&scr == &R.tv) interp::set_present_vsync(sync);
