@@ -211,7 +211,9 @@ static LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut
     bool ours = ld32(prog) == 0x57574653;
     uint32_t size = ours ? 16 + ld32(prog + 4) * 16 : regs[mmSQ_PGM_START_FS + 1] << 3;
     if (size > 0x1000) return nullptr;
-    uint64_t h = program_hash(prog, size);  // the program's hash, revalidated once per frame
+    // hashed every draw: games rebuild fetch shaders in place within a frame (a per-frame cache gave
+    // grass a stale vertex layout: flattened blades)
+    uint64_t h = hash_bytes(mem::ptr(prog), size);
     // strides decide between vertex-descriptor fetch and manual fetch in the shader
     for (uint32_t b = 0; b < 16; b++) h = (h ^ ((regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + b * 7 + 2] >> 11) & 0xFFFF)) * 1099511628211ull;
     *keyOut = h;

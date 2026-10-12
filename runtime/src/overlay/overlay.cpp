@@ -79,6 +79,7 @@ double now_s() { return std::chrono::duration<double>(clock::now().time_since_ep
 
 std::atomic<bool> g_open{false};
 std::atomic<bool> g_perf{false};
+std::atomic<bool> g_metal_hud{false};
 PerfAverage g_average;
 std::atomic<float> g_density{1.0f};
 std::atomic<bool> g_wait_release{false};  // just closed: the game sees no buttons until all are released
@@ -759,6 +760,11 @@ void tab_graphics() {
 #endif
     heading("Overlay");
     if (check("Performance overlay (FPS, frame time)", perf_shown(), &v)) set_perf_shown(v);
+    if (!render::vulkan()) {
+        bool hud;
+        if (check("Metal HUD instead (Apple's: FPS, GPU time, memory)", metal_hud_shown(), &hud)) set_metal_hud_shown(hud);
+        help("Apple's Metal performance HUD in the corner of the game window, in place of the overlay above.");
+    }
     if (ImGui::Button("Reset performance averages")) { g_average.reset(); perf::reset(); }
     // the render-thread profiler's latest report (render_prof.h), for performance bug reports
     static double copiedAt = -10;
@@ -2138,6 +2144,13 @@ bool perf_shown() { return g_perf.load(std::memory_order_relaxed); }
 void set_perf_shown(bool on) {
     g_perf = on;
     hostui::post([on] { hostui::set("perfOverlay", on ? "1" : "0"); });
+    if (on && g_metal_hud) set_metal_hud_shown(false);
+}
+bool metal_hud_shown() { return g_metal_hud.load(std::memory_order_relaxed); }
+void set_metal_hud_shown(bool on) {
+    g_metal_hud = on;
+    hostui::post([on] { hostui::set("metalHud", on ? "1" : "0"); });
+    if (on && g_perf) set_perf_shown(false);
 }
 
 bool key(int code, bool down, bool repeat, int mods) {
@@ -2212,6 +2225,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         prefs_read = true;
         std::string v;
         if (hostui::get("perfOverlay", v)) g_perf = v == "1";
+        if (hostui::get("metalHud", v)) g_metal_hud = v == "1";
         // the saved controller choice (WWHD_PRO_CONTROLLER wins); it also hides or shows the GamePad screen
         if (!getenv("WWHD_PRO_CONTROLLER") && hostui::get("proController", v))
             hostui::post([pro = v == "1"] { hostui::set_pro_controller(pro); });

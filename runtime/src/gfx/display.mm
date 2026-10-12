@@ -910,6 +910,15 @@ static void present_to_layer(Screen& scr, void (^draw)(id<MTLTexture>)) {
         scr.layer.displaySyncEnabled = sync;
         if (&scr == &R.tv) interp::set_present_vsync(sync);
     }
+    if (&scr == &R.tv) {  // Apple's Metal HUD (settings overlay > Overlay), applied when it changes
+        static int hudState = -1;
+        const int want = overlay::metal_hud_shown() ? 1 : 0;
+        if (want != hudState) {
+            hudState = want;
+            if (@available(macOS 13.0, *))
+                scr.layer.developerHUDProperties = want ? @{@"mode" : @"default"} : nil;
+        }
+    }
     id<CAMetalDrawable> drawable = scr.visible ? [scr.layer nextDrawable] : nil;
     if (!drawable) return;
     draw(drawable.texture);

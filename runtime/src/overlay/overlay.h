@@ -40,6 +40,9 @@ bool captures();
 bool alive();
 bool perf_shown();          // performance overlay (FPS, frame time) on
 void set_perf_shown(bool on);
+// Apple's Metal performance HUD on the game window instead of our performance overlay (Metal only)
+bool metal_hud_shown();
+void set_metal_hud_shown(bool on);
 
 // ---- host input (main thread)
 // Key codes are macOS virtual key codes (kVK_*); the SDL host maps to them (platform/keycodes.h).
