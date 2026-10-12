@@ -1108,6 +1108,9 @@ static uint32_t g_hires_src = 0;             // guest address of the game's 640x
 static uint64_t g_hires_frame = ~0ull;       // frame the private copy was last drawn
 static Surface g_hires_color, g_hires_depth;
 
+MTLTextureUsage format_view_usage();
+void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice);
+
 static Surface* hires_surface(Surface& dst, const Surface* like) {
     uint32_t w = like->width * 3 / 2, h = like->height * 3 / 2;
     // texture: 1.5x the game's buffer as allocated (which may already be scaled for the internal resolution)
@@ -1116,7 +1119,7 @@ static Surface* hires_surface(Surface& dst, const Surface* like) {
         dst.fmt.pixel != like->fmt.pixel) {
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:like->fmt.pixel width:pw height:ph
                                                                                  mipmapped:NO];
-        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | format_view_usage();
         d.storageMode = MTLStorageModePrivate;
         dst = *like;
         dst.mipChain.reset();
@@ -1323,6 +1326,75 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
 // ---------------------------------------------------------------- render pass
 std::atomic<uint64_t> g_pass_stats[4];  // passes, bytes loaded+stored, reopened passes, their bytes
 std::atomic<uint64_t> g_pass_stats_merged{0};  // draws kept in a pass whose targets are a superset of theirs
+// WWHD_GPU_PASS_TIMES=<frame>: GPU time of every render pass of that frame (Metal timestamp
+// counters at the pass's start of vertex and end of fragment work), logged most expensive first
+static id<MTLCounterSampleBuffer> g_pt_buf = nil;
+static std::vector<std::string> g_pt_desc;
+static std::vector<uint64_t> g_pt_draws;
+static uint64_t g_pt_frame() {
+    static const uint64_t f = getenv("WWHD_GPU_PASS_TIMES") ? strtoull(getenv("WWHD_GPU_PASS_TIMES"), nullptr, 10) : 0;
+    return f;
+}
+static bool pass_timing_on() { return g_pt_frame() && R.frame == g_pt_frame(); }
+static void pass_timing_attach(MTLRenderPassDescriptor* rp, const std::string& desc) {
+    if (!g_pt_buf) {
+        if (![R.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { LOG("[gputime] no stage-boundary counters"); return; }
+        id<MTLCounterSet> ts = nil;
+        for (id<MTLCounterSet> cs in R.device.counterSets)
+            if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+        if (!ts) { LOG("[gputime] no timestamp counter set"); return; }
+        MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = ts;
+        d.sampleCount = 4096;
+        d.storageMode = MTLStorageModeShared;
+        NSError* err = nil;
+        g_pt_buf = [R.device newCounterSampleBufferWithDescriptor:d error:&err];
+        if (!g_pt_buf) { LOG("[gputime] sample buffer: %s", err.localizedDescription.UTF8String); return; }
+    }
+    const size_t i = g_pt_desc.size();
+    if (4 * i + 3 >= 4096) return;
+    rp.sampleBufferAttachments[0].sampleBuffer = g_pt_buf;
+    rp.sampleBufferAttachments[0].startOfVertexSampleIndex = 4 * i;
+    rp.sampleBufferAttachments[0].endOfVertexSampleIndex = 4 * i + 1;
+    rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = 4 * i + 2;
+    rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = 4 * i + 3;
+    g_pt_desc.push_back(desc);
+    g_pt_draws.push_back(R.drawCount);
+}
+// swap(), at the end of the timed frame: report once its command buffers have completed
+void pass_timing_end_frame(id<MTLCommandBuffer> last) {
+    if (!pass_timing_on() || !g_pt_buf || g_pt_desc.empty()) return;
+    auto desc = g_pt_desc;
+    auto draws = g_pt_draws;
+    draws.push_back(R.drawCount);
+    id<MTLCounterSampleBuffer> buf = g_pt_buf;
+    [last addCompletedHandler:^(id<MTLCommandBuffer>) {
+        NSData* data = [buf resolveCounterRange:NSMakeRange(0, 4 * desc.size())];
+        if (!data) { LOG("[gputime] resolve failed"); return; }
+        const MTLCounterResultTimestamp* t = (const MTLCounterResultTimestamp*)data.bytes;
+        struct Row { double vs, fs; size_t i; };
+        std::vector<Row> rows;
+        double tv = 0, tf = 0;
+        uint64_t first = ~0ull, lastEnd = 0;
+        auto span = [&](uint64_t a, uint64_t b) { return (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) ? 0.0 : (b - a) / 1e6; };
+        for (size_t i = 0; i < desc.size(); i++) {
+            const uint64_t* x = &t[4 * i].timestamp;
+            double vs = span(x[0], x[1]), fs = span(x[2], x[3]);  // Apple GPUs: nanoseconds
+            tv += vs;
+            tf += fs;
+            for (int k = 0; k < 4; k++)
+                if (x[k] != MTLCounterErrorValue && x[k]) { first = std::min(first, x[k]); lastEnd = std::max(lastEnd, x[k]); }
+            rows.push_back({vs, fs, i});
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.fs + a.vs > b.fs + b.vs; });
+        LOG("[gputime] %zu passes: vertex %.2f ms, fragment %.2f ms summed; %.2f ms first to last timestamp", desc.size(), tv, tf,
+            (lastEnd - first) / 1e6);
+        for (size_t k = 0; k < rows.size() && k < 30; k++)
+            LOG("[gputime] vs %6.2f fs %6.2f ms  #%-3zu %4llu draws  %s", rows[k].vs, rows[k].fs, rows[k].i,
+                (unsigned long long)(draws[rows[k].i + 1] - draws[rows[k].i]), desc[rows[k].i].c_str());
+    }];
+}
+
 // debug: WWHD_PASS_DUMP=<frame> logs every render pass and clear of that frame ([pass])
 static uint64_t g_pass_dump_draws = 0;
 bool pass_dump_on() {
@@ -1407,6 +1479,7 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
         else rp.colorAttachments[i].slice = colorSlices[i];
         rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
+        take_pending_clear(rp, i, colors[i]->tex, colorSlices[i]);
         mark_gpu_written(colors[i]);
         any = true;
     }
@@ -1421,6 +1494,7 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
             rp.stencilAttachment.loadAction = MTLLoadActionLoad;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
         }
+        take_pending_clear(rp, -1, depth->tex, depthSlice);
         mark_gpu_written(depth);
         any = true;
     }
@@ -1430,6 +1504,17 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
         rp.renderTargetWidth = 1;
         rp.renderTargetHeight = 1;
         rp.defaultRasterSampleCount = 1;
+    }
+    if (pass_timing_on()) {
+        char b[300];
+        int n = 0;
+        b[0] = 0;
+        for (int i = 0; i < 8; i++)
+            if (colors[i] && colors[i]->tex)
+                n += snprintf(b + n, sizeof b - n, "C%d %lux%lu f%X ", i, (unsigned long)colors[i]->tex.width,
+                              (unsigned long)colors[i]->tex.height, colors[i]->format);
+        if (depth && depth->tex) snprintf(b + n, sizeof b - n, "D %lux%lu f%X", (unsigned long)depth->tex.width, (unsigned long)depth->tex.height, depth->format);
+        pass_timing_attach(rp, b);
     }
     R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     for (int i = 0; i < 8; i++) {

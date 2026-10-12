@@ -15,6 +15,7 @@
 #include "render_prof.h"
 #include "gx2_texture_regs.h"
 #include "metal.h"
+
 #include "runtime.h"
 #include "write_watch.h"
 #define XXH_INLINE_ALL
@@ -23,6 +24,7 @@
 Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N&, const Latte::LATTE_SQ_TEX_RESOURCE_WORD4_N&);
 
 namespace gfx {
+MTLTextureUsage format_view_usage();
 
 
 static MTLTextureType texture_type(uint32_t dim, uint32_t slices) {
@@ -164,9 +166,9 @@ static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, bool forRend
     td.arrayLength = (type == MTLTextureType2DArray || type == MTLTextureType1DArray) ? s->slices : 1;
     if (type == MTLTextureTypeCube) td.arrayLength = 1;
     td.mipmapLevelCount = s->mips;
-    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | format_view_usage();
     td.storageMode = MTLStorageModePrivate;
-    if (s->fmt.compressed) td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    if (s->fmt.compressed) td.usage = MTLTextureUsageShaderRead | format_view_usage();
     id<MTLTexture> t = [R.device newTextureWithDescriptor:td];
     if (t) {
         s->scale = scale;
@@ -226,6 +228,27 @@ fragment DOut rs_depth(VOut in [[stage_in]], depth2d<float> t [[texture(0)]]) {
     return o;
 }
 )";
+
+// Textures are made without MTLTextureUsagePixelFormatView: on Apple GPUs that flag turns off lossless
+// framebuffer compression, which at 2x roughly doubles render target memory traffic. Copies between
+// formats of one texel size go through a buffer instead (WWHD_FORMAT_VIEWS=1: the old views).
+MTLTextureUsage format_view_usage() {
+    static const bool on = getenv("WWHD_FORMAT_VIEWS") != nullptr;
+    return on ? MTLTextureUsagePixelFormatView : 0;
+}
+
+// the bits of src's level/slice region into dst (same texel size, any formats) through a scratch buffer
+static void copy_bits_via_buffer(id<MTLBlitCommandEncoder> b, id<MTLTexture> src, NSUInteger srcSlice, NSUInteger srcLevel,
+                                 id<MTLTexture> dst, NSUInteger dstSlice, NSUInteger dstLevel, MTLSize size, NSUInteger bytesPerPixel) {
+    NSUInteger row = size.width * bytesPerPixel, image = row * size.height, len = image * size.depth;
+    if (!len) return;
+    id<MTLBuffer> tmp = [R.device newBufferWithLength:len options:MTLResourceStorageModePrivate];
+    if (!tmp) return;
+    [b copyFromTexture:src sourceSlice:srcSlice sourceLevel:srcLevel sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+              toBuffer:tmp destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:image];
+    [b copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:size
+            toTexture:dst destinationSlice:dstSlice destinationLevel:dstLevel destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
 
 void resample(id<MTLTexture> src, id<MTLTexture> dst, const FormatInfo& fmt, uint32_t slices, float uMax, float vMax, uint32_t dstW,
               uint32_t dstH) {
@@ -324,7 +347,9 @@ static Surface* adopt_newer_alias(Surface* s) {
         if (!newest || o->writeSeq > newest->writeSeq) newest = o;
     }
     if (!newest) return s;
-    id<MTLTexture> src = newest->tex.pixelFormat == s->tex.pixelFormat ? newest->tex : [newest->tex newTextureViewWithPixelFormat:s->tex.pixelFormat];
+    bool viaBuffer = newest->tex.pixelFormat != s->tex.pixelFormat && !(newest->tex.usage & MTLTextureUsagePixelFormatView);
+    id<MTLTexture> src = newest->tex.pixelFormat == s->tex.pixelFormat || viaBuffer ? newest->tex
+                                                                                   : [newest->tex newTextureViewWithPixelFormat:s->tex.pixelFormat];
     if (!src) return s;
     end_encoder();
     id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
@@ -332,10 +357,16 @@ static Surface* adopt_newer_alias(Surface* s) {
     if (s->tex.textureType == MTLTextureTypeCube) layers = 6;
     for (NSUInteger level = 0; level < std::min(s->tex.mipmapLevelCount, newest->tex.mipmapLevelCount); level++)
         for (NSUInteger slice = 0; slice < layers; slice++)
-            [b copyFromTexture:src sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0)
+            {
+                MTLSize sz = MTLSizeMake(std::max<NSUInteger>(s->tex.width >> level, 1), std::max<NSUInteger>(s->tex.height >> level, 1),
+                                         std::max<NSUInteger>(s->tex.depth >> level, 1));
+                if (viaBuffer) copy_bits_via_buffer(b, src, slice, level, s->tex, slice, level, sz, s->fmt.hostBytesPerBlock);
+                else
+                    [b copyFromTexture:src sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0)
                     sourceSize:MTLSizeMake(std::max<NSUInteger>(s->tex.width >> level, 1), std::max<NSUInteger>(s->tex.height >> level, 1),
                                            std::max<NSUInteger>(s->tex.depth >> level, 1))
                      toTexture:s->tex destinationSlice:slice destinationLevel:level destinationOrigin:MTLOriginMake(0, 0, 0)];
+            }
     [b endEncoding];
     mark_gpu_written(s);
     return s;
@@ -555,7 +586,7 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->tex.pixelFormat
             width:w height:h mipmapped:YES];
         td.mipmapLevelCount = mips;
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | format_view_usage();
         td.storageMode = MTLStorageModePrivate;
         c->tex = [R.device newTextureWithDescriptor:td];
         if (!c->tex) return s;
@@ -905,7 +936,9 @@ void upload_surface(Surface* s) {
                      sourceOffset:stagingOffset + (NSUInteger)z * perSlice
                 sourceBytesPerRow:bw * f.hostBytesPerBlock
               sourceBytesPerImage:perSlice
-                       sourceSize:MTLSizeMake(f.compressed ? bw * 4 : w, f.compressed ? bh * 4 : h, is3D ? slices : 1)
+                       sourceSize:MTLSizeMake(f.compressed ? std::min<NSUInteger>(bw * 4, std::max<NSUInteger>(s->tex.width >> level, 1)) : w,
+                                              f.compressed ? std::min<NSUInteger>(bh * 4, std::max<NSUInteger>(s->tex.height >> level, 1)) : h,
+                                              is3D ? slices : 1)
                         toTexture:s->tex
                  destinationSlice:z
                  destinationLevel:level
@@ -1107,12 +1140,12 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         // (same GX2 format, e.g. an sRGB view: the save thumbnail, 256x144 1A tm 4 -> linear). Same
         // texel size: the bits are copied through a view in the destination's format; else drawn.
         id<MTLTexture> srcTex = src->tex;
-        bool convert = false;
+        bool convert = false, bitsViaBuffer = false;
         if (dst->fmt.pixel != src->fmt.pixel) {
-            if (src->fmt.hostBytesPerBlock == dst->fmt.hostBytesPerBlock && !src->fmt.compressed && !dst->fmt.compressed &&
-                (src->tex.usage & MTLTextureUsagePixelFormatView))
-                srcTex = [src->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat];
-            else
+            if (src->fmt.hostBytesPerBlock == dst->fmt.hostBytesPerBlock && !src->fmt.compressed && !dst->fmt.compressed) {
+                if (src->tex.usage & MTLTextureUsagePixelFormatView) srcTex = [src->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat];
+                else bitsViaBuffer = true;
+            } else
                 convert = true;
             note(convert ? "GPU source, other format: drawn" : "GPU source, other format: copied through a view");
         } else {
@@ -1127,9 +1160,12 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         uint32_t dph = std::min<uint32_t>((uint32_t)std::lround(ch * dst->sy), (uint32_t)dst->tex.height);
         if (spw == dpw && sph == dph && !convert) {
             id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
-            [b copyFromTexture:srcTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                    sourceSize:MTLSizeMake(spw, sph, 1)
-                     toTexture:dst->tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            if (bitsViaBuffer)
+                copy_bits_via_buffer(b, srcTex, 0, 0, dst->tex, 0, 0, MTLSizeMake(spw, sph, 1), dst->fmt.hostBytesPerBlock);
+            else
+                [b copyFromTexture:srcTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(spw, sph, 1)
+                         toTexture:dst->tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [b endEncoding];
         } else {
             resample(src->tex, dst->tex, dst->fmt, 1, (float)spw / src->tex.width, (float)sph / src->tex.height, dpw, dph);

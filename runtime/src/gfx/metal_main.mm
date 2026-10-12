@@ -130,7 +130,7 @@ static void read_overlay_gpu_times() {
         q = {};
     }
 }
-id<MTLCommandBuffer> command_buffer() {
+static id<MTLCommandBuffer> raw_command_buffer() {
     if (!R.cmd) {
         read_overlay_gpu_times();
         R.cmd = [R.queue commandBuffer];
@@ -138,6 +138,85 @@ id<MTLCommandBuffer> command_buffer() {
         commandToken = perf::gpu_begin(commandFrame);
     }
     return R.cmd;
+}
+
+// ---------------------------------------------------------------- deferred clears
+// A guest clear is held until the next render pass: if that pass attaches the cleared slice, the clear
+// becomes its load action (no separate pass storing the whole target and the next one loading it back).
+// Any other GPU work (blits, other passes, commits) encodes the held clears first, in order.
+struct PendingClear {
+    id<MTLTexture> tex;
+    uint32_t slice;
+    bool isDepth, hasStencil, clearDepth, clearStencil;
+    float rgba[4];
+    float depth;
+    uint32_t stencil;
+};
+static std::vector<PendingClear> g_pending_clears;
+std::atomic<uint64_t> g_clears_folded{0}, g_clears_flushed{0};
+
+static void encode_clear(const PendingClear& c) {
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.slice = rp.stencilAttachment.slice = c.slice;
+    if (c.tex.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = c.slice;
+    else rp.colorAttachments[0].slice = c.slice;
+    if (c.isDepth) {
+        rp.depthAttachment.texture = c.tex;
+        rp.depthAttachment.loadAction = c.clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.depthAttachment.clearDepth = c.depth;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        if (c.hasStencil) {
+            rp.stencilAttachment.texture = c.tex;
+            rp.stencilAttachment.loadAction = c.clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.stencilAttachment.clearStencil = c.stencil;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    } else {
+        rp.colorAttachments[0].texture = c.tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(c.rgba[0], c.rgba[1], c.rgba[2], c.rgba[3]);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    [[raw_command_buffer() renderCommandEncoderWithDescriptor:rp] endEncoding];
+}
+
+void flush_pending_clears() {
+    if (g_pending_clears.empty()) return;
+    std::vector<PendingClear> v;
+    v.swap(g_pending_clears);
+    for (auto& c : v) encode_clear(c);
+    g_clears_flushed += v.size();
+}
+
+// a pass about to attach tex/slice: turn a held clear of it into the attachment's load action
+void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice) {
+    for (size_t i = 0; i < g_pending_clears.size(); i++) {
+        PendingClear& c = g_pending_clears[i];
+        if (c.tex != tex || c.slice != slice) continue;
+        if (colorIndex >= 0) {
+            if (c.isDepth) return;
+            rp.colorAttachments[colorIndex].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[colorIndex].clearColor = MTLClearColorMake(c.rgba[0], c.rgba[1], c.rgba[2], c.rgba[3]);
+        } else {
+            if (!c.isDepth) return;
+            if (c.clearDepth) {
+                rp.depthAttachment.loadAction = MTLLoadActionClear;
+                rp.depthAttachment.clearDepth = c.depth;
+            }
+            if (c.hasStencil && c.clearStencil && rp.stencilAttachment.texture) {
+                rp.stencilAttachment.loadAction = MTLLoadActionClear;
+                rp.stencilAttachment.clearStencil = c.stencil;
+            }
+        }
+        g_pending_clears.erase(g_pending_clears.begin() + i);
+        g_clears_folded++;
+        return;
+    }
+}
+
+id<MTLCommandBuffer> command_buffer() {
+    flush_pending_clears();
+    return raw_command_buffer();
 }
 
 uint32_t g_draws_since_commit = 0;
@@ -161,6 +240,19 @@ static void track_gpu_time(id<MTLCommandBuffer> cb) {
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
         double t = b.GPUEndTime - b.GPUStartTime;
         if (t > 0) g_gpu_ns += (uint64_t)(t * 1e9);
+        // per-frame GPU busy time and span; frames over 30 ms are logged (to line up with [hitch])
+        static uint64_t curFrame = ~0ull;
+        static double busy = 0, first = 0, last = 0;
+        if (frame != curFrame) {
+            if (curFrame != ~0ull && (busy > 0.030 || last - first > 0.040))
+                LOG("[gpuslow] frame %llu: GPU busy %.1f ms, first start to last end %.1f ms", (unsigned long long)curFrame,
+                    busy * 1e3, (last - first) * 1e3);
+            curFrame = frame;
+            busy = 0;
+            first = b.GPUStartTime;
+        }
+        if (t > 0) busy += t;
+        last = b.GPUEndTime;
     }];
 }
 
@@ -188,6 +280,7 @@ void pool_retire(id<MTLCommandBuffer> cmd);
 
 void flush() {
     end_encoder();
+    flush_pending_clears();
     if (R.cmd) {
         pool_retire(R.cmd);
         track_gpu_time(R.cmd);
@@ -198,6 +291,7 @@ void flush() {
 
 void wait_idle() {
     end_encoder();
+    flush_pending_clears();
     if (R.cmd) {
         id<MTLCommandBuffer> c = R.cmd;
         pool_retire(c);
@@ -236,30 +330,23 @@ static void clear_surface(Surface* s, const float* rgba, bool clearDepth, float 
     if (pass_dump_on())
         LOG("[pass] clear %08X %lux%lu f%X%s%s%s", s->addr, (unsigned long)s->tex.width, (unsigned long)s->tex.height, s->format,
             s->isDepth ? " depth" : " color", clearDepth ? " d" : "", clearStencil ? " s" : "");
+    static const bool fold = getenv("WWHD_NO_CLEAR_FOLD") == nullptr;
     for (uint32_t slice = firstSlice; slice < firstSlice + numSlices; slice++) {
-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.depthAttachment.slice = rp.stencilAttachment.slice = slice;
-    if (s->tex.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = slice;  // a volume's slice
-    else rp.colorAttachments[0].slice = slice;
-    if (s->isDepth) {
-        rp.depthAttachment.texture = s->tex;
-        rp.depthAttachment.loadAction = clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
-        rp.depthAttachment.clearDepth = depth;
-        rp.depthAttachment.storeAction = MTLStoreActionStore;
-        if (s->fmt.stencil) {
-            rp.stencilAttachment.texture = s->tex;
-            rp.stencilAttachment.loadAction = clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
-            rp.stencilAttachment.clearStencil = stencil;
-            rp.stencilAttachment.storeAction = MTLStoreActionStore;
-        }
-    } else {
-        rp.colorAttachments[0].texture = s->tex;
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(rgba[0], rgba[1], rgba[2], rgba[3]);
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    }
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    [e endEncoding];
+        PendingClear c{};
+        c.tex = s->tex;
+        c.slice = slice;
+        c.isDepth = s->isDepth;
+        c.hasStencil = s->isDepth && s->fmt.stencil;
+        c.clearDepth = clearDepth;
+        c.clearStencil = clearStencil;
+        if (rgba) for (int i = 0; i < 4; i++) c.rgba[i] = rgba[i];
+        c.depth = depth;
+        c.stencil = stencil;
+        // a second clear of a slice already held: encode the first (rare; keeps partial depth/stencil clears exact)
+        for (auto& p : g_pending_clears)
+            if (p.tex == c.tex && p.slice == c.slice) { flush_pending_clears(); break; }
+        if (fold) g_pending_clears.push_back(c);
+        else encode_clear(c);
     }
     mark_gpu_written(s);
 }
@@ -516,6 +603,8 @@ void swap() {
     if (sync_gpu) wait_idle();
     end_encoder();
     if (log_this_frame()) LOG("[frame] end %llu", (unsigned long long)R.frame);
+    void pass_timing_end_frame(id<MTLCommandBuffer>);
+    pass_timing_end_frame(command_buffer());
     R.frame++;
     latch_res_scale();
     if (capture_schedule::contains(g_dump_frames, R.frame))
@@ -587,6 +676,8 @@ void swap() {
         LOG("[gfx] last 300 frames: %.0f render passes/frame (%.0f MiB loaded+stored), %.0f of them reopen the previous pass's targets (%.0f MiB)",
             g_pass_stats[0].exchange(0) / 300.0, g_pass_stats[1].exchange(0) / 300.0 / 1048576.0, g_pass_stats[2].exchange(0) / 300.0,
             g_pass_stats[3].exchange(0) / 300.0 / 1048576.0);
+        LOG("[gfx] last 300 frames: %.1f clears/frame folded into the next pass, %.1f encoded on their own",
+            g_clears_folded.exchange(0) / 300.0, g_clears_flushed.exchange(0) / 300.0);
         LOG("[gfx] frame %llu, %llu draws so far, GPU %.1f ms/frame, render thread CPU %.2f ms/frame", (unsigned long long)R.frame,
             (unsigned long long)R.drawCount, g_gpu_ns.exchange(0) / 1e6 / 300.0, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
         lastCpu = cpu;
