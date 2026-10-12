@@ -25,6 +25,7 @@ Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_
 
 namespace gfx {
 MTLTextureUsage format_view_usage();
+static const char* g_resample_why = nullptr;  // resample's caller, for WWHD_GPU_PASS_TIMES
 
 
 static MTLTextureType texture_type(uint32_t dim, uint32_t slices) {
@@ -191,7 +192,9 @@ static Surface* rescale(Surface* s) {
     id<MTLTexture> t = make_texture(s, old.textureType, true, want, ax, ay);
     if (!t) { s->sx = osx; s->sy = osy; s->scale = oscale; s->ax = oax; s->ay = oay; return s; }
     end_encoder();
+    g_resample_why = "rescale";
     resample(old, t, s->fmt, old.textureType == MTLTextureType2DArray ? (uint32_t)old.arrayLength : 1);
+    g_resample_why = nullptr;
     s->tex = t;
     forget_texture_views();
     if (getenv("WWHD_LOG_RESCALE"))
@@ -314,7 +317,13 @@ void resample(id<MTLTexture> src, id<MTLTexture> dst, const FormatInfo& fmt, uin
             rp.colorAttachments[0].loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         }
-        time_render_pass(rp, __FILE_NAME__, __LINE__);
+        {
+            char why[96];
+            snprintf(why, sizeof why, "resample(%s) %lux%lu->%lux%lu px%lu", g_resample_why ? g_resample_why : "?",
+                     (unsigned long)src.width, (unsigned long)src.height, (unsigned long)dst.width, (unsigned long)dst.height,
+                     (unsigned long)dst.pixelFormat);
+            time_render_pass(rp, why, 0);
+        }
         id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
         [e setRenderPipelineState:it->second];
         if (fmt.depth) [e setDepthStencilState:writeDepth];
@@ -609,7 +618,9 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
                 levels:NSMakeRange(l-1,1) slices:NSMakeRange(0,1)];
         // Resampling also handles the console's floor rounding at e.g. 120x67, upscaled to 360x201
         // when the companion mip is 360x202. Sampling keeps one coherent physical mip pyramid.
+        g_resample_why = levels[l] ? "mip from game" : "mip";
         resample(src, dst, c->fmt, 1);
+        g_resample_why = nullptr;
         if (levels[l]) fromGame++;
     }
     s->mipChainSeq = key;
@@ -996,7 +1007,9 @@ static id<MTLBuffer> encode_texel_read(Surface* img, uint32_t w, uint32_t h) {
         td.storageMode = MTLStorageModePrivate;
         id<MTLTexture> small = [R.device newTextureWithDescriptor:td];
         end_encoder();
+        g_resample_why = "readback";
         resample(src, small, img->fmt, 1);
+        g_resample_why = nullptr;
         src = small;
     }
     id<MTLBuffer> buf = [R.device newBufferWithLength:(NSUInteger)w * h * bytes options:MTLResourceStorageModeShared];
@@ -1061,6 +1074,7 @@ void drain_write_backs(bool all) {
     }
     g_pending_write_backs.erase(g_pending_write_backs.begin(), g_pending_write_backs.begin() + done);
 }
+std::atomic<uint64_t> g_copy_cpu{0}, g_copy_cpu_bytes{0}, g_copy_gpu{0}, g_write_backs{0}, g_write_back_bytes{0};
 void write_back_linear_targets() {
     static const bool sync = getenv("WWHD_SYNC_WRITE_BACK") && atoi(getenv("WWHD_SYNC_WRITE_BACK")) != 0;
     const uint64_t t0 = rprof::now_ns();
@@ -1083,6 +1097,8 @@ void write_back_linear_targets() {
             id<MTLBuffer> buf = encode_texel_read(s, s->width, s->height);
             g_pending_write_backs.push_back({buf, command_buffer(), addr, s->width, s->height, bytes, pitch});
             count++;
+            g_write_backs++;
+            g_write_back_bytes += (uint64_t)s->width * s->height * bytes;
             continue;
         }
         const uint64_t r0 = rprof::now_ns();
@@ -1122,6 +1138,9 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
                  (uint32_t)s->tileMode.value(), std::max<uint32_t>(d->width >> dstMip, 1), std::max<uint32_t>(d->height >> dstMip, 1),
                  (uint32_t)d->format.value(), (uint32_t)d->tileMode.value(), path);
         if (seen.insert(k).second) LOG("[copy] %s", k);
+        // per-300-frame counts by path (metal_main.mm's report)
+        if (path[0] == 'C') { g_copy_cpu++; g_copy_cpu_bytes += (uint64_t)w * h * 4; }
+        else g_copy_gpu++;
     };
     if (gpuSrc) {
         Surface* src = adopt_newer_alias(gpuSrc);
@@ -1169,7 +1188,9 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
                          toTexture:dst->tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [b endEncoding];
         } else {
+            g_resample_why = "copy";
             resample(src->tex, dst->tex, dst->fmt, 1, (float)spw / src->tex.width, (float)sph / src->tex.height, dpw, dph);
+            g_resample_why = nullptr;
         }
         mark_gpu_written(dst);
         write_back_linear_copy(dst, d, dbase, dstMip, dstSlice, cw, ch);

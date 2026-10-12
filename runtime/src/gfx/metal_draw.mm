@@ -1133,6 +1133,13 @@ static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = fals
     if (aniso) d.maxAnisotropy = std::min(1u << aniso, 16u);
     if (g_aniso_force && mip != 0 && d.minFilter == MTLSamplerMinMagFilterLinear && (uint32_t)w0.get_DEPTH_COMPARE_FUNCTION() == 0)
         d.maxAnisotropy = 16;
+    {   // Metal samplers have no LOD bias (the Vulkan renderer sets mipLodBias): log the values the game uses
+        const int bias = (int)w1.get_LOD_BIAS();
+        static std::set<int> seen;
+        if (bias && seen.insert(bias).second)
+            LOG("[gfx] sampler with LOD bias %d (%.2f levels) not applied (min filter %u, mip filter %u)", bias, bias / 64.0f,
+                (uint32_t)w0.get_XY_MIN_FILTER(), mip);
+    }
     d.lodMinClamp = w1.get_MIN_LOD() / 64.0f;
     d.lodMaxClamp = w1.get_MAX_LOD() / 64.0f;
     uint32_t border = (uint32_t)w0.get_BORDER_COLOR_TYPE();
@@ -2181,6 +2188,7 @@ void cache_warm_step() {
 enum Skip { SK_GS, SK_RASTER_KILL, SK_NO_FETCH, SK_NO_SHADER, SK_NO_TARGET, SK_PRIM, SK_PASS, SK_PIPELINE, SK_CULL, SK_SCISSOR, SK_COMPILING,
             SK_DROPPED_DEPTH, SK_DROPPED_COLOR, SK_PIPE_COMPILING, SK_COUNT };
 static uint64_t g_skip[SK_COUNT];
+uint64_t g_alpha_to_mask_draws = 0;  // draws with DB_ALPHA_TO_MASK enabled (render thread)
 static const char* kSkipNames[SK_COUNT] = {"geometry-shader", "raster-kill", "no-fetch-shader", "shader-failed", "no-target",
                                            "unsupported-prim", "no-pass", "pipeline-failed", "cull-all", "empty-scissor",
                                            "compiling", "dropped-depth", "dropped-color", "pipeline-compiling"};
@@ -2242,6 +2250,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         }
         return;
     }
+    if (regs[mmDB_ALPHA_TO_MASK] & 1) g_alpha_to_mask_draws++;  // alpha-to-coverage: not implemented (report)
     Shader* vs = get_shader(regs, true, fs, fsKey);
     Shader* ps = get_shader(regs, false, fs, fsKey);
     if (!vs || !ps) { g_skip[SK_NO_SHADER]++; return; }
@@ -2331,7 +2340,17 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     // textures must be uploaded before the render encoder opens
     static std::vector<uint32_t> indices;  // render thread only; keeps its capacity between draws
     MTLPrimitiveType ptype;
-    if (!build_indices(prim, count, indexType, indexAddr, indices, ptype)) { g_skip[SK_PRIM]++; return; }
+    // 16-bit indices of primitives Metal draws as they are: kept 16-bit (byte-swapped in a loop the compiler
+    // vectorizes) instead of widened to 32 bits one call at a time. Half the upload, and the 16-bit
+    // primitive-restart index stays 0xFFFF (widened, it became vertex 65535). WWHD_INDEX32=1: always widen.
+    static const bool widen = getenv("WWHD_INDEX32") != nullptr;
+    const bool idx16 = !widen && indexAddr && count && indexType != 1 && indexType != 9 &&
+                       (prim == 1 || prim == 2 || prim == 3 || prim == 4 || prim == 6);
+    if (idx16) {  // swapped straight into the upload pool at the draw (a commit in between recycles the pool)
+        indices.clear();
+        ptype = prim == 1 ? MTLPrimitiveTypePoint : prim == 2 ? MTLPrimitiveTypeLine : prim == 3 ? MTLPrimitiveTypeLineStrip
+                : prim == 4 ? MTLPrimitiveTypeTriangle : MTLPrimitiveTypeTriangleStrip;
+    } else if (!build_indices(prim, count, indexType, indexAddr, indices, ptype)) { g_skip[SK_PRIM]++; return; }
     rprof::mark(rprof::kIndices);
     static Surface* sampled[64];
     int nSampled = 0;
@@ -2468,7 +2487,22 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     DLOG("[draw]   -> target %ux%u fmt %lu depth %d (slice %u of %u) vp %.0f,%.0f %.0fx%.0f", w, h,
          colors[0] ? (unsigned long)colors[0]->fmt.pixel : 0, depth != nullptr, depthSlice, depth ? depth->slices : 0, vp.originX,
          vp.originY, vp.width, vp.height);
-    if (indices.empty()) {
+    if (idx16) {
+        rprof::UploadKind uploads(rprof::kUpIndex);
+        Upload idx16Buf = reserve(count * 2);
+        const uint16_t* src = (const uint16_t*)mem::ptr(indexAddr);
+        uint16_t* dst = (uint16_t*)((uint8_t*)idx16Buf.buf.contents + idx16Buf.offset);
+        if (indexType == 0) memcpy(dst, src, (size_t)count * 2);
+        else for (uint32_t i = 0; i < count; i++) dst[i] = __builtin_bswap16(src[i]);
+        [enc drawIndexedPrimitives:ptype
+                        indexCount:count
+                         indexType:MTLIndexTypeUInt16
+                       indexBuffer:idx16Buf.buf
+                 indexBufferOffset:idx16Buf.offset
+                     instanceCount:instances
+                        baseVertex:baseVertex
+                      baseInstance:render::g_base_instance];
+    } else if (indices.empty()) {
         [enc drawPrimitives:ptype vertexStart:baseVertex vertexCount:count instanceCount:instances];
     } else {
         rprof::UploadKind uploads(rprof::kUpIndex);

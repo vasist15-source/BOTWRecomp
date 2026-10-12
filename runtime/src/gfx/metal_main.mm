@@ -14,6 +14,8 @@
 #include "gx2/gx2.h"
 #include "gx2_texture_regs.h"
 #include "metal.h"
+#include "write_watch.h"
+extern "C" uint64_t wwhd_query_counts(uint64_t* conditional);  // gx2_core.cpp
 #include "runtime.h"
 #include "input.h"
 
@@ -714,6 +716,15 @@ void swap() {
         LOG("[gfx] last 300 frames: %.0f render passes/frame (%.0f MiB loaded+stored), %.0f of them reopen the previous pass's targets (%.0f MiB)",
             g_pass_stats[0].exchange(0) / 300.0, g_pass_stats[1].exchange(0) / 300.0 / 1048576.0, g_pass_stats[2].exchange(0) / 300.0,
             g_pass_stats[3].exchange(0) / 300.0 / 1048576.0);
+        extern std::atomic<uint64_t> g_copy_cpu, g_copy_cpu_bytes, g_copy_gpu, g_write_backs, g_write_back_bytes;
+        uint64_t cond = 0, queries = wwhd_query_counts(&cond);
+        extern uint64_t g_alpha_to_mask_draws;
+        LOG("[gfx] last 300 frames: %.1f draws/frame with alpha-to-coverage on", g_alpha_to_mask_draws / 300.0);
+        g_alpha_to_mask_draws = 0;
+        LOG("[gfx] last 300 frames: surface copies %.1f/frame on the GPU, %.1f on the CPU (%.2f MiB/frame); linear write-backs %.1f/frame "
+            "(%.2f MiB/frame); occlusion queries %.1f/frame, conditional renders %.1f/frame",
+            g_copy_gpu.exchange(0) / 300.0, g_copy_cpu.exchange(0) / 300.0, g_copy_cpu_bytes.exchange(0) / 300.0 / 1048576.0,
+            g_write_backs.exchange(0) / 300.0, g_write_back_bytes.exchange(0) / 300.0 / 1048576.0, queries / 300.0, cond / 300.0);
         LOG("[gfx] last 300 frames: %.1f clears/frame folded into the next pass, %.1f encoded on their own",
             g_clears_folded.exchange(0) / 300.0, g_clears_flushed.exchange(0) / 300.0);
         LOG("[gfx] frame %llu, %llu draws so far, GPU %.1f ms/frame, render thread CPU %.2f ms/frame", (unsigned long long)R.frame,
@@ -763,6 +774,11 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
     if (size >= 0x10000000) return;
     g_inval_texture++;
     if (!size) return;
+    // with page-protection write tracking every CPU write to a texture's pages is seen anyway (check_texture);
+    // BotW sends ~460 texture invalidations a frame and this scan (~50 surfaces each) never marked one.
+    // WWHD_SCAN_INVALIDATES=1 scans anyway.
+    static const bool scan = getenv("WWHD_SCAN_INVALIDATES") != nullptr;
+    if (!scan && wwatch::active()) return;
     uint64_t end = (uint64_t)addr + size;
     auto hits = [&](Surface* s) {
         // every level once known (after the first check), else the base level estimate

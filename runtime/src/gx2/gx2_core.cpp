@@ -115,6 +115,25 @@ static bool metal_key_changes(uint32 reg, uint32 old, uint32 val) {
     }
     return true;
 }
+// debug: WWHD_GEN_STATS=1 logs, every 20000 bumps, which registers bumped the shader generation
+static void note_gen_bump(uint32 reg) {
+    static const bool on = getenv("WWHD_GEN_STATS") != nullptr;
+    if (!on) return;
+    static std::unordered_map<uint32, uint32> tally;
+    static uint32 total = 0;
+    tally[reg]++;
+    if (++total % 20000) return;
+    std::vector<std::pair<uint32, uint32>> v(tally.begin(), tally.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string line;
+    for (size_t i = 0; i < v.size() && i < 16; i++) {
+        char b[32];
+        snprintf(b, sizeof b, " %04X=%u", v[i].first, v[i].second);
+        line += b;
+    }
+    LOG("[genstats] %u bumps; by register:%s", total, line.c_str());
+    tally.clear();
+}
 static ShaderKeyDirtyStats shaderKeyDirtyStats;
 ShaderKeyDirtyStats shader_key_dirty_stats() { return shaderKeyDirtyStats; }
 
@@ -214,6 +233,7 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
         for (uint32 i = 0; i < n; i++)
             if (g_regs[first + i] != v[i] && !shader_irrelevant(first + i) && metal_key_changes(first + i, g_regs[first + i], v[i])) {
                 g_shader_state_gen++;
+                note_gen_bump(first + i);
                 break;
             }
         memcpy(&g_regs[first], v, n * 4);
@@ -853,13 +873,18 @@ HLE(gx2, GX2SaveStreamOutContext) {
 // Occlusion queries (BotW): no GPU queries on the Metal backend yet, so every query reports
 // "visible" (0x100000 samples) and conditional rendering always draws. Nothing is wrongly culled;
 // the cost is drawing some things the game could have skipped.
-HLE(gx2, GX2QueryBegin) { memset(mem::ptr(arg(c, 1)), 0, 0x40); }
+static std::atomic<uint64_t> g_queries{0}, g_cond_renders{0};
+extern "C" uint64_t wwhd_query_counts(uint64_t* conditional) {
+    *conditional = g_cond_renders.exchange(0);
+    return g_queries.exchange(0);
+}
+HLE(gx2, GX2QueryBegin) { memset(mem::ptr(arg(c, 1)), 0, 0x40); g_queries++; }
 HLE(gx2, GX2QueryEnd) {}
 HLE(gx2, GX2QueryGetOcclusionResult) {  // (GX2Query*, u64* result) -> ready
     if (arg(c, 1)) { st32(arg(c, 1), 0); st32(arg(c, 1) + 4, 0x100000); }
     ret(c, 1);
 }
-HLE(gx2, GX2QueryBeginConditionalRender) {}
+HLE(gx2, GX2QueryBeginConditionalRender) { g_cond_renders++; }
 HLE(gx2, GX2QueryEndConditionalRender) {}
 
 HLE(gx2, GX2DrawIndexedEx2) {  // (prim, count, indexType, indices, baseVertex, instances, baseInstance)
