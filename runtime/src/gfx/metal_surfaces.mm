@@ -666,6 +666,16 @@ static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
         layer[i] = best;
         key = (key ^ (best ? best->writeSeq + i : i)) * 0xFF51AFD7ED558CCDull;
     }
+    int found = 0;
+    for (uint32_t i = 1; i < d.slices; i++) found += layer[i] != nullptr;
+    // nothing rendered at the other slices: an array of zeros helps no one (cube maps the game samples
+    // from a 2D image keep their six-face copy, update_cube_proxy)
+    if (!found) {
+        static int none = 0;
+        if (dim == Latte::E_DIM::DIM_2D_ARRAY && none++ < 10)
+            LOG("[gfx] array %08X %ux%u f%X: %u layers, none rendered at the other slices", d.addr, d.width, d.height, d.format, d.slices);
+        return s;
+    }
     auto* c = s->layerArray.get();
     if (c && (layer_count(c->tex) != d.slices || c->tex.width != w || c->tex.height != h || c->tex.pixelFormat != s->tex.pixelFormat ||
               c->tex.textureType != (dim == Latte::E_DIM::DIM_CUBEMAP ? MTLTextureTypeCubeArray : MTLTextureType2DArray))) {
@@ -714,8 +724,6 @@ static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
     s->layerArraySeq = key;
     static int logged = 0;
     if (logged++ < 20) {
-        int found = 0;
-        for (uint32_t i = 1; i < d.slices; i++) found += layer[i] != nullptr;
         LOG("[gfx] array %08X %ux%u f%X: %u layers assembled from render targets (%d of %u found)", d.addr, d.width, d.height, d.format,
             d.slices, found, d.slices - 1);
     }
