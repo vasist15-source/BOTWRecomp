@@ -111,10 +111,14 @@ struct ProgramHash {
     uint32_t size;
     uint64_t hash;
     uint64_t frame;
+    uint64_t maskKey = 0;  // the key unitMask was learned for (get_shader_uncached: skips the locked lookup)
+    uint32_t unitMask = 0x3FFFF;
 };
 static std::unordered_map<uint32_t, ProgramHash> g_program_hashes;
+static ProgramHash* g_program_hash_last = nullptr;  // the entry of the latest program_hash call
 static uint64_t program_hash(uint32_t addr, uint32_t size) {
     auto& e = g_program_hashes[addr];
+    g_program_hash_last = &e;
     if (e.size != size || e.frame != R.frame) {
         e.size = size;
         e.hash = hash_bytes(mem::ptr(addr), size);
@@ -207,7 +211,7 @@ static LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut
     bool ours = ld32(prog) == 0x57574653;
     uint32_t size = ours ? 16 + ld32(prog + 4) * 16 : regs[mmSQ_PGM_START_FS + 1] << 3;
     if (size > 0x1000) return nullptr;
-    uint64_t h = hash_bytes(mem::ptr(prog), size);
+    uint64_t h = program_hash(prog, size);  // the program's hash, revalidated once per frame
     // strides decide between vertex-descriptor fetch and manual fetch in the shader
     for (uint32_t b = 0; b < 16; b++) h = (h ^ ((regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + b * 7 + 2] >> 11) & 0xFFFF)) * 1099511628211ull;
     *keyOut = h;
@@ -459,10 +463,16 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     // table entry holding its semantic; the other entries (stale or repeated) change nothing, and hashing
     // them made a variant per leftover table (the largest source of variants after the linkage fix)
     if (vs && fs) {
-        bool want[256] = {}, seen[256] = {};
-        for (auto* groups : {&fs->bufferGroups, &fs->bufferGroupsInvalid})
-            for (auto& g : *groups)
-                for (uint32_t i = 0; i < g.attribCount; i++) want[g.attrib[i].semanticId] = true;
+        static const LatteFetchShader* wantFs = nullptr;  // fetch shaders live as long as the program
+        static bool want[256];
+        if (wantFs != fs) {
+            memset(want, 0, sizeof want);
+            for (auto* groups : {&fs->bufferGroups, &fs->bufferGroupsInvalid})
+                for (auto& g : *groups)
+                    for (uint32_t i = 0; i < g.attribCount; i++) want[g.attrib[i].semanticId] = true;
+            wantFs = fs;
+        }
+        bool seen[256] = {};
         for (uint32_t f = 0; f < 32; f++) {
             const uint32_t v = regs[mmSQ_VTX_SEMANTIC_0 + f];
             const bool used = v < 256 && want[v] && !seen[v];
@@ -637,12 +647,19 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     if (!addr || !size) return nullptr;
     uint64_t key = program_hash(addr, size) ^ (vertex ? 0x1111 : 0x2222);
     uint64_t base = key;
-    // texture units this program samples, known after its first translation (see stage_state_hash)
+    // texture units this program samples, known after its first translation (see stage_state_hash);
+    // once learned it never changes, so the program's hash entry keeps it
+    ProgramHash* ph = g_program_hash_last;
     uint32_t unitMask = 0x3FFFF;
-    {
+    if (ph && ph->maskKey == base) {
+        unitMask = ph->unitMask;
+    } else {
         std::lock_guard<std::mutex> lk(g_used_units_mu);
         auto uu = g_used_units.find(base);
-        if (uu != g_used_units.end()) unitMask = uu->second;
+        if (uu != g_used_units.end()) {
+            unitMask = uu->second;
+            if (ph) { ph->maskKey = base; ph->unitMask = unitMask; }
+        }
     }
     key = stage_state_hash(regs, key ^ (unitMask == 0x3FFFF ? 0 : 0x5EED0001u),
                            vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask, vertex ? fs : nullptr);
