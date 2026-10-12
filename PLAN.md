@@ -117,10 +117,9 @@ Debug switches: WWHD_TRACE_LIB, WWHD_PEEK, WWHD_AX_STATS, WWHD_KEY_DIFF, WWHD_VE
 
 ## Audio status (2026-10-12)
 
-Fixed: OSWaitRendezvous counted callers instead of cores, so aal initialized nw::snd's
-SoundArchivePlayer before its launcher thread had set up the sound system (flag 1047F1DC);
-the player never became available and the game sent only empty command batches.
-Now: the game sends real nw::snd commands and plays AX voices (ADPCM, offsets struct in the
-0x68xxxxxx range), but our AX mixer's final mix stays at 0. Next: the first-voices log
-("[ax] voice ... plays") shows format/address/volumes; suspects are the ADPCM nibble address
-(samples*2 in 32 bits), sample data above MEM2, or device-mix volumes.
+Working: menus, title and gameplay sound. Two fixes: OSWaitRendezvous counted callers instead of
+cores (aal initialized nw::snd's SoundArchivePlayer before its launcher thread set up the sound
+system, so the game never sent a real command), and AX voice positions overflowed 32 bits (ADPCM
+nibble addresses of sample data at 0xA5xxxxxx). Open: a burst of noise was heard once after loading
+a save; if it recurs, suspects are the per-voice biquad/LPF filters (BotW updates them constantly,
+WWHD never used them) and stream voices (type 1).
