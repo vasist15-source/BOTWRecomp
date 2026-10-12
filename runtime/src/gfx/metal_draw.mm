@@ -570,9 +570,28 @@ static bool g_defer_compiles = false;
 static std::vector<Shader*> g_deferred_shaders;
 
 static void compile_deferred(Shader* s) {
-    if (s->state != CS_DEFERRED) return;
-    s->state = CS_PENDING;
+    int expected = CS_DEFERRED;  // the background warm-up (warm_deferred_in_background) may take it first
+    if (!s->state.compare_exchange_strong(expected, CS_PENDING)) return;
     compile_msl(s, s->dec->strBuf_shaderSource->c_str(), s->key);
+}
+
+// After the cache replay, every cached shader is compiled on a background thread instead of on its first
+// draw (which waited or skipped the draw: a glitched frame wherever the game first used it, every session).
+// Metal's own cache usually has the code, so this takes seconds, mostly while the title screen is up.
+// WWHD_NO_BG_SHADER_WARM=1: compile on first use (and in the menus' spare frame time) as before.
+static void warm_deferred_in_background(std::vector<Shader*> shaders) {
+    if (getenv("WWHD_NO_BG_SHADER_WARM") || shaders.empty()) return;
+    std::thread([list = std::move(shaders)] {
+        const double t0 = now_ms();
+        size_t n = 0;
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {  // newest recipes first: the latest sessions' areas
+            while (g_compiles_in_flight >= 32) std::this_thread::sleep_for(std::chrono::microseconds(500));
+            compile_deferred(*it);
+            n++;
+        }
+        while (g_compiles_in_flight > 0 && now_ms() - t0 < 600000) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        LOG("[gfx] cached shaders compiled in the background: %zu in %.1f s", n, (now_ms() - t0) / 1000.0);
+    }).detach();
 }
 
 // render thread: start the retry of a failed Metal compile when it is due (see kCompileAttempts).
@@ -2048,6 +2067,7 @@ static void cache_load() {
     }
     void headstart_load();  // shader_headstart.mm
     headstart_load();
+    warm_deferred_in_background(g_deferred_shaders);
     g_cache_out = fopen(path.c_str(), "ab");
     if (shaders || pipelines) {
         size_t srcBytes = 0, programs = 0;
@@ -2128,7 +2148,7 @@ void cache_warm_step() {
         if (g_warm_deadline_ms && now_ms() > g_warm_deadline_ms) break;
         Shader* s = g_deferred_shaders.back();
         g_deferred_shaders.pop_back();
-        if (s->state == CS_DEFERRED) { compile_deferred(s); n++; }
+        if (s->state.load() == CS_DEFERRED) { compile_deferred(s); n++; }
     }
     static bool queued = false;
     if (!g_pending_pipelines.empty()) queued = true;
