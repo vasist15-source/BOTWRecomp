@@ -361,6 +361,16 @@ static std::string snap_texcoords(const char* src) {
     return out;
 }
 
+// a compiled shader's MSL is only needed again to retry a failed compile: free it (tens of KB each,
+// tens of thousands of shaders). WWHD_KEEP_MSL=1 keeps it (debug dumps of every shader's source).
+static void release_source(Shader* sh) {
+    static const bool keep = getenv("WWHD_KEEP_MSL") != nullptr;
+    if (keep || !sh->dec || !sh->dec->strBuf_shaderSource) return;
+    StringBuf* src = sh->dec->strBuf_shaderSource;
+    sh->dec->strBuf_shaderSource = nullptr;
+    delete src;
+}
+
 static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     const int attempt = ++sh->attempts;
     const bool injectFailure = attempt <= g_test_fail_compiles;
@@ -401,6 +411,7 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:entry] : nil;
         if (!fn) { report_compile_error(src, key, err, attempt, lib != nil); sh->state = CS_FAILED; return; }
         sh->fn = fn;
+        release_source(sh);
         sh->state = CS_READY;
         return;
     }
@@ -412,6 +423,7 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:entry] : nil;
         if (!fn) { report_compile_error(copy.c_str(), key, err, attempt, lib != nil); compile_done(sh->state, CS_FAILED); return; }
         sh->fn = fn;
+        release_source(sh);
         compile_done(sh->state, CS_READY);
     }];
 }
@@ -443,11 +455,25 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     auto skip = [&](uint32_t count) { memset(&buf[n], 0, count * 4); n += count; };
     auto putIf = [&](bool keep, uint32_t first, uint32_t count) { if (keep) put(first, count); else skip(count); };
     putIf(vs, mmSQ_VTX_SEMANTIC_0, 32);           // vertex fetch
-    put(mmSPI_VS_OUT_ID_0, 10);                   // VS exports <-> PS inputs (both stages link through these)
+    // VS exports <-> PS inputs (both stages link through these). Only the entries in use: the VS's export
+    // semantics up to its export count, the PS's inputs up to SPI_PS_IN_CONTROL_0's count (what the GPU and
+    // the translator read). The registers past them keep whatever earlier shaders left, and hashing those
+    // split every program into a variant per stale combination (BotW: ~6x the shaders)
+    {
+        const uint32_t exports = ((regs[mmSPI_VS_OUT_CONFIG] >> 1) & 0x1F) + 1;  // semantic ids, 4 per register
+        for (uint32_t i = 0; i < 10; i++) {
+            const uint32_t first = i * 4;
+            const uint32_t keep = first >= exports ? 0 : exports - first >= 4 ? 0xFFFFFFFFu : (1u << (8 * (exports - first))) - 1;
+            buf[n++] = regs[mmSPI_VS_OUT_ID_0 + i] & keep;
+        }
+    }
     put(mmSPI_VS_OUT_CONFIG, 1);
     put(mmPA_CL_VS_OUT_CNTL, 1);
     put(mmSPI_PS_IN_CONTROL_0, 2);
-    put(mmSPI_PS_INPUT_CNTL_0, 32);
+    {
+        const uint32_t inputs = std::min<uint32_t>(regs[mmSPI_PS_IN_CONTROL_0] & 0x3F, 32);
+        for (uint32_t i = 0; i < 32; i++) buf[n++] = i < inputs ? regs[mmSPI_PS_INPUT_CNTL_0 + i] : 0;
+    }
     put(REGADDR::SQ_CONFIG, 1);
     putIf(!vs, mmCB_SHADER_MASK, 1);              // pixel exports
     putIf(!vs, mmCB_SHADER_CONTROL, 1);
@@ -623,7 +649,10 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     // translating waits within the compile budget (wait_compiled), then is skipped for that frame.
     // Cache replay stays synchronous. WWHD_SYNC_TRANSLATE=1: translate in place (the old way).
     static const bool asyncTranslate = !getenv("WWHD_SYNC_TRANSLATE");
-    if (asyncTranslate && !g_cache_replaying && !g_defer_compiles) {
+    // a program's first variant is translated here: its translation tells which texture units it samples,
+    // and every later variant's key depends on that (stage_state_hash). Keyed before it is known, a burst
+    // made duplicate variants. Later variants (the many) go to the workers.
+    if (asyncTranslate && !g_cache_replaying && !g_defer_compiles && unitMask != 0x3FFFF) {
         cache_record_shader(regs, vertex);
         s->tstate = CS_PENDING;
         auto snap = std::make_shared<std::vector<uint32_t>>(regs, regs + 0x10000);  // the render thread moves on
@@ -799,9 +828,10 @@ static uint64_t g_must_run_waits = 0;
 static double g_must_run_wait_ms = 0;
 std::atomic<double> g_compile_wait_ms{0};  // render thread time spent waiting for compiles (hitch log)
 static bool wait_compiled(const std::atomic<int>& st) {
-    // 10 ms: new areas bring hundreds of shaders in a frame; waiting 25 ms for them made 75+ ms frames
-    // where skipping a few draws for a frame or two went unnoticed
-    static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 10.0;
+    // 4 ms: new areas bring hundreds of shaders a frame for many frames; waiting 25 (then 10) ms for them
+    // each frame made the game wait on the render thread, while skipping a few object draws for a frame
+    // or two goes unnoticed
+    static const double budgetMs = getenv("WWHD_COMPILE_WAIT_MS") ? atof(getenv("WWHD_COMPILE_WAIT_MS")) : 4.0;
     if (g_building_ahead) return st.load(std::memory_order_acquire) == CS_READY;
     static uint64_t frame = ~0ull;
     static double spent = 0;
@@ -1933,10 +1963,17 @@ static void cache_load() {
         };
         g_cache_replaying = true;
         g_defer_compiles = true;
+        // compaction: the records worth keeping (a shader recipe that made a new shader, a pipeline recipe
+        // whose shaders exist), compressed as read
+        struct Rec { uint32_t hdr[3]; std::vector<uint8_t> comp; };
+        std::vector<Rec> keepShaders;
+        std::vector<std::pair<PipelineRecipe, Rec>> keepPipelines;
+        size_t records = 0;
         uint32_t hdr[3];
         while (fread(hdr, sizeof hdr, 1, f) == 1) {
             std::vector<uint8_t> comp(hdr[2]), raw(hdr[1]);
             if (fread(comp.data(), 1, hdr[2], f) != hdr[2]) break;
+            records++;
             uLongf rsize = hdr[1];
             if (uncompress(raw.data(), &rsize, comp.data(), hdr[2]) != Z_OK || rsize != hdr[1]) break;
             const uint8_t* p = raw.data();
@@ -1946,6 +1983,7 @@ static void cache_load() {
                 if (get(p, end, r) && g_known_pipelines.insert(hash_bytes(raw.data(), raw.size())).second) {
                     g_pending_pipelines.push_back(r);
                     pipelines++;
+                    keepPipelines.push_back({r, Rec{{hdr[0], hdr[1], hdr[2]}, comp}});
                 }
                 continue;
             }
@@ -1975,19 +2013,53 @@ static void cache_load() {
             uint64_t fsKey = 0;
             LatteFetchShader* fs = vertex ? get_fetch_shader(regs.data(), &fsKey) : nullptr;
             if (vertex && !fs) continue;
+            const size_t before = g_shaders.size();
             get_shader_uncached(regs.data(), vertex, fs, fsKey);
+            if (g_shaders.size() > before) keepShaders.push_back(Rec{{hdr[0], hdr[1], hdr[2]}, std::move(comp)});
             shaders++;
         }
         fclose(f);
         g_cache_replaying = false;
         g_defer_compiles = false;
+        // rewrite the file without the dead weight when it is mostly that: recipes of shaders already made
+        // (older keys, or a variant per stale register), pipelines whose shaders no longer resolve. It only
+        // ever grew (BotW: 294k shader recipes for 55k shaders, 530 MB). WWHD_NO_CACHE_COMPACT=1: keep it.
+        size_t livePipelines = 0;
+        for (auto& [r, rec] : keepPipelines)
+            if (g_shaders.count(r.vsKey) && g_shaders.count(r.psKey) && g_fetch.count(r.fsKey)) livePipelines++;
+        const size_t kept = keepShaders.size() + livePipelines;
+        if (!getenv("WWHD_NO_CACHE_COMPACT") && records > 1000 && kept * 10 < records * 7) {
+            const std::string tmp = path + ".compact";
+            if (FILE* o = fopen(tmp.c_str(), "wb")) {
+                bool ok = true;
+                for (auto& rec : keepShaders)
+                    ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 && fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
+                for (auto& [r, rec] : keepPipelines)
+                    if (g_shaders.count(r.vsKey) && g_shaders.count(r.psKey) && g_fetch.count(r.fsKey))
+                        ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 &&
+                             fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
+                ok = fclose(o) == 0 && ok;
+                if (ok && rename(tmp.c_str(), path.c_str()) == 0)
+                    LOG("[gfx] shader cache compacted: %zu of %zu records kept (%zu shaders, %zu pipelines)", kept, records,
+                        keepShaders.size(), livePipelines);
+                else
+                    remove(tmp.c_str());
+            }
+        }
     }
     void headstart_load();  // shader_headstart.mm
     headstart_load();
     g_cache_out = fopen(path.c_str(), "ab");
-    if (shaders || pipelines)
-        LOG("[gfx] shader cache: replayed %zu shaders, %zu pipelines queued (%.0f ms) from %s", shaders, pipelines,
-            now_ms() - t0, path.c_str());
+    if (shaders || pipelines) {
+        size_t srcBytes = 0, programs = 0;
+        std::unordered_set<uint64_t> bases;
+        for (auto& [k, sh] : g_shaders)
+            if (sh && sh->dec && sh->dec->strBuf_shaderSource) srcBytes += sh->dec->strBuf_shaderSource->getLen();
+        LOG("[gfx] shader cache: replayed %zu shaders, %zu pipelines queued (%.0f ms) from %s; %.0f MiB of shader source held",
+            shaders, pipelines, now_ms() - t0, path.c_str(), srcBytes / 1048576.0);
+        (void)programs;
+        (void)bases;
+    }
 }
 
 // build queued pipelines whose shaders have finished compiling, at most `budget` of them and only
@@ -2137,9 +2209,6 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     Shader* vs = get_shader(regs, true, fs, fsKey);
     Shader* ps = get_shader(regs, false, fs, fsKey);
     if (!vs || !ps) { g_skip[SK_NO_SHADER]++; return; }
-    // a full-screen pass (a quad or a big triangle, once): skipping it for a frame while its shader
-    // compiles flashes the whole picture (lighting, post effects), so it always waits; objects skip
-    const bool fullScreen = count <= 6 && instances <= 1;
     if (vs->tstate.load(std::memory_order_acquire) != CS_READY || ps->tstate.load(std::memory_order_acquire) != CS_READY) {
         // still translating on a worker: wait within the compile budget, or skip the draw this frame. The
         // pixel shader's outputs aren't known yet, so any bound target not redrawn every frame counts
@@ -2156,7 +2225,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             auto it = g_target_drawn.find(regs[mmDB_DEPTH_BASE]);
             must = it == g_target_drawn.end() || it->second + 1 < R.frame;
         }
-        g_draw_must_run = must || fullScreen;
+        g_draw_must_run = must;
         const bool ready = wait_compiled(vs->tstate) && wait_compiled(ps->tstate);
         g_draw_must_run = false;
         if (!ready) { g_skip[vs->tstate == CS_FAILED || ps->tstate == CS_FAILED ? SK_NO_SHADER : SK_COMPILING]++; return; }
@@ -2174,7 +2243,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         for (int i = 0; i < 8 && !must; i++)
             if ((mask & (1 << i)) && regs[mmCB_COLOR0_BASE + i]) must = notRedrawn(regs[mmCB_COLOR0_BASE + i]);
         if (!must && LatteMRT::GetActiveDepthBufferMask(lcr) && regs[mmDB_DEPTH_BASE]) must = notRedrawn(regs[mmDB_DEPTH_BASE]);
-        g_draw_must_run = must || fullScreen;
+        g_draw_must_run = must;
     }
     struct MustRunReset { ~MustRunReset() { g_draw_must_run = false; } } mustRunReset;
     retry_failed_compile(vs, g_draw_must_run);
