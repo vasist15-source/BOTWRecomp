@@ -388,8 +388,11 @@ void dump_texture(id<MTLTexture> src, const char* name, bool async, bool srgbEnc
     bool f16 = pf == MTLPixelFormatRGBA16Float;
     bool r8 = pf == MTLPixelFormatR8Unorm;
     bool rg11 = pf == MTLPixelFormatRG11B10Float;
-    if (!rgb10 && !rgba8 && !f16 && !r8 && !rg11) { LOG("[gfx] dump: unsupported format %lu", (unsigned long)pf); return; }
-    uint32_t bpp = f16 ? 8 : r8 ? 1 : 4;
+    // single-channel float/16-bit: grey, stretched between the values' min and max (logged)
+    bool r16f = pf == MTLPixelFormatR16Float, r32f = pf == MTLPixelFormatR32Float, r16 = pf == MTLPixelFormatR16Unorm;
+    bool scalar = r16f || r32f || r16;
+    if (!rgb10 && !rgba8 && !f16 && !r8 && !rg11 && !scalar) { LOG("[gfx] dump: unsupported format %lu", (unsigned long)pf); return; }
+    uint32_t bpp = f16 ? 8 : r8 ? 1 : (r16f || r16) ? 2 : 4;
     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
     d.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [R.device newTextureWithDescriptor:d];
@@ -402,6 +405,20 @@ void dump_texture(id<MTLTexture> src, const char* name, bool async, bool srgbEnc
     auto write = [=]() {
     std::vector<uint8_t> raw((size_t)w * h * bpp), px((size_t)w * h * 4);
     [t getBytes:raw.data() bytesPerRow:w * bpp fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    std::vector<float> vals;
+    float lo = INFINITY, hi = -INFINITY;
+    if (scalar) {
+        vals.resize((size_t)w * h);
+        for (size_t i = 0; i < vals.size(); i++) {
+            float v;
+            if (r16f) { __fp16 hv; memcpy(&hv, &raw[i * 2], 2); v = hv; }
+            else if (r16) { uint16_t u; memcpy(&u, &raw[i * 2], 2); v = u / 65535.0f; }
+            else memcpy(&v, &raw[i * 4], 4);
+            vals[i] = v;
+            if (std::isfinite(v)) { lo = std::min(lo, v); hi = std::max(hi, v); }
+        }
+        LOG("[gfx] dump %s: values %g .. %g (centre %g)", file.c_str(), lo, hi, vals[(size_t)(h / 2) * w + w / 2]);
+    }
     for (size_t i = 0; i < (size_t)w * h; i++) {
         uint8_t* o = &px[i * 4];
         if (rgb10) {
@@ -411,6 +428,9 @@ void dump_texture(id<MTLTexture> src, const char* name, bool async, bool srgbEnc
             memcpy(o, &raw[i * 4], 3);
         } else if (r8) {
             o[0] = o[1] = o[2] = raw[i];
+        } else if (scalar) {
+            float v = std::isfinite(vals[i]) && hi > lo ? (vals[i] - lo) / (hi - lo) : 0.0f;
+            o[0] = o[1] = o[2] = (uint8_t)(v * 255.0f);
         } else if (rg11) {
             uint32_t v; memcpy(&v, &raw[i * 4], 4);
             auto f11 = [](uint32_t m, uint32_t e) { float f = e ? ldexpf(1.0f + m / 64.0f, (int)e - 15) : ldexpf(m / 64.0f, -14); return f; };

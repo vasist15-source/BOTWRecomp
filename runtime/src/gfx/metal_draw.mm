@@ -2210,6 +2210,20 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         snprintf(name, sizeof name, "%s/draw_%04llu_PS%08X_CB%08X.png", g_capture_dir.c_str(), (unsigned long long)thisDraw,
                  regs[mmSQ_PGM_START_PS] << 8, regs[mmCB_COLOR0_BASE]);
         dump_texture(colors[0]->tex, name, false, false);
+        // and what it read: each sampled texture (once per capture) and the pixel shader's MSL
+        static std::set<std::string> done;
+        static std::string doneDir;
+        if (doneDir != g_capture_dir) { done.clear(); doneDir = g_capture_dir; }
+        for (int k = 0; k < g_draw_sampled_n; k++) {
+            Surface* t = g_draw_sampled[k];
+            if (!t || !t->tex) continue;
+            snprintf(name, sizeof name, "%s/tex_%08X_f%X_%lux%lu.png", g_capture_dir.c_str(), t->addr, t->format,
+                     (unsigned long)t->tex.width, (unsigned long)t->tex.height);
+            if (done.insert(name).second) dump_texture(t->tex, name, false, false);
+        }
+        snprintf(name, sizeof name, "%s/ps_%08X.metal", g_capture_dir.c_str(), regs[mmSQ_PGM_START_PS] << 8);
+        if (ps->dec && ps->dec->strBuf_shaderSource && done.insert(name).second)
+            if (FILE* f = fopen(name, "w")) { fputs(ps->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
     }
     if (R.frame == dumpFrame && dumpDraws.count(thisDraw)) {
         void dump_texture(id<MTLTexture>, const char*, bool, bool);
