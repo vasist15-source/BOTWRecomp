@@ -625,6 +625,19 @@ void cache_warm_step();
 
 void pass_timing_arm(double lastFrameMs);
 void swap() {
+    {  // debug: values a patched shader wrote (WWHD_MSL_PATCH, buffer 30)
+        extern id<MTLBuffer> g_debug_values;
+        static uint64_t n = 0;
+        if (g_debug_values && ++n % 30 == 0) {
+            const float* v = (const float*)g_debug_values.contents;
+            if (v[63] == 12345.0f) {
+                std::string line;
+                char b[32];
+                for (int i = 0; i < 56; i++) { snprintf(b, sizeof b, " [%d]%g", i, v[i]); line += b; }
+                LOG("[dbgvals]%s", line.c_str());
+            }
+        }
+    }
     {
         static double prev = 0;
         const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();

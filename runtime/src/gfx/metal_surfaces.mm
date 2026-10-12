@@ -787,6 +787,20 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
         s->lastCheckedFrame = R.frame;
         check_texture(s);
     }
+    {  // debug: WWHD_TRACE_TEX=hexaddr logs what a sampled lookup at that address resolved to (60 times)
+        static const uint32_t trace = getenv("WWHD_TRACE_TEX") ? (uint32_t)strtoul(getenv("WWHD_TRACE_TEX"), nullptr, 16) : 0;
+        static int traced = 0;
+        if (trace && d.addr == trace && traced++ < 60) {
+            int n = 0;
+            auto range = R.surfaces.equal_range(d.addr);
+            for (auto it = range.first; it != range.second; ++it) n++;
+            LOG("[tracetex] f%llu want %ux%u x%u f%X dim %u mips %u tm %u -> %s %ux%u x%u f%X tex %lux%lux%lu type %lu gpu %d seq %llu (%d surfaces here)",
+                (unsigned long long)R.frame, d.width, d.height, d.slices, d.format, d.dim, d.mips, d.tileMode, s ? "found" : "none",
+                s ? s->width : 0, s ? s->height : 0, s ? s->slices : 0, s ? s->format : 0, s && s->tex ? (unsigned long)s->tex.width : 0,
+                s && s->tex ? (unsigned long)s->tex.height : 0, s && s->tex ? (unsigned long)s->tex.arrayLength : 0,
+                s && s->tex ? (unsigned long)s->tex.textureType : 0, s ? s->gpuWritten : 0, s ? (unsigned long long)s->writeSeq : 0, n);
+        }
+    }
     if (s && s->gpuWritten && !isDepthSampler && d.slices > 1) return with_array_layers(s, d);
     return s && s->gpuWritten && d.mips > 1 && !isDepthSampler ? with_mip_chain(s, d) : s;
 }
@@ -1250,11 +1264,20 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         dd.pitch = d->pitch;
         dd.format = (uint32_t)d->format.value();
         dd.tileMode = (uint32_t)d->tileMode.value();
+        // an array (or cube) destination is looked up whole and the copy goes to its slice; slice 0 of a
+        // one-layer alias left the array's other layers unwritten (BotW's water reads layer 1 of one)
+        const auto ddim = d->dim.value();
+        if (ddim == Latte::E_DIM::DIM_2D_ARRAY || ddim == Latte::E_DIM::DIM_CUBEMAP) {
+            dd.slices = std::max<uint32_t>((uint32_t)d->depth, 1);
+            dd.dim = (uint32_t)ddim;
+        }
         Surface* dst = find_or_create_surface(dd, true);
         if (!dst) {
             note("GPU source, no destination image (skipped)");
             return;
         }
+        const NSUInteger srcLayer = srcSlice < layer_count(src->tex) ? srcSlice : 0;
+        const NSUInteger dstLayer = std::min<NSUInteger>(dstSlice, layer_count(dst->tex) - 1);
         // the source's image can be in another host format than a fresh one for the destination
         // (same GX2 format, e.g. an sRGB view: the save thumbnail, 256x144 1A tm 4 -> linear). Same
         // texel size: the bits are copied through a view in the destination's format; else drawn.
@@ -1280,15 +1303,24 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         if (spw == dpw && sph == dph && !convert) {
             id<MTLBlitCommandEncoder> b = TIMED_BLIT();
             if (bitsViaBuffer)
-                copy_bits_via_buffer(b, srcTex, 0, 0, dst->tex, 0, 0, MTLSizeMake(spw, sph, 1), dst->fmt.hostBytesPerBlock);
+                copy_bits_via_buffer(b, srcTex, srcLayer, 0, dst->tex, dstLayer, 0, MTLSizeMake(spw, sph, 1), dst->fmt.hostBytesPerBlock);
             else
-                [b copyFromTexture:srcTex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                [b copyFromTexture:srcTex sourceSlice:srcLayer sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                         sourceSize:MTLSizeMake(spw, sph, 1)
-                         toTexture:dst->tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                         toTexture:dst->tex destinationSlice:dstLayer destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [b endEncoding];
         } else {
+            // one layer of each (resample draws into slice 0 of what it is given)
+            id<MTLTexture> sv = layer_count(src->tex) > 1 && src->tex.textureType != MTLTextureType3D
+                                    ? [src->tex newTextureViewWithPixelFormat:src->tex.pixelFormat textureType:MTLTextureType2D
+                                                                      levels:NSMakeRange(0, 1) slices:NSMakeRange(srcLayer, 1)]
+                                    : src->tex;
+            id<MTLTexture> dv = layer_count(dst->tex) > 1 && dst->tex.textureType != MTLTextureType3D
+                                    ? [dst->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat textureType:MTLTextureType2D
+                                                                      levels:NSMakeRange(0, 1) slices:NSMakeRange(dstLayer, 1)]
+                                    : dst->tex;
             g_resample_why = "copy";
-            resample(src->tex, dst->tex, dst->fmt, 1, (float)spw / src->tex.width, (float)sph / src->tex.height, dpw, dph);
+            resample(sv, dv, dst->fmt, 1, (float)spw / src->tex.width, (float)sph / src->tex.height, dpw, dph);
             g_resample_why = nullptr;
         }
         mark_gpu_written(dst);
