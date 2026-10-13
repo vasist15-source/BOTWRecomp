@@ -1628,7 +1628,11 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
 
 // ---------------------------------------------------------------- render pass
 std::atomic<uint64_t> g_pass_stats[4];  // passes, bytes loaded+stored, reopened passes, their bytes
-std::atomic<uint64_t> g_pass_stats_merged{0};  // draws kept in a pass whose targets are a superset of theirs
+std::atomic<uint64_t> g_pass_stats_merged{0};
+// why passes end: 0 ended by something else (copy, upload, clear, flush), 1 same targets other slice,
+// 2 draw needs more targets, 3 different depth, 4 draw samples an attached target, 5 other targets; 6 passes with <=1 draw
+std::atomic<uint64_t> g_pass_why[7];
+static uint64_t g_pass_first_draw = 0;  // draws kept in a pass whose targets are a superset of theirs
 // WWHD_GPU_PASS_TIMES=<frame>: GPU time of every render pass of that frame (Metal timestamp
 // counters at the pass's start of vertex and end of fragment work), logged most expensive first
 static id<MTLCounterSampleBuffer> g_pt_buf = nil;
@@ -1829,7 +1833,22 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
             g_pass_stats_merged++;
             return true;
         }
+        // why the open pass could not take this draw (logged every 300 frames with the pass counts)
+        bool sameSurfaces = R.passDepth == depth, superset = true, sampled = false, sharesAny = R.passDepth && R.passDepth == depth;
+        for (int i = 0; i < 8; i++) {
+            sameSurfaces = sameSurfaces && R.passColor[i] == colors[i];
+            if (colors[i] && R.passColor[i] != colors[i]) superset = superset && !R.passColor[i];
+            if (colors[i] && R.passColor[i] == colors[i]) sharesAny = true;
+            for (int k = 0; k < g_draw_sampled_n; k++) sampled = sampled || (R.passColor[i] && g_draw_sampled[k] == R.passColor[i]);
+        }
+        for (int k = 0; k < g_draw_sampled_n; k++) sampled = sampled || (R.passDepth && g_draw_sampled[k] == R.passDepth);
+        const int why = sameSurfaces ? 1 : !sharesAny ? 5 : sampled ? 4 : R.passDepth != depth ? 3 : superset ? 2 : 5;
+        g_pass_why[why]++;
+    } else {
+        g_pass_why[0]++;
     }
+    if (R.enc && R.drawCount - g_pass_first_draw <= 1) g_pass_why[6]++;
+    g_pass_first_draw = R.drawCount;
     end_encoder();
     // stats: passes per frame, the attachment bytes each loads and stores, and how many reopen the
     // same targets as the pass before (it was ended by something else: an upload, a copy, a clear)

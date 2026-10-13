@@ -729,6 +729,12 @@ void swap() {
         LOG("[gfx] last 300 frames: %.0f render passes/frame (%.0f MiB loaded+stored), %.0f of them reopen the previous pass's targets (%.0f MiB)",
             g_pass_stats[0].exchange(0) / 300.0, g_pass_stats[1].exchange(0) / 300.0 / 1048576.0, g_pass_stats[2].exchange(0) / 300.0,
             g_pass_stats[3].exchange(0) / 300.0 / 1048576.0);
+        extern std::atomic<uint64_t> g_pass_why[7];
+        LOG("[gfx] last 300 frames: passes/frame ended by: other work %.1f, slice change %.1f, more targets %.1f, other depth %.1f, "
+            "sampling an attached target %.1f, other targets %.1f; %.1f passes/frame had at most one draw",
+            g_pass_why[0].exchange(0) / 300.0, g_pass_why[1].exchange(0) / 300.0, g_pass_why[2].exchange(0) / 300.0,
+            g_pass_why[3].exchange(0) / 300.0, g_pass_why[4].exchange(0) / 300.0, g_pass_why[5].exchange(0) / 300.0,
+            g_pass_why[6].exchange(0) / 300.0);
         extern std::atomic<uint64_t> g_copy_cpu, g_copy_cpu_bytes, g_copy_gpu, g_write_backs, g_write_back_bytes;
         uint64_t cond = 0, queries = wwhd_query_counts(&cond);
         extern uint64_t g_alpha_to_mask_draws;
@@ -807,6 +813,7 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
         if (!s->gpuWritten && !(a >= 0xF4000000 && a < 0xF6000000) && hits(s)) {
             s->lastCheckedFrame = ~0ull;
             s->dirty = true;
+            g_surface_gen++;
             g_stat_invalidated_surfaces++;
             static int lg = 0;
             if (logInval && lg++ < 300)

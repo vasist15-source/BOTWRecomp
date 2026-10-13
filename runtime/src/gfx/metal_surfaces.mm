@@ -39,8 +39,10 @@ static MTLTextureType texture_type(uint32_t dim, uint32_t slices) {
     }
 }
 
+uint64_t g_surface_gen = 1;
 uint64_t next_write_seq() {
     static uint64_t seq = 0;
+    g_surface_gen++;  // any surface written: sampled_texture's lookup cache starts over
     return ++seq;
 }
 
@@ -262,6 +264,7 @@ static Surface* rescale(Surface* s) {
     resample(old, t, s->fmt, old.textureType == MTLTextureType3D ? 1 : (uint32_t)layer_count(old));
     g_resample_why = nullptr;
     s->tex = t;
+    g_surface_gen++;
     forget_texture_views();
     if (getenv("WWHD_LOG_RESCALE"))
         LOG("[gfx] rescaled %08X %ux%u fmt %X to %lux%lu", s->addr, s->width, s->height, s->format, (unsigned long)t.width,
@@ -523,6 +526,7 @@ Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering) {
     Surface* raw = s.get();
     note_surface_range(raw, s->addr, std::max<uint32_t>(s->dataSize, s->pitch * s->height * 4));  // as invalidate's estimate
     R.surfaces.emplace(d.addr, std::move(s));
+    g_surface_gen++;
     // format views of one guest surface (adopt_newer_alias): flag them once, so lookups stay cheap
     if (!raw->isDepth && !raw->fmt.compressed && raw->fmt.convert == Convert::NONE) {
         auto views = R.surfaces.equal_range(d.addr);
@@ -649,6 +653,7 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
     auto* c = s->mipChain.get();
     if (c && (c->mips != mips || c->tex.width != w || c->tex.height != h || c->tex.pixelFormat != s->tex.pixelFormat)) {
         s->mipChain.reset(); c = nullptr;
+        g_surface_gen++;  // cached lookups may hold the old chain
     }
     if (R.binding) return c ? c : s; // prepared by draw's texture preflight, before opening its encoder
     if (!c) {
@@ -668,14 +673,39 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
         s->mipChain = std::move(chain); s->mipChainSeq = ~0ull;
     }
     if (s->mipChainSeq == key) return c;
+    // Only the levels whose source changed since the last build: the game renders its chain one level
+    // at a time and samples in between (bloom/blur), which used to rebuild every level after each one.
+    // A generated level (no game level) follows the level above it. Game levels of the companion's
+    // exact size are blit-copied; others (rounding differences, e.g. 360x201 vs 360x202) are resampled.
     end_encoder();
+    if (s->mipChainSeq == ~0ull) memset(s->mipLevelSeq, 0, sizeof s->mipLevelSeq);
+    bool redo[16] = {};
+    redo[0] = s->mipLevelSeq[0] != s->writeSeq;
+    for (uint32_t l = 1; l < mips; l++)
+        redo[l] = levels[l] ? s->mipLevelSeq[l] != levels[l]->writeSeq + 1 : (redo[l - 1] || s->mipLevelSeq[l] != 1);
+    auto exact = [&](uint32_t l) {
+        return levels[l] && levels[l]->tex && levels[l]->tex.pixelFormat == c->tex.pixelFormat &&
+               levels[l]->tex.width == std::max<NSUInteger>(w >> l, 1) && levels[l]->tex.height == std::max<NSUInteger>(h >> l, 1) &&
+               levels[l]->tex.textureType == MTLTextureType2D;
+    };
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-    [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
-        sourceSize:MTLSizeMake(w,h,1) toTexture:c->tex destinationSlice:0 destinationLevel:0
-        destinationOrigin:MTLOriginMake(0,0,0)];
+    if (redo[0])
+        [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(w,h,1) toTexture:c->tex destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0,0,0)];
+    for (uint32_t l = 1; l < mips; l++)
+        if (redo[l] && exact(l))
+            [b copyFromTexture:levels[l]->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(std::max<uint32_t>(w >> l, 1), std::max<uint32_t>(h >> l, 1), 1) toTexture:c->tex
+                destinationSlice:0 destinationLevel:l destinationOrigin:MTLOriginMake(0,0,0)];
     [b endEncoding];
+    s->mipLevelSeq[0] = s->writeSeq;
     uint32_t fromGame = 0;
     for (uint32_t l = 1; l < mips; l++) {
+        if (levels[l]) fromGame++;
+        if (!redo[l]) continue;
+        s->mipLevelSeq[l] = levels[l] ? levels[l]->writeSeq + 1 : 1;
+        if (exact(l)) continue;
         id<MTLTexture> dst = [c->tex newTextureViewWithPixelFormat:c->tex.pixelFormat textureType:MTLTextureType2D
             levels:NSMakeRange(l,1) slices:NSMakeRange(0,1)];
         id<MTLTexture> src = levels[l] ? levels[l]->tex :
@@ -686,7 +716,6 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
         g_resample_why = levels[l] ? "mip from game" : "mip";
         resample(src, dst, c->fmt, 1);
         g_resample_why = nullptr;
-        if (levels[l]) fromGame++;
     }
     s->mipChainSeq = key;
     static int logged = 0;
@@ -744,6 +773,7 @@ static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
               c->tex.textureType != (dim == Latte::E_DIM::DIM_CUBEMAP ? MTLTextureTypeCubeArray : MTLTextureType2DArray))) {
         s->layerArray.reset();
         c = nullptr;
+        g_surface_gen++;
     }
     if (R.binding) return c ? c : s;  // prepared by the draw's texture preflight, before its encoder opened
     if (dim == Latte::E_DIM::DIM_CUBEMAP && (d.slices % 6 || w != h)) return s;
@@ -793,7 +823,33 @@ static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
     return c;
 }
 
+static Surface* sampled_texture_uncached(const uint32_t* w, bool isDepthSampler);
+
+// Draws look up the same few textures over and over (BotW: thousands of draws a frame, a handful of
+// texture descriptors each). The answer only changes when a surface is created, written (CPU upload
+// or GPU render: next_write_seq), invalidated or rescaled, or a new frame starts (the once-a-frame CPU
+// write check): until then a lookup with the same descriptor words returns the same surface.
+// Not while binding (lookups there skip the companion blits). WWHD_NO_TEX_CACHE=1: off.
 Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
+    static const bool off = getenv("WWHD_NO_TEX_CACHE") != nullptr || getenv("WWHD_TRACE_TEX") != nullptr;
+    if (off || R.binding) return sampled_texture_uncached(w, isDepthSampler);
+    struct Entry { uint32_t w[6]; bool depth; uint64_t gen, frame; Surface* s; };
+    static Entry cache[512];
+    uint64_t h = (uint64_t)w[2] * 0x9E3779B97F4A7C15ull ^ (uint64_t)w[0] * 0xC2B2AE3D27D4EB4Full ^ w[1] ^ ((uint64_t)w[4] << 32) ^ w[5] ^
+                 ((uint64_t)w[3] << 17) ^ isDepthSampler;
+    Entry& e = cache[(h ^ (h >> 29)) & 511];
+    if (e.gen == g_surface_gen && e.frame == R.frame && e.depth == isDepthSampler && !memcmp(e.w, w, sizeof e.w)) return e.s;
+    Surface* s = sampled_texture_uncached(w, isDepthSampler);
+    // the lookup itself may have written surfaces (uploads, companion copies): cache against the generation after it
+    memcpy(e.w, w, sizeof e.w);
+    e.depth = isDepthSampler;
+    e.gen = g_surface_gen;
+    e.frame = R.frame;
+    e.s = s;
+    return s;
+}
+
+static Surface* sampled_texture_uncached(const uint32_t* w, bool isDepthSampler) {
     Latte::LATTE_SQ_TEX_RESOURCE_WORD0_N w0;
     Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N w1;
     Latte::LATTE_SQ_TEX_RESOURCE_WORD4_N w4;
@@ -1428,6 +1484,7 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
     for (auto it = dr.first; it != dr.second; ++it) {
         it->second->lastCheckedFrame = ~0ull;
         it->second->dirty = true;
+        g_surface_gen++;
     }
 }
 
@@ -1441,6 +1498,7 @@ void ss_reset_surfaces() {
     for (auto& [a, s] : R.surfaces) {
         s->dirty = true;
         s->lastCheckedFrame = ~0ull;
+        g_surface_gen++;
     }
 }
 }  // namespace gfx

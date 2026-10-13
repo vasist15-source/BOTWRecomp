@@ -35,6 +35,7 @@ id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr);
 struct Surface {
     std::shared_ptr<Surface> mipChain; // sampled companion assembled from GPU-rendered levels
     uint64_t mipChainSeq = ~0ull;
+    uint64_t mipLevelSeq[16] = {};      // per companion level: the source write it was built from (0: never)
     std::shared_ptr<Surface> layerArray; // sampled companion: an array assembled from GPU-rendered layers
     uint64_t layerArraySeq = ~0ull;
     id<MTLTexture> tex = nil;
@@ -76,6 +77,7 @@ struct Screen {
 };
 
 uint64_t next_write_seq();
+extern uint64_t g_surface_gen;  // bumped whenever any surface changes (sampled_texture lookup cache)
 inline void mark_gpu_written(Surface* s) { s->gpuWritten = true; s->writeSeq = next_write_seq(); }
 
 struct Renderer {
