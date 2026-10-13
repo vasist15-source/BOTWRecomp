@@ -1397,6 +1397,79 @@ static uint64_t g_streamout_draws = 0, g_streamout_notarget = 0;  // the latter:
 static Surface* g_unit_tex[2][18];
 static bool g_unit_tex_valid[2][18];
 
+// What the current render encoder has bound, so draws skip rebinding what the previous draw left in
+// place (each Metal set call costs driver time; most draws rebind the same textures, samplers and
+// buffers). Command buffers retain what they reference, so a pointer can't be reused within one.
+// Reset whenever a new encoder starts (g_enc_serial).
+static uint64_t g_enc_serial = 0;
+namespace {
+struct BindCache {
+    static constexpr int kSlots = 31;
+    uint64_t serial = ~0ull;
+    const void* pipe = nullptr;
+    const void* depthState = nullptr;
+    const void* tex[2][kSlots];
+    const void* smp[2][16];
+    const void* buf[2][kSlots];  // kBytes: bound with set*Bytes, contents in bytes[]
+    NSUInteger off[2][kSlots];
+    std::vector<uint8_t> bytes[2][kSlots];
+};
+}  // namespace
+static BindCache g_bc;
+static const void* const kBytes = (const void*)1;
+static inline void bc_sync() {
+    if (g_bc.serial == g_enc_serial) return;
+    g_bc.serial = g_enc_serial;
+    g_bc.pipe = g_bc.depthState = nullptr;
+    memset(g_bc.tex, 0, sizeof g_bc.tex);
+    memset(g_bc.smp, 0, sizeof g_bc.smp);
+    memset(g_bc.buf, 0, sizeof g_bc.buf);
+}
+static inline void bc_texture(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLTexture> tex, uint32_t i) {
+    if (i < BindCache::kSlots) {
+        const void* p = (__bridge const void*)tex;
+        if (g_bc.tex[!vertex][i] == p) return;
+        g_bc.tex[!vertex][i] = p;
+    }
+    if (vertex) [enc setVertexTexture:tex atIndex:i];
+    else [enc setFragmentTexture:tex atIndex:i];
+}
+static inline void bc_sampler(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLSamplerState> smp, uint32_t i) {
+    if (i < 16) {
+        const void* p = (__bridge const void*)smp;
+        if (g_bc.smp[!vertex][i] == p) return;
+        g_bc.smp[!vertex][i] = p;
+    }
+    if (vertex) [enc setVertexSamplerState:smp atIndex:i];
+    else [enc setFragmentSamplerState:smp atIndex:i];
+}
+static inline void bc_buffer(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLBuffer> buf, NSUInteger off, uint32_t i) {
+    if (i < BindCache::kSlots) {
+        const void* p = (__bridge const void*)buf;
+        if (g_bc.buf[!vertex][i] == p) {
+            if (g_bc.off[!vertex][i] == off) return;
+            g_bc.off[!vertex][i] = off;
+            if (vertex) [enc setVertexBufferOffset:off atIndex:i];
+            else [enc setFragmentBufferOffset:off atIndex:i];
+            return;
+        }
+        g_bc.buf[!vertex][i] = p;
+        g_bc.off[!vertex][i] = off;
+    }
+    if (vertex) [enc setVertexBuffer:buf offset:off atIndex:i];
+    else [enc setFragmentBuffer:buf offset:off atIndex:i];
+}
+static inline void bc_bytes(id<MTLRenderCommandEncoder> enc, bool vertex, const void* data, size_t n, uint32_t i) {
+    if (i < BindCache::kSlots) {
+        auto& last = g_bc.bytes[!vertex][i];
+        if (g_bc.buf[!vertex][i] == kBytes && last.size() == n && !memcmp(last.data(), data, n)) return;
+        g_bc.buf[!vertex][i] = kBytes;
+        last.assign((const uint8_t*)data, (const uint8_t*)data + n);
+    }
+    if (vertex) [enc setVertexBytes:data length:n atIndex:i];
+    else [enc setFragmentBytes:data length:n atIndex:i];
+}
+
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
     float texScale[18][2];
@@ -1446,18 +1519,12 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             extraCount = std::max<uint32_t>(extraCount, binding - MAX_MTL_SAMPLERS + 1);
             smp = nil;
         }
-        if (vertex) {
-            [enc setVertexTexture:tex atIndex:binding];
-            if (smp) [enc setVertexSamplerState:smp atIndex:binding];
-        } else {
-            [enc setFragmentTexture:tex atIndex:binding];
-            if (smp) [enc setFragmentSamplerState:smp atIndex:binding];
-        }
+        bc_texture(enc, vertex, tex, binding);
+        if (smp) bc_sampler(enc, vertex, smp, binding);
     }
     if (extraCount) {
         Upload u = upload(extraSamplers, (uint32_t)sizeof extraSamplers);
-        if (vertex) [enc setVertexBuffer:u.buf offset:u.offset atIndex:MTL_EXTRA_SAMPLER_BUFFER];
-        else [enc setFragmentBuffer:u.buf offset:u.offset atIndex:MTL_EXTRA_SAMPLER_BUFFER];
+        bc_buffer(enc, vertex, u.buf, u.offset, MTL_EXTRA_SAMPLER_BUFFER);
     }
 
     // support buffer (uniform registers, remapped uniforms, helper values)
@@ -1529,17 +1596,15 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             sz[1] = (regs[REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS + t * 7 + 1] & 0x1FFF) + 1;
         }
         if (buf.size() <= 4096) {
-            if (vertex) [enc setVertexBytes:buf.data() length:buf.size() atIndex:rm.uniformVarsBufferBindingPoint];
-            else [enc setFragmentBytes:buf.data() length:buf.size() atIndex:rm.uniformVarsBufferBindingPoint];
+            bc_bytes(enc, vertex, buf.data(), buf.size(), rm.uniformVarsBufferBindingPoint);
         } else {
             Upload u = upload(buf.data(), (uint32_t)buf.size());
-            if (vertex) [enc setVertexBuffer:u.buf offset:u.offset atIndex:rm.uniformVarsBufferBindingPoint];
-            else [enc setFragmentBuffer:u.buf offset:u.offset atIndex:rm.uniformVarsBufferBindingPoint];
+            bc_buffer(enc, vertex, u.buf, u.offset, rm.uniformVarsBufferBindingPoint);
         }
     }
 
     if (vertex && g_so.active && rm.tfStorageBindingPoint >= 0 && g_so.buf)
-        [enc setVertexBuffer:g_so.buf offset:0 atIndex:rm.tfStorageBindingPoint];
+        bc_buffer(enc, true, g_so.buf, 0, rm.tfStorageBindingPoint);
 
     // uniform blocks: snapshot at draw time. Our GPU runs a frame after the CPU built it, and games
     // rewrite uniform memory between draws, so binding guest memory directly shows later values.
@@ -1554,11 +1619,9 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         if (!gb) continue;
         if (g_snapshot) {
             Upload u = upload(mem::ptr(addr), size);
-            if (vertex) [enc setVertexBuffer:u.buf offset:u.offset atIndex:binding];
-            else [enc setFragmentBuffer:u.buf offset:u.offset atIndex:binding];
+            bc_buffer(enc, vertex, u.buf, u.offset, binding);
         } else {
-            if (vertex) [enc setVertexBuffer:gb offset:off atIndex:binding];
-            else [enc setFragmentBuffer:gb offset:off atIndex:binding];
+            bc_buffer(enc, vertex, gb, off, binding);
         }
     }
 }
@@ -1856,6 +1919,7 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
     }
     occl_attach(rp);
     R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    g_enc_serial++;
     occl_new_encoder();
     for (int i = 0; i < 8; i++) {
         R.passColor[i] = colors[i];
@@ -2561,8 +2625,16 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (!pipe) { g_skip[SK_PIPE_COMPILING]++; return; }
     rprof::mark(rprof::kPipeline);
     id<MTLRenderCommandEncoder> enc = R.enc;
-    [enc setRenderPipelineState:pipe];
-    [enc setDepthStencilState:get_depth_state(regs, depth != nullptr)];
+    bc_sync();
+    if (g_bc.pipe != (__bridge const void*)pipe) {
+        g_bc.pipe = (__bridge const void*)pipe;
+        [enc setRenderPipelineState:pipe];
+    }
+    id<MTLDepthStencilState> dss = get_depth_state(regs, depth != nullptr);
+    if (g_bc.depthState != (__bridge const void*)dss) {
+        g_bc.depthState = (__bridge const void*)dss;
+        [enc setDepthStencilState:dss];
+    }
     LATTE_DB_STENCILREFMASK sf;
     LATTE_DB_STENCILREFMASK_BF sb;
     uint32_t rf = regs[REGADDR::DB_STENCILREFMASK], rb = regs[REGADDR::DB_STENCILREFMASK_BF];
@@ -2631,9 +2703,9 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         if (!b) continue;
         if (g_snapshot && size <= kSnapshotLimit) {
             Upload u = upload(mem::ptr(addr), size);
-            [enc setVertexBuffer:u.buf offset:u.offset atIndex:GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex)];
+            bc_buffer(enc, true, u.buf, u.offset, GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex));
         } else {
-            [enc setVertexBuffer:b offset:off atIndex:GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex)];
+            bc_buffer(enc, true, b, off, GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex));
         }
     }
     rprof::mark(rprof::kVertex);
@@ -2654,10 +2726,11 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             }
         }
         // debug (WWHD_MSL_PATCH): a patched shader can write values to buffer 30; logged at each swap
-        if (getenv("WWHD_MSL_PATCH")) {
+        static const bool debugValues = getenv("WWHD_MSL_PATCH") != nullptr;
+        if (debugValues) {
             extern id<MTLBuffer> g_debug_values;
             if (!g_debug_values) g_debug_values = [R.device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
-            [enc setFragmentBuffer:g_debug_values offset:0 atIndex:30];
+            bc_buffer(enc, false, g_debug_values, 0, 30);
         }
         R.binding = true;
         bind_stage(enc, regs, vs, true, colors);

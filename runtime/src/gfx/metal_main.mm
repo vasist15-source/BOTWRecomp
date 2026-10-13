@@ -777,7 +777,8 @@ extern uint64_t g_stat_invalidates, g_stat_invalidated_surfaces;
 void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
     g_stat_invalidates++;
     static int logged = 0;
-    if (getenv("WWHD_LOG_INVALIDATE") && (flags & 0x2) && logged++ < 400)
+    static const bool logInval = getenv("WWHD_LOG_INVALIDATE") != nullptr;
+    if (logInval && (flags & 0x2) && logged++ < 400)
         LOG("[inval] frame %llu flags %X addr %08X size %X", (unsigned long long)R.frame, flags, addr, size);
     // GX2_INVALIDATE_MODE_TEXTURE (0x2): the CPU wrote texture data; force a full check of surfaces in
     // range on next use. Uniform/attribute/shader invalidations need nothing here.
@@ -808,7 +809,7 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
             s->dirty = true;
             g_stat_invalidated_surfaces++;
             static int lg = 0;
-            if (getenv("WWHD_LOG_INVALIDATE") && lg++ < 300)
+            if (logInval && lg++ < 300)
                 LOG("[inval]   marks %08X %ux%u fmt %X size %X (range %08X+%X)", a, s->width, s->height, s->format, s->dataSize, addr, size);
         }
     };

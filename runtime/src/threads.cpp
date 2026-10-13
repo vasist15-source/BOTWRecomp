@@ -188,9 +188,16 @@ static void core_acquire(HostThread* t) {
     auto start = std::chrono::steady_clock::now();
     t->acquired = start;
     t->ready_since = start;
-    bool warned = false;
+    bool warned = false, waited = false;
     while (k.owner || best_ready(k) != t) {
+        waited = true;
+#ifdef __APPLE__
+        // relative timeout: no wall/steady clock reads per wait (wait_for converts through both)
+        const timespec rel{2, 0};
+        pthread_cond_timedwait_relative_np(k.cv.native_handle(), lk.mutex()->native_handle(), &rel);
+#else
         k.cv.wait_for(lk, std::chrono::seconds(2));
+#endif
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(10)) {
             warned = true;
             std::string a = mem::read_cstr(ld32(t->guest + osthread::kName));
@@ -204,9 +211,11 @@ static void core_acquire(HostThread* t) {
     k.owner = t;
     t->holds_core = true;
     t->held_core = core;
-    auto now = std::chrono::steady_clock::now();
-    t->wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
-    t->acquired = now;
+    if (waited) {
+        auto now = std::chrono::steady_clock::now();
+        t->wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+        t->acquired = now;
+    }
     t->cpu.core = core;
     HostThread* next = best_ready(k);
     g_core_preempt[core] = next && next->prio < t->prio;

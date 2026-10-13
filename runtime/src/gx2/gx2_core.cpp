@@ -228,17 +228,33 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
                 shaderKeyDirtyStats.avoidedBumps += baselineBump && !actualBump;
                 shaderKeyDirtyStats.maskedWords += maskedWords;
             }
+            memcpy(&g_regs[first], v, n * 4);
         } else
 #endif
-        for (uint32 i = 0; i < n; i++)
-            if (g_regs[first + i] != v[i] && !shader_irrelevant(first + i) && metal_key_changes(first + i, g_regs[first + i], v[i])) {
-                g_shader_state_gen++;
-                note_gen_bump(first + i);
-                break;
-            }
-        memcpy(&g_regs[first], v, n * 4);
+        {
+            // one pass over the changed span: the shader-generation check (constants and uniform/attribute
+            // block words skip it by table) and only the changed words copied
+            static uint8_t keyReg[kNumRegs];
+            static const bool keyRegInit = [] {
+                for (uint32 r = 0; r < kNumRegs; r++) keyReg[r] = !shader_irrelevant(r);
+                return true;
+            }();
+            (void)keyRegInit;
+            uint32 lo = 0;
+            while (g_regs[first + lo] == v[lo]) lo++;  // memcmp found a difference
+            uint32 hi = n - 1;
+            while (g_regs[first + hi] == v[hi]) hi--;
+            bool bumped = false;
+            for (uint32 i = lo; i <= hi && !bumped; i++)
+                if (g_regs[first + i] != v[i] && keyReg[first + i] && metal_key_changes(first + i, g_regs[first + i], v[i])) {
+                    g_shader_state_gen++;
+                    note_gen_bump(first + i);
+                    bumped = true;
+                }
+            memcpy(&g_regs[first + lo], v + lo, (hi - lo + 1) * 4);
+        }
     }
-    if (g_shadow) memcpy(&g_shadow[first], v, n * 4);
+    if (g_shadow && g_shadow != v) memcpy(&g_shadow[first], v, n * 4);
 }
 
 // ---------------------------------------------------------------- display list recording
@@ -848,7 +864,8 @@ void fps_frame() {
     g_fps_gameplay = gameplay;
     const double avg = (hist[0] + hist[1] + hist[2] + hist[3]) / 4;
     static int dbg = 0;
-    if (getenv("WWHD_FPS_DEBUG") && (++dbg % 120) == 0)
+    static const bool fpsDebug = getenv("WWHD_FPS_DEBUG") != nullptr;
+    if (fpsDebug && (++dbg % 120) == 0)
         LOG("[fps] engine at frame end: pending %.3f live %.3f delta frames %.3f; %llu draws, gameplay %d", get_f32(a + 0x0C),
             get_f32(a + 0x18), get_f32(a + 0x50), (unsigned long long)frameDraws, gameplay);
     static const double maxRatio = getenv("WWHD_FPS_MAX_STEP") ? atof(getenv("WWHD_FPS_MAX_STEP")) : 1.5;  // 20 fps
@@ -1393,7 +1410,8 @@ HLE(gx2, GX2WaitForVsync) {
     std::lock_guard<std::mutex> lk(g_flip_mutex);
     update_flips();
     static uint64_t calls = 0;
-    if (getenv("WWHD_LOG_VSYNC") && ++calls % 60 == 0)
+    static const bool logVsync = getenv("WWHD_LOG_VSYNC") != nullptr;
+    if (logVsync && ++calls % 60 == 0)
         LOG("[gx2] vsync %llu: swaps %llu flips %llu pending %zu", (unsigned long long)vsync_index(),
             (unsigned long long)g_swap_count, (unsigned long long)g_flip_count, g_pending_flips.size());
 }
