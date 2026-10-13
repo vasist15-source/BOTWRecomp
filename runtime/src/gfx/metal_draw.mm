@@ -107,15 +107,21 @@ static void capture_full(Surface* s) {
     if (g_full_dumps.size() >= 48 || s->tex.width * s->tex.height > 2048u * 2048u) return;
     g_full_dumps.push_back({s->tex, s->addr, s->format, s->fmt.hostBytesPerBlock});
 }
+static void dump_full_now(const FullDump& d, const std::string& prefix);
 void capture_flush_full_dumps() {
     if (g_full_dumps.empty()) return;
-    const std::string dir = g_capture_dir;
-    for (auto& d : g_full_dumps) {
+    for (auto& d : g_full_dumps) dump_full_now(d, g_capture_dir + "/full_");
+    LOG("[capture] %zu GPU textures dumped in full (all slices and levels)", g_full_dumps.size());
+    g_full_dumps.clear();
+}
+// raw texels of every slice and level as they are now (blits queued on the frame's command buffer)
+static void dump_full_now(const FullDump& d, const std::string& prefix) {
+    {
         id<MTLTexture> t = d.tex;
         const bool is3D = t.textureType == MTLTextureType3D;
         const NSUInteger layers = is3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
         const NSUInteger bpp = d.bpp;
-        if (!bpp) { LOG("[capture] %08X: pixel format %lu not dumped", d.addr, (unsigned long)t.pixelFormat); continue; }
+        if (!bpp) { LOG("[capture] %08X: pixel format %lu not dumped", d.addr, (unsigned long)t.pixelFormat); return; }
         for (NSUInteger m = 0; m < t.mipmapLevelCount && m < 6; m++)
             for (NSUInteger sl = 0; sl < layers && sl < 16; sl++) {
                 const NSUInteger w = std::max<NSUInteger>(t.width >> m, 1), h = std::max<NSUInteger>(t.height >> m, 1);
@@ -126,7 +132,7 @@ void capture_flush_full_dumps() {
                              toBuffer:b destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:size];
                 [blit endEncoding];
                 char name[256];
-                snprintf(name, sizeof name, "%s/full_%08X_f%X_s%lu_m%lu_%lux%lu_pf%lu.raw", dir.c_str(), d.addr, d.format, (unsigned long)sl,
+                snprintf(name, sizeof name, "%s%08X_f%X_s%lu_m%lu_%lux%lu_pf%lu.raw", prefix.c_str(), d.addr, d.format, (unsigned long)sl,
                          (unsigned long)m, (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat);
                 std::string file = name;
                 [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
@@ -134,8 +140,6 @@ void capture_flush_full_dumps() {
                 }];
             }
     }
-    LOG("[capture] %zu GPU textures dumped in full (all slices and levels)", g_full_dumps.size());
-    g_full_dumps.clear();
 }
 
 // fast 64-bit hash over 8-byte words (tail handled bytewise)
@@ -3048,6 +3052,17 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         static std::set<std::string> done;
         static std::string doneDir;
         if (doneDir != g_capture_dir) { done.clear(); doneDir = g_capture_dir; }
+        // the inputs of full-screen passes at screen size, raw (NaN and every level visible) as they are at this draw
+        if (colors[0]->width >= 1280) {
+            end_encoder();
+            char pre[200];
+            snprintf(pre, sizeof pre, "%s/in_%04llu_", g_capture_dir.c_str(), (unsigned long long)thisDraw);
+            for (int k = 0; k < g_draw_sampled_n; k++) {
+                Surface* t = g_draw_sampled[k];
+                if (t && t->tex && !t->fmt.compressed && !t->fmt.depth && t->tex.width * t->tex.height <= 2560u * 1440u)
+                    dump_full_now({t->tex, t->addr, t->format, t->fmt.hostBytesPerBlock}, pre);
+            }
+        }
         for (int k = 0; k < g_draw_sampled_n; k++) {
             Surface* t = g_draw_sampled[k];
             if (!t || !t->tex) continue;
