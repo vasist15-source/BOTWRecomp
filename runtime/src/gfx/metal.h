@@ -66,6 +66,7 @@ struct Surface {
     float scale = 1.0f;        // the resolution factor the texture was made for
     float ax = 1.0f, ay = 1.0f;  // ... and the aspect-ratio factors (screen-shaped targets, metal_surfaces.mm)
     float sx = 1.0f, sy = 1.0f;
+    float minScale = 0.0f;  // at least this factor: a depth buffer drawn with colour targets scaled more (match_depth_scale)
 };
 
 // A display output: the TV or the GamePad screen, each in its own window.
@@ -77,6 +78,7 @@ struct Screen {
 };
 
 uint64_t next_write_seq();
+Surface* match_depth_scale(Surface* depth, const Surface* color);
 extern uint64_t g_surface_gen;  // bumped whenever any surface changes (sampled_texture lookup cache)
 inline void mark_gpu_written(Surface* s) { s->gpuWritten = true; s->writeSeq = next_write_seq(); }
 

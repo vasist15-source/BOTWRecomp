@@ -114,7 +114,9 @@ static bool screen_shaped(const Surface* s) {
 // shadow edges at 2x in v0.2.6-v0.2.8 came mainly from the missing mip chains the game's
 // shadow-mask softening samples (restored in v0.2.9); since then both sizes give practically the
 // same soft edges, the larger maps only a hair crisper.
-static float target_scale(const Surface* s) {
+static float target_scale_rules(const Surface* s);
+static float target_scale(const Surface* s) { return std::max(target_scale_rules(s), s->minScale); }
+static float target_scale_rules(const Surface* s) {
     uint32_t width,height;
     if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
     if (s->fmt.compressed || s->mips > 1) return 1.0f;
@@ -270,6 +272,22 @@ static Surface* rescale(Surface* s) {
         LOG("[gfx] rescaled %08X %ux%u fmt %X to %lux%lu", s->addr, s->width, s->height, s->format, (unsigned long)t.width,
             (unsigned long)t.height);
     return s;
+}
+
+// A depth buffer drawn together with a colour target that is scaled more than it (the pack's rules
+// scale some colour formats at a size whose depth format they leave alone) would not fit the pass:
+// Metal needs matching sizes, and the draw ran without depth (no depth test or write; BotW's water
+// surface never reached the depth buffer at 2x: white water). The depth buffer follows the colour
+// target's factor from then on. Only when its guest size covers the colour target's.
+Surface* match_depth_scale(Surface* depth, const Surface* color) {
+    if (!depth || !color || depth->width < color->width || depth->height < color->height) return depth;
+    if (color->scale <= depth->scale || depth->minScale >= color->scale) return depth;
+    depth->minScale = color->scale;
+    static int logged = 0;
+    if (logged++ < 20)
+        LOG("[gfx] depth %08X %ux%u f%X scaled %gx to match colour %08X %ux%u f%X", depth->addr, depth->width, depth->height,
+            depth->format, color->scale, color->addr, color->width, color->height, color->format);
+    return rescale(depth);
 }
 
 // fullscreen-triangle copy with filtering; one pipeline per destination format

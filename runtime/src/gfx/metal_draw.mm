@@ -2584,6 +2584,9 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     float kx = 1.0f, ky = 1.0f;
     for (auto* c : colors)
         if (c) { w = (uint32_t)c->tex.width; h = (uint32_t)c->tex.height; kx = c->sx; ky = c->sy; break; }
+    if (depth && w && (depth->tex.width < w || depth->tex.height < h))
+        for (auto* c : colors)
+            if (c) { depth = match_depth_scale(depth, c); break; }
     if (depth && w && (depth->tex.width < w || depth->tex.height < h)) { depth = nullptr; g_skip[SK_DROPPED_DEPTH]++; }
     if (!w && depth) { w = (uint32_t)depth->tex.width; h = (uint32_t)depth->tex.height; kx = depth->sx; ky = depth->sy; }
     for (auto& c : colors)
