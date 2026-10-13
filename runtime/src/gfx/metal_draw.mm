@@ -2907,6 +2907,46 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         snprintf(name, sizeof name, "ps_%08X_%llu.png", dumpPS, (unsigned long long)thisDraw);
         for (auto* c : colors) if (c) { dump_texture(c->tex, name, false, false); break; }
     }
+    // F12 capture: the main depth buffer's value at the screen centre after every draw that has it bound
+    // (captures/<time>/depthprobe.log: draw, shaders, value), to find which draw writes a surface there.
+    // Ends the pass after each such draw in the captured frame only.
+    if (capturing() && depth && depth->tex && depth->width == 1280 && depth->height == 720 && !depth->tex.isFramebufferOnly) {
+        static id<MTLBuffer> probe = nil;
+        static uint32_t slot = 0;
+        static uint64_t probeFrame = ~0ull;
+        if (!probe) probe = [R.device newBufferWithLength:8192 * 16 options:MTLResourceStorageModeShared];
+        if (probeFrame != R.frame) { probeFrame = R.frame; slot = 0; }
+        if (slot < 8192) {
+            const MTLPixelFormat pf = depth->tex.pixelFormat;
+            const bool d32 = pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatDepth32Float_Stencil8;
+            const bool d16 = pf == MTLPixelFormatDepth16Unorm;
+            if (d32 || d16) {
+                end_encoder();
+                id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+                const uint32_t off = slot++ * 16;
+                [b copyFromTexture:depth->tex sourceSlice:depthSlice sourceLevel:0
+                      sourceOrigin:MTLOriginMake(depth->tex.width / 2, depth->tex.height / 2, 0) sourceSize:MTLSizeMake(1, 1, 1)
+                          toBuffer:probe destinationOffset:off destinationBytesPerRow:16 destinationBytesPerImage:16
+                           options:pf == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone];
+                [b endEncoding];
+                std::string file = g_capture_dir + "/depthprobe.log";
+                char meta[200];
+                snprintf(meta, sizeof meta, "draw %llu VS %08X PS %08X count %u DB %08X tex %lux%lu depthctl %08X CB0 %08X",
+                         (unsigned long long)thisDraw, regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, count, depth->addr,
+                         (unsigned long)depth->tex.width, (unsigned long)depth->tex.height, regs[REGADDR::DB_DEPTH_CONTROL],
+                         regs[mmCB_COLOR0_BASE]);
+                std::string m = meta;
+                id<MTLBuffer> pb = probe;
+                [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+                    const uint8_t* p = (const uint8_t*)pb.contents + off;
+                    float v;
+                    if (d16) v = *(const uint16_t*)p / 65535.0f;
+                    else memcpy(&v, p, 4);
+                    if (FILE* f = fopen(file.c_str(), "a")) { fprintf(f, "%s depth %.7f\n", m.c_str(), v); fclose(f); }
+                }];
+            }
+        }
+    }
     if (capturing() && count <= 6 && colors[0]) {  // full-screen pass
         void dump_texture(id<MTLTexture>, const char*, bool, bool);
         char name[160];
