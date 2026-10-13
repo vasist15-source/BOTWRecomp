@@ -1,3 +1,4 @@
+#include <map>
 #include <chrono>
 #include "perf_metrics.h"
 #include "gfx/capture_schedule.h"
@@ -729,6 +730,29 @@ void swap() {
         LOG("[gfx] last 300 frames: %.0f render passes/frame (%.0f MiB loaded+stored), %.0f of them reopen the previous pass's targets (%.0f MiB)",
             g_pass_stats[0].exchange(0) / 300.0, g_pass_stats[1].exchange(0) / 300.0 / 1048576.0, g_pass_stats[2].exchange(0) / 300.0,
             g_pass_stats[3].exchange(0) / 300.0 / 1048576.0);
+        // addresses with more than one surface (one guest buffer, several textures): which one a draw renders
+        // to and which one a later pass samples can differ. Logged every 1800 frames.
+        if (R.frame % 1800 == 1) {
+            std::map<uint32_t, std::vector<Surface*>> multi;
+            for (auto& [a, sp] : R.surfaces) multi[a].push_back(sp.get());
+            int lines = 0;
+            for (auto& [a, v] : multi) {
+                if (v.size() < 2 || lines >= 60) continue;
+                bool gpu = false;
+                for (auto* x : v) gpu = gpu || x->gpuWritten;
+                if (!gpu) continue;
+                std::string line;
+                char b[160];
+                for (auto* x : v) {
+                    snprintf(b, sizeof b, " [%ux%ux%u f%X%s mips %u %s seq %llu tex %lux%lu]", x->width, x->height, x->slices, x->format,
+                             x->isDepth ? " depth" : "", x->mips, x->gpuWritten ? "gpu" : "cpu", (unsigned long long)x->writeSeq,
+                             x->tex ? (unsigned long)x->tex.width : 0, x->tex ? (unsigned long)x->tex.height : 0);
+                    line += b;
+                }
+                LOG("[alias] %08X:%s", a, line.c_str());
+                lines++;
+            }
+        }
         extern std::atomic<uint64_t> g_pass_why[7];
         LOG("[gfx] last 300 frames: passes/frame ended by: other work %.1f, slice change %.1f, more targets %.1f, other depth %.1f, "
             "sampling an attached target %.1f, other targets %.1f; %.1f passes/frame had at most one draw",
