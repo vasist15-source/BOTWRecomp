@@ -16,6 +16,7 @@ struct ShaderKeyDirtyStats {
 };
 ShaderKeyDirtyStats shader_key_dirty_stats(); // Render-thread diagnostics.
 uint32_t color_buffer_address(const GX2::GX2ColorBuffer* cb);
+uint32_t depth_buffer_address(const GX2::GX2DepthBuffer* db);
 LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fetch "program"
 // Uncapped (debug only: settings overlay > Graphics; WWHD_UNCAPPED=1 for any renderer, and the older
 // WWHD_VK_UNCAPPED=1 with Vulkan): flips no longer wait for the virtual vsync and presentation no

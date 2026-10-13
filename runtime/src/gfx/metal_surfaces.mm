@@ -1,6 +1,5 @@
 #include <set>
 #include <chrono>
-#include "gfx/render_mips.h"
 #include "mods/cemu_pack.h"
 #include <tuple>
 #include <atomic>
@@ -39,10 +38,8 @@ static MTLTextureType texture_type(uint32_t dim, uint32_t slices) {
     }
 }
 
-uint64_t g_surface_gen = 1;
 uint64_t next_write_seq() {
     static uint64_t seq = 0;
-    g_surface_gen++;  // any surface written: sampled_texture's lookup cache starts over
     return ++seq;
 }
 
@@ -119,7 +116,7 @@ static float target_scale(const Surface* s) { return std::max(target_scale_rules
 static float target_scale_rules(const Surface* s) {
     uint32_t width,height;
     if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
-    if (s->fmt.compressed || s->mips > 1) return 1.0f;
+    if (s->fmt.compressed) return 1.0f;
     static const float shadow = getenv("WWHD_SHADOW_SCALE") ? parse_scale(getenv("WWHD_SHADOW_SCALE")) : 0.0f;
     static const bool shadow_logged = [] {  // issue #67: show that the switch was picked up
         if (shadow) LOG("[gfx] WWHD_SHADOW_SCALE=%g: shadow maps at %gx the console's 1024x1024", shadow, shadow);
@@ -215,33 +212,33 @@ static void target_aspect(const Surface* s, float& kx, float& ky) {
     ky = on ? g_aspect_ky : 1.0f;
 }
 
-static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, bool forRendering, float scale, float ax = 1.0f, float ay = 1.0f) {
-    // render targets: 2D, 2D arrays and volumes (rendered slice by slice: the game's colour-grading volumes)
-    if (forRendering && type != MTLTextureType2DArray && type != MTLTextureType3D) type = MTLTextureType2D;
+static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, float scale, float ax = 1.0f, float ay = 1.0f) {
     bool is1D = type == MTLTextureType1D || type == MTLTextureType1DArray;
     uint32_t pw = s->width, ph = s->height;
     // volumes keep the guest size (they are sampled as lookup tables, not shown)
-    if ((scale != 1.0f || ax != 1.0f || ay != 1.0f) && !is1D && type != MTLTextureType3D) {
+    if ((scale != 1.0f || ax != 1.0f || ay != 1.0f) && !is1D && type != MTLTextureType3D && !s->fmt.compressed) {
         pw = (uint32_t)std::ceil(s->width * scale * ax - 0.01f);
         ph = (uint32_t)std::ceil(s->height * scale * ay - 0.01f);
     } else {
         scale = 1.0f;
         ax = ay = 1.0f;
     }
+    if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) ph = pw;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType = type;
     td.pixelFormat = s->fmt.pixel;
     td.width = pw;
     td.height = is1D ? 1 : ph;
     td.depth = type == MTLTextureType3D ? s->slices : 1;
-    td.arrayLength = (type == MTLTextureType2DArray || type == MTLTextureType1DArray) ? s->slices : 1;
-    if (type == MTLTextureTypeCube) td.arrayLength = 1;
-    td.mipmapLevelCount = s->mips;
+    td.arrayLength = (type == MTLTextureType2DArray || type == MTLTextureType1DArray) ? s->slices
+                     : type == MTLTextureTypeCubeArray ? s->slices / 6 : 1;
+    td.mipmapLevelCount = is1D ? 1 : s->mips;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | format_view_usage();
     td.storageMode = MTLStorageModePrivate;
-    if (s->fmt.compressed) td.usage = MTLTextureUsageShaderRead | format_view_usage();
+    if (s->fmt.compressed || is1D) td.usage = MTLTextureUsageShaderRead | format_view_usage();
     id<MTLTexture> t = [R.device newTextureWithDescriptor:td];
     if (t) {
+        if (is1D) s->mips = 1;
         s->scale = scale;
         s->ax = ax;
         s->ay = ay;
@@ -259,14 +256,13 @@ static Surface* rescale(Surface* s) {
     if ((s->scale == want && s->ax == ax && s->ay == ay) || !s->tex || s->tex.textureType == MTLTextureType3D) return s;
     id<MTLTexture> old = s->tex;
     float osx = s->sx, osy = s->sy, oscale = s->scale, oax = s->ax, oay = s->ay;
-    id<MTLTexture> t = make_texture(s, old.textureType, true, want, ax, ay);
+    id<MTLTexture> t = make_texture(s, old.textureType, want, ax, ay);
     if (!t) { s->sx = osx; s->sy = osy; s->scale = oscale; s->ax = oax; s->ay = oay; return s; }
     end_encoder();
     g_resample_why = "rescale";
     resample(old, t, s->fmt, old.textureType == MTLTextureType3D ? 1 : (uint32_t)layer_count(old));
     g_resample_why = nullptr;
     s->tex = t;
-    g_surface_gen++;
     forget_texture_views();
     if (getenv("WWHD_LOG_RESCALE"))
         LOG("[gfx] rescaled %08X %ux%u fmt %X to %lux%lu", s->addr, s->width, s->height, s->format, (unsigned long)t.width,
@@ -424,450 +420,795 @@ void resample(id<MTLTexture> src, id<MTLTexture> dst, const FormatInfo& fmt, uin
     }
 }
 
-// One guest surface can be rendered and sampled through views of different formats with the same
-// texel bits, e.g. RGBA8 and RGBA8 sRGB: the Picto Box draws its picture through the sRGB view and
-// then through the plain one (issue #53). Each format gets its own texture here, so before one is
-// used, take over the texels of a more recent compatible one (a raw copy, as the memory is shared).
-static Surface* adopt_newer_alias(Surface* s) {
-    if (!s || !s->formatViews || !s->tex) return s;  // the common case: one view per address, nothing to do
-    if (R.binding) return s;  // a texture looked up again while binding to the open encoder: no blits now
-    Surface* newest = nullptr;
-    auto range = R.surfaces.equal_range(s->addr);
-    for (auto it = range.first; it != range.second; ++it) {
-        Surface* o = it->second.get();
-        if (o == s || !o->gpuWritten || !o->tex || o->isDepth || o->fmt.compressed || o->fmt.convert != Convert::NONE) continue;
-        if (s->gpuWritten && o->writeSeq <= s->writeSeq) continue;
-        if ((o->format & 0x3F) != (s->format & 0x3F) || o->fmt.hostBytesPerBlock != s->fmt.hostBytesPerBlock) continue;
-        if (o->tex.textureType != s->tex.textureType || o->tex.width != s->tex.width || o->tex.height != s->tex.height ||
-            o->tex.depth != s->tex.depth || o->tex.arrayLength != s->tex.arrayLength)
-            continue;
-        if (!newest || o->writeSeq > newest->writeSeq) newest = o;
-    }
-    if (!newest) return s;
-    bool viaBuffer = newest->tex.pixelFormat != s->tex.pixelFormat && !(newest->tex.usage & MTLTextureUsagePixelFormatView);
-    id<MTLTexture> src = newest->tex.pixelFormat == s->tex.pixelFormat || viaBuffer ? newest->tex
-                                                                                   : [newest->tex newTextureViewWithPixelFormat:s->tex.pixelFormat];
-    if (!src) return s;
-    end_encoder();
-    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-    NSUInteger layers = layer_count(s->tex);
-    for (NSUInteger level = 0; level < std::min(s->tex.mipmapLevelCount, newest->tex.mipmapLevelCount); level++)
-        for (NSUInteger slice = 0; slice < layers; slice++)
-            {
-                MTLSize sz = MTLSizeMake(std::max<NSUInteger>(s->tex.width >> level, 1), std::max<NSUInteger>(s->tex.height >> level, 1),
-                                         std::max<NSUInteger>(s->tex.depth >> level, 1));
-                if (viaBuffer) copy_bits_via_buffer(b, src, slice, level, s->tex, slice, level, sz, s->fmt.hostBytesPerBlock);
-                else
-                    [b copyFromTexture:src sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0)
-                    sourceSize:MTLSizeMake(std::max<NSUInteger>(s->tex.width >> level, 1), std::max<NSUInteger>(s->tex.height >> level, 1),
-                                           std::max<NSUInteger>(s->tex.depth >> level, 1))
-                     toTexture:s->tex destinationSlice:slice destinationLevel:level destinationOrigin:MTLOriginMake(0, 0, 0)];
-            }
-    [b endEncoding];
-    mark_gpu_written(s);
-    return s;
-}
-
-// the existing surface a lookup resolves to, or nullptr
-static Surface* find_surface(const SurfaceDesc& d, bool forRendering) {
-    auto range = R.surfaces.equal_range(d.addr);
-    Surface* exact = nullptr;
-    // sampling a GPU-written surface: several can alias one address (mip chains rendered into the same
-    // memory, a render target recreated as a texture array...). Prefer the same size, then the same
-    // array size, then the most recent write.
-    Surface* rendered = nullptr;
-    auto score = [&](Surface* s) {
-        return std::make_tuple(s->width == d.width && s->height == d.height, s->slices == d.slices, s->writeSeq);
-    };
-    // only with the same kind of texture: a 2D render target cannot stand in for a sampled volume
-    auto volume = [](uint32_t dim) { return (Latte::E_DIM)dim == Latte::E_DIM::DIM_3D; };
-    auto consider = [&](Surface* s) {
-        if (volume(s->dim) != volume(d.dim)) return;
-        if (!rendered || score(s) > score(rendered)) rendered = s;
-    };
-    for (auto it = range.first; it != range.second; ++it) {
-        Surface* s = it->second.get();
-        // a rendered depth buffer sampled as a texture (fog, depth of field, shadow maps...)
-        if (!forRendering && s->isDepth && !d.isDepth && s->gpuWritten && s->width == d.width && s->height == d.height)
-            consider(s);
-        if (s->isDepth != d.isDepth) continue;
-        // a render target is one level. A texture made first by sampling the address (with the mip
-        // chain its descriptor declares) is not adopted as a target: rendering would define level
-        // 0 only, and samplers would keep reading the other levels as uploaded from guest memory,
-        // for the rest of the session. That happens when a pass samples a buffer before the pass
-        // that renders it has run once, e.g. its draw was skipped while its shader compiled (issue
-        // #47: the light buffer, black shadows). The target gets its own surface instead, which
-        // then wins sampling lookups as the newest write, as when the render came first.
-        if (forRendering && s->mips > 1) continue;
-        // a volume and a 2D array of the same size are different textures
-        if (s->width == d.width && s->height == d.height && s->format == d.format && s->slices == d.slices &&
-            volume(s->dim) == volume(d.dim) && (forRendering || s->mips >= d.mips || s->gpuWritten)) {
-            if (forRendering) return adopt_newer_alias(rescale(s));
-            if (!exact || s->writeSeq > exact->writeSeq) exact = s;
-            continue;
-        }
-        // render target being sampled with a compatible format but different view parameters
-        if (!forRendering && s->gpuWritten && (s->format & 0x3F) == (d.format & 0x3F)) consider(s);
-    }
-    if (exact && (exact->gpuWritten || !rendered || exact->writeSeq > rendered->writeSeq)) return exact->gpuWritten ? adopt_newer_alias(exact) : exact;
-    if (rendered) return rendered;
-    return exact;
-}
-
-Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering) {
-    if (Surface* found = find_surface(d, forRendering)) return found;
-    auto s = std::make_unique<Surface>();
-    s->addr = d.addr;
-    s->mipAddr = d.mipAddr;
-    s->width = std::max(d.width, 1u);
-    s->height = std::max(d.height, 1u);
-    s->slices = std::max(d.slices, 1u);
-    s->pitch = d.pitch;
-    s->mips = forRendering ? 1 : std::max(d.mips, 1u);
-    s->format = d.format;
-    s->dim = d.dim;
-    s->tileMode = d.tileMode;
-    s->swizzle = d.swizzle;
-    s->isDepth = d.isDepth;
-    s->fmt = format_info(d.format, d.isDepth);
-    float ax = 1.0f, ay = 1.0f;
-    if (forRendering) target_aspect(s.get(), ax, ay);
-    s->tex = make_texture(s.get(), texture_type(d.dim, s->slices), forRendering, forRendering ? target_scale(s.get()) : 1.0f, ax, ay);
-    if (!s->tex) {
-        LOG("[gfx] cannot create %ux%ux%u texture (format %X, pixel %lu)", s->width, s->height, s->slices, s->format,
-            (unsigned long)s->fmt.pixel);
-        return nullptr;
-    }
-    if (forRendering && getenv("WWHD_LOG_RESCALE"))
-        LOG("[gfx] render target %08X %ux%ux%u fmt %X%s -> %lux%lu", s->addr, s->width, s->height, s->slices, s->format,
-            s->isDepth ? " depth" : "", (unsigned long)s->tex.width, (unsigned long)s->tex.height);
-    Surface* raw = s.get();
-    note_surface_range(raw, s->addr, std::max<uint32_t>(s->dataSize, s->pitch * s->height * 4));  // as invalidate's estimate
-    R.surfaces.emplace(d.addr, std::move(s));
-    g_surface_gen++;
-    // format views of one guest surface (adopt_newer_alias): flag them once, so lookups stay cheap
-    if (!raw->isDepth && !raw->fmt.compressed && raw->fmt.convert == Convert::NONE) {
-        auto views = R.surfaces.equal_range(d.addr);
-        for (auto it = views.first; it != views.second; ++it) {
-            Surface* o = it->second.get();
-            if (o != raw && !o->isDepth && !o->fmt.compressed && o->fmt.convert == Convert::NONE && o->format != raw->format &&
-                (o->format & 0x3F) == (raw->format & 0x3F) && o->fmt.hostBytesPerBlock == raw->fmt.hostBytesPerBlock)
-                o->formatViews = raw->formatViews = true;
-        }
-    }
-    if (!raw->isDepth && (Latte::E_HWTILEMODE)raw->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED) R.linearTargets.push_back(raw);
-    return forRendering ? adopt_newer_alias(raw) : raw;
-}
-
-// ---------------------------------------------------------------- render targets
-// CB_COLORn_BASE holds the full guest address; CB_COLORn_TILE/FRAG hold width/height (our convention).
-constexpr uint32_t kDim2D = 1, kDim3D = 2, kDim2DArray = 5;
-
-Surface* color_target(const uint32_t* regs, int i, uint32_t* slice) {
-    uint32_t base = regs[mmCB_COLOR0_BASE + i];
-    if (!base) return nullptr;
-    uint32_t size = regs[mmCB_COLOR0_SIZE + i], info = regs[mmCB_COLOR0_INFO + i];
-    uint32_t pitch = ((size & 0x3FF) + 1) * 8;
-    uint32_t height = (((size >> 10) & 0xFFFFF) + 1) * 64 / pitch;
-    // our convention (GX2SetColorBuffer, gx2.h kColorTarget3D): TILE = width | slices << 16 | volume flag, FRAG = height
-    uint32_t tile = regs[mmCB_COLOR0_TILE + i];
-    uint32_t w = tile & 0xFFFF, h = regs[mmCB_COLOR0_FRAG + i];
-    uint32_t slices = gx2::color_target_slices(tile);
-    bool volume = (tile & gx2::kColorTarget3D) != 0;
-    if (slice) *slice = slices > 1 ? std::min<uint32_t>(regs[mmCB_COLOR0_VIEW + i] & 0x7FF, slices - 1) : 0;
-    static const uint32_t numberBits[8] = {0, 0x200, 0, 0, 0x100, 0x300, 0x400, 0x800};
-    SurfaceDesc d;
-    d.addr = base;
-    d.width = w ? w : pitch;
-    d.height = h ? h : height;
-    d.pitch = pitch;
-    d.format = ((info >> 2) & 0x3F) | numberBits[(info >> 12) & 7];
-    d.tileMode = (info >> 8) & 0xF;
-    d.slices = slices;
-    d.dim = volume ? kDim3D : slices > 1 ? kDim2DArray : kDim2D;
-    return find_or_create_surface(d, true);
-}
-
-Surface* depth_target(const uint32_t* regs, uint32_t* slice) {
-    uint32_t base = regs[mmDB_DEPTH_BASE];
-    if (!base) return nullptr;
-    uint32_t slices = std::max<uint32_t>(regs[gx2::kDepthSlicesReg], 1);
-    if (slice) *slice = slices > 1 ? std::min<uint32_t>(regs[mmDB_DEPTH_VIEW] & 0x7FF, slices - 1) : 0;
-    uint32_t size = regs[mmDB_DEPTH_SIZE], info = regs[mmDB_DEPTH_INFO];
-    uint32_t pitch = ((size & 0x3FF) + 1) * 8;
-    uint32_t height = (((size >> 10) & 0xFFFFF) + 1) * 64 / pitch;
-    uint32_t wh = regs[mmDB_HTILE_DATA_BASE];  // our convention: width << 16 | height
-    static const uint32_t fmts[8] = {0, 0x005, 0, 0x011, 0, 0x811, 0x80E, 0x81C};
-    SurfaceDesc d;
-    d.addr = base;
-    d.width = wh ? (wh >> 16) : pitch;
-    d.height = wh ? (wh & 0xFFFF) : height;
-    d.pitch = pitch;
-    d.format = fmts[info & 7];
-    d.isDepth = true;
-    d.slices = slices;
-    d.dim = slices > 1 ? kDim2DArray : kDim2D;
-    return find_or_create_surface(d, true);
-}
-
-Surface* surface_from_color_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t* numSlices) {
-    auto* cb = (GX2::GX2ColorBuffer*)mem::ptr(addr);
-    SurfaceDesc d;
-    bool volume = cb->surface.dim.value() == Latte::E_DIM::DIM_3D;
-    uint32_t slices = cb->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(cb->surface.depth, 1)
-                      : volume ? std::max<uint32_t>(cb->surface.depth >> cb->viewMip, 1) : 1;
-    d.slices = slices;
-    d.dim = volume ? kDim3D : slices > 1 ? kDim2DArray : kDim2D;
-    if (firstSlice) *firstSlice = std::min<uint32_t>(cb->viewFirstSlice, slices - 1);
-    if (numSlices) *numSlices = std::clamp<uint32_t>(cb->viewNumSlices, 1, slices - std::min<uint32_t>(cb->viewFirstSlice, slices - 1));
-    d.addr = gx2::color_buffer_address(cb);
-    d.width = std::max<uint32_t>(cb->surface.width >> cb->viewMip, 1);
-    d.height = std::max<uint32_t>(cb->surface.height >> cb->viewMip, 1);
-    d.pitch = cb->surface.pitch;
-    d.format = (uint32_t)cb->surface.format.value();
-    d.tileMode = (uint32_t)cb->surface.tileMode.value();
-    return find_or_create_surface(d, true);
-}
-
-Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t* numSlices) {
-    auto* db = (GX2::GX2DepthBuffer*)mem::ptr(addr);
-    SurfaceDesc d;
-    uint32_t slices = db->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(db->surface.depth, 1) : 1;
-    d.slices = slices;
-    d.dim = slices > 1 ? kDim2DArray : kDim2D;
-    if (firstSlice) *firstSlice = std::min<uint32_t>(db->viewFirstSlice, slices - 1);
-    if (numSlices) *numSlices = std::clamp<uint32_t>(db->viewNumSlices, 1, slices - std::min<uint32_t>(db->viewFirstSlice, slices - 1));
-    d.addr = db->surface.imagePtr;
-    d.width = db->surface.width;
-    d.height = db->surface.height;
-    d.pitch = db->surface.pitch;
-    d.format = (uint32_t)db->surface.format.value();
-    d.tileMode = (uint32_t)db->surface.tileMode.value();
-    d.isDepth = true;
-    return find_or_create_surface(d, true);
-}
-
-// ---------------------------------------------------------------- sampled textures
+// ================================================================ texture cache
+// After Cemu's texture cache (Cafe/HW/Latte/Core/LatteTexture.cpp, LatteTextureCache.cpp,
+// LatteTextureView.cpp, LatteRenderTarget.cpp, LatteSurfaceCopy.cpp; MPL-2.0), adapted to Metal and to
+// this renderer's internal-resolution scaling:
+//  - one Surface per guest surface definition, holding all of its mips and slices; samplers and render
+//    targets use views into it (a mip/slice range). A lookup with a larger mip or slice range than an
+//    existing surface has recreates it bigger (GPU contents copied over)
+//  - surfaces sharing memory at the same layout (same address, pitch, tile mode, texel size) are related:
+//    a GPU write to one marks the others, which copy the newer slices before their next use
+//  - a lookup that a bigger surface can serve as a view (a render target at the address of another
+//    surface's mip or slice) becomes that view, and smaller surfaces it absorbs are dropped
+//  - surfaces whose memory was overwritten by other GPU writes, or unused CPU textures, are dropped
+// Lookups by exact view description: address, size, pitch, mip/slice range, format, dimension.
 static uint64_t sparse_hash(Surface* s);
 static void check_texture(Surface* s);
 uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces;
+bool g_repeat_texture_init = false;
 
-// Companion mip chains: preserve AGL's own blurred levels instead of sampling only level 0.
-// Based on GreenNaugahyde/ZeldaWWHDRecompAndroid commit 73b54e1, adapted to Metal.
-static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
-    static const bool off = getenv("WWHD_NO_RT_MIPS") != nullptr;
-    if (off || !s || !s->tex || s->mips != 1 || d.mips <= 1 || s->fmt.depth || s->fmt.compressed ||
-        s->fmt.kind != FormatInfo::FLOAT || s->tex.textureType != MTLTextureType2D || s->slices != 1) return s;
-    uint32_t w = (uint32_t)s->tex.width, h = (uint32_t)s->tex.height, full = 1;
-    while ((std::max(w, h) >> full) > 0) full++;
-    uint32_t mips = std::min(d.mips, full);
-    if (mips <= 1) return s;
-    Surface* levels[16] = {};
-    uint64_t key = s->writeSeq * 0x9E3779B97F4A7C15ull;
-    for (uint32_t l = 1; l < mips; l++) {
-        levels[l] = gfx::render_mips::game_level(d, l, R.surfaces);
-        key = (key ^ (levels[l] ? levels[l]->writeSeq + l : l)) * 0xFF51AFD7ED558CCDull;
-    }
-    auto* c = s->mipChain.get();
-    if (c && (c->mips != mips || c->tex.width != w || c->tex.height != h || c->tex.pixelFormat != s->tex.pixelFormat)) {
-        s->mipChain.reset(); c = nullptr;
-        g_surface_gen++;  // cached lookups may hold the old chain
-    }
-    if (R.binding) return c ? c : s; // prepared by draw's texture preflight, before opening its encoder
-    if (!c) {
-        auto chain = std::make_shared<Surface>();
-        c = chain.get();
-        c->addr = s->addr; c->mipAddr = d.mipAddr;
-        c->width = s->width; c->height = s->height; c->slices = 1; c->mips = mips;
-        c->format = s->format; c->dim = s->dim; c->fmt = s->fmt;
-        c->sx = s->sx; c->sy = s->sy; c->gpuWritten = true;
-        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->tex.pixelFormat
-            width:w height:h mipmapped:YES];
-        td.mipmapLevelCount = mips;
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | format_view_usage();
-        td.storageMode = MTLStorageModePrivate;
-        c->tex = [R.device newTextureWithDescriptor:td];
-        if (!c->tex) return s;
-        s->mipChain = std::move(chain); s->mipChainSeq = ~0ull;
-    }
-    if (s->mipChainSeq == key) return c;
-    // Only the levels whose source changed since the last build: the game renders its chain one level
-    // at a time and samples in between (bloom/blur), which used to rebuild every level after each one.
-    // A generated level (no game level) follows the level above it. Game levels of the companion's
-    // exact size are blit-copied; others (rounding differences, e.g. 360x201 vs 360x202) are resampled.
-    end_encoder();
-    if (s->mipChainSeq == ~0ull) memset(s->mipLevelSeq, 0, sizeof s->mipLevelSeq);
-    bool redo[16] = {};
-    redo[0] = s->mipLevelSeq[0] != s->writeSeq;
-    for (uint32_t l = 1; l < mips; l++)
-        redo[l] = levels[l] ? s->mipLevelSeq[l] != levels[l]->writeSeq + 1 : (redo[l - 1] || s->mipLevelSeq[l] != 1);
-    auto exact = [&](uint32_t l) {
-        return levels[l] && levels[l]->tex && levels[l]->tex.pixelFormat == c->tex.pixelFormat &&
-               levels[l]->tex.width == std::max<NSUInteger>(w >> l, 1) && levels[l]->tex.height == std::max<NSUInteger>(h >> l, 1) &&
-               levels[l]->tex.textureType == MTLTextureType2D;
-    };
-    id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-    if (redo[0])
-        [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
-            sourceSize:MTLSizeMake(w,h,1) toTexture:c->tex destinationSlice:0 destinationLevel:0
-            destinationOrigin:MTLOriginMake(0,0,0)];
-    for (uint32_t l = 1; l < mips; l++)
-        if (redo[l] && exact(l))
-            [b copyFromTexture:levels[l]->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
-                sourceSize:MTLSizeMake(std::max<uint32_t>(w >> l, 1), std::max<uint32_t>(h >> l, 1), 1) toTexture:c->tex
-                destinationSlice:0 destinationLevel:l destinationOrigin:MTLOriginMake(0,0,0)];
-    [b endEncoding];
-    s->mipLevelSeq[0] = s->writeSeq;
-    uint32_t fromGame = 0;
-    for (uint32_t l = 1; l < mips; l++) {
-        if (levels[l]) fromGame++;
-        if (!redo[l]) continue;
-        s->mipLevelSeq[l] = levels[l] ? levels[l]->writeSeq + 1 : 1;
-        if (exact(l)) continue;
-        id<MTLTexture> dst = [c->tex newTextureViewWithPixelFormat:c->tex.pixelFormat textureType:MTLTextureType2D
-            levels:NSMakeRange(l,1) slices:NSMakeRange(0,1)];
-        id<MTLTexture> src = levels[l] ? levels[l]->tex :
-            [c->tex newTextureViewWithPixelFormat:c->tex.pixelFormat textureType:MTLTextureType2D
-                levels:NSMakeRange(l-1,1) slices:NSMakeRange(0,1)];
-        // Resampling also handles the console's floor rounding at e.g. 120x67, upscaled to 360x201
-        // when the companion mip is 360x202. Sampling keeps one coherent physical mip pyramid.
-        g_resample_why = levels[l] ? "mip from game" : "mip";
-        resample(src, dst, c->fmt, 1);
-        g_resample_why = nullptr;
-    }
-    s->mipChainSeq = key;
-    static int logged = 0;
-    if (logged++ < 8) LOG("[gfx] mip chain for %08X %ux%u: %u levels, %u of them the game's own", s->addr,w,h,mips,fromGame);
-    return c;
+namespace {
+// ---- view lookup (LatteTextureViewLookupCache)
+struct ViewDesc {
+    uint32_t addr, width, height, pitch, firstMip, numMip, firstSlice, numSlice, format, dim;
+    bool isDepth;
+    TexView* view;
+};
+constexpr uint32_t kViewBuckets = 1061;
+std::vector<ViewDesc> g_viewBucket[kViewBuckets], g_viewBucketNoRes[kViewBuckets];
+inline uint32_t view_key(uint32_t a, uint32_t w, uint32_t h, uint32_t p) {
+    return (uint32_t)(((uint64_t)a + (uint64_t)w * 7 + (uint64_t)h * 11 + (uint64_t)p * 13) % kViewBuckets);
+}
+inline uint32_t view_key_nores(uint32_t a, uint32_t p) { return (uint32_t)(((uint64_t)a + (uint64_t)p * 13) % kViewBuckets); }
+
+// ---- memory occupancy: which slices of which surfaces cover each 2 MiB of guest memory
+struct Occ {
+    uint32_t start, end;
+    SliceMip* sm;
+};
+constexpr uint64_t kOccSize = 0x200000;
+constexpr uint32_t kOccBuckets = (uint32_t)(0x100000000ull / kOccSize);
+std::vector<Occ> g_occ[kOccBuckets];
+template <class F>
+inline void for_occ_buckets(uint32_t start, uint32_t end, F f) {
+    if (end <= start) end = start + 1;
+    for (uint64_t b = start / kOccSize; b <= ((uint64_t)end - 1) / kOccSize && b < kOccBuckets; b++) f(g_occ[b]);
 }
 
-// A texture array the game samples where only single-layer render targets exist: on the Wii U layer N is
-// the memory at the address of slice N, which the game rendered as a separate 2D target. The companion
-// array copies each layer from the GPU-written surface at that address (same size and format), zero where
-// there is none; a sample past our one-layer texture was undefined before (BotW's water read layer 1 of
-// its quarter-res scene buffer: white water). WWHD_NO_ARRAY_LAYERS=1: off.
-static Surface* with_array_layers(Surface* s, const SurfaceDesc& d) {
-    static const bool off = getenv("WWHD_NO_ARRAY_LAYERS") != nullptr;
-    const auto dim = (Latte::E_DIM)d.dim;
-    if (off || !s || !s->tex || !s->gpuWritten || s->fmt.depth || s->fmt.compressed || d.slices < 2 || d.slices > 64 ||
-        dim != Latte::E_DIM::DIM_2D_ARRAY || layer_count(s->tex) >= d.slices ||
-        s->tex.textureType != MTLTextureType2D)
-        return s;
-    const uint32_t w = (uint32_t)s->tex.width, h = (uint32_t)s->tex.height;
-    Surface* layer[64] = {};
-    layer[0] = s;
-    uint64_t key = s->writeSeq * 0x9E3779B97F4A7C15ull;
-    for (uint32_t i = 1; i < d.slices; i++) {
-        uint32_t sliceAddr = 0, sliceSize = 0;
-        sint32 sub = 0;
-        LatteAddrLib::CalculateMipAndSliceAddr(d.addr | d.swizzle, d.mipAddr, (Latte::E_GX2SURFFMT)d.format, d.width, d.height, d.slices,
-                                               dim, (Latte::E_HWTILEMODE)d.tileMode, d.swizzle, 0, 0, (sint32)i, &sliceAddr, &sliceSize, &sub);
-        if (sub != 0) continue;  // thick tiling: slices share tiles, not separate targets
-        sliceAddr &= ~0x700u;
-        Surface* best = nullptr;
-        auto range = R.surfaces.equal_range(sliceAddr);
-        for (auto it = range.first; it != range.second; ++it) {
-            Surface* o = it->second.get();
-            if (!o->tex || !o->gpuWritten || o->isDepth || o->tex.pixelFormat != s->tex.pixelFormat || o->tex.width != w ||
-                o->tex.height != h)
-                continue;
-            if (!best || o->writeSeq > best->writeSeq) best = o;
+std::vector<Surface*> g_all;                          // every live surface (cleanup scan)
+std::vector<std::unique_ptr<Surface>> g_graveyard;    // deleted this frame, freed at its end
+}  // namespace
+
+static void view_lookup_add(TexView* v, uint32_t baseMip = 0, uint32_t baseSlice = 0) {
+    Surface* t = v->tex;
+    ViewDesc d{t->addr, t->width, t->height, t->pitch, v->firstMip, v->numMip, v->firstSlice, v->numSlice, v->format, v->dim, t->isDepth, v};
+    if (baseMip || baseSlice) {  // looked up by the address of one of its slices/mips (a sub-texture)
+        SliceMip* sm = t->slice_mip(baseSlice, baseMip);
+        d.addr = sm->addrStart;
+        d.pitch = sm->pitch;
+        d.width = std::max(t->width >> baseMip, 1u);
+        d.height = std::max(t->height >> baseMip, 1u);
+        d.firstMip -= baseMip;
+        d.firstSlice -= baseSlice;
+    }
+    uint32_t k = view_key(d.addr, d.width, d.height, d.pitch);
+    g_viewBucket[k].push_back(d);
+    if (std::find(v->keys.begin(), v->keys.end(), k) == v->keys.end()) v->keys.push_back(k);
+    k = view_key_nores(d.addr, d.pitch);
+    g_viewBucketNoRes[k].push_back(d);
+    if (std::find(v->keysNoRes.begin(), v->keysNoRes.end(), k) == v->keysNoRes.end()) v->keysNoRes.push_back(k);
+}
+static void view_lookup_remove(TexView* v) {
+    auto drop = [v](std::vector<ViewDesc>& b) { b.erase(std::remove_if(b.begin(), b.end(), [v](const ViewDesc& d) { return d.view == v; }), b.end()); };
+    for (uint32_t k : v->keys) drop(g_viewBucket[k]);
+    for (uint32_t k : v->keysNoRes) drop(g_viewBucketNoRes[k]);
+    v->keys.clear();
+    v->keysNoRes.clear();
+}
+static TexView* view_lookup(uint32_t addr, uint32_t w, uint32_t h, uint32_t pitch, uint32_t firstMip, uint32_t numMip, uint32_t firstSlice,
+                            uint32_t numSlice, uint32_t format, uint32_t dim, int isDepth = -1) {
+    for (auto& d : g_viewBucket[view_key(addr, w, h, pitch)])
+        if (d.format == format && d.dim == dim && d.width == w && d.height == h && d.pitch == pitch && d.addr == addr && d.firstMip == firstMip &&
+            d.numMip == numMip && d.firstSlice == firstSlice && d.numSlice == numSlice && (isDepth < 0 || d.isDepth == (isDepth != 0)))
+            return d.view;
+    return nullptr;
+}
+// any mip/slice count; isDepth < 0: either kind
+static TexView* view_lookup_slice(uint32_t addr, uint32_t w, uint32_t h, uint32_t pitch, uint32_t firstMip, uint32_t firstSlice, uint32_t format,
+                                  int isDepth = -1) {
+    for (auto& d : g_viewBucket[view_key(addr, w, h, pitch)])
+        if (d.width == w && d.height == h && d.pitch == pitch && d.addr == addr && d.format == format && d.firstSlice == firstSlice &&
+            d.firstMip == firstMip && (isDepth < 0 || d.isDepth == (isDepth != 0)))
+            return d.view;
+    return nullptr;
+}
+// any mip/slice count, at least this size
+static TexView* view_lookup_slice_min(uint32_t addr, uint32_t minW, uint32_t minH, uint32_t pitch, uint32_t firstMip, uint32_t firstSlice,
+                                      uint32_t format) {
+    for (auto& d : g_viewBucketNoRes[view_key_nores(addr, pitch)])
+        if (d.width >= minW && d.height >= minH && d.pitch == pitch && d.addr == addr && d.format == format && d.firstSlice == firstSlice &&
+            d.firstMip == firstMip)
+            return d.view;
+    return nullptr;
+}
+
+static TexView* get_or_create_view(Surface* t, uint32_t dim, uint32_t format, uint32_t firstMip, uint32_t numMip, uint32_t firstSlice,
+                                   uint32_t numSlice) {
+    for (TexView* v : t->views)
+        if (v->firstMip == firstMip && v->numMip == numMip && v->firstSlice == firstSlice && v->numSlice == numSlice && v->dim == dim &&
+            v->format == format)
+            return v;
+    TexView* v = new TexView;
+    v->tex = t;
+    v->firstMip = firstMip;
+    v->numMip = numMip;
+    v->firstSlice = firstSlice;
+    v->numSlice = numSlice;
+    v->format = format;
+    v->dim = dim;
+    t->views.push_back(v);
+    view_lookup_add(v);
+    return v;
+}
+
+// ---- slice/mip layout and occupancy
+static void init_slice_mips(Surface* t) {
+    t->sm.assign((size_t)t->slices * t->mips, SliceMip{});
+    for (uint32_t mip = 0; mip < t->mips; mip++) {
+        LatteAddrLib::AddrSurfaceInfo_OUT info{};
+        LatteAddrLib::GX2CalculateSurfaceInfo((Latte::E_GX2SURFFMT)t->format, t->width, t->height, t->slices, (Latte::E_DIM)t->dim,
+                                              Latte::MakeGX2TileMode((Latte::E_HWTILEMODE)t->tileMode), 0, mip, &info);
+        for (uint32_t slice = 0; slice < t->mip_slices(mip); slice++) {
+            uint32_t a = 0, size = 0;
+            sint32 sub = 0;
+            LatteAddrLib::CalculateMipAndSliceAddr(t->addr, t->mipAddr, (Latte::E_GX2SURFFMT)t->format, t->width, t->height, t->slices,
+                                                   (Latte::E_DIM)t->dim, (Latte::E_HWTILEMODE)t->tileMode, t->swizzle, 0, mip, slice, &a, &size, &sub);
+            SliceMip* sm = t->slice_mip(slice, mip);
+            sm->addrStart = a;
+            sm->addrEnd = a + size;
+            sm->subIndex = (uint32_t)sub;
+            sm->slice = slice;
+            sm->mip = mip;
+            sm->tex = t;
+            sm->tileMode = (uint32_t)info.hwTileMode;
+            sm->pitch = mip == 0 ? t->pitch : info.pitch;  // the base level: the pitch the hardware was given
         }
-        layer[i] = best;
-        key = (key ^ (best ? best->writeSeq + i : i)) * 0xFF51AFD7ED558CCDull;
     }
-    int found = 0;
-    for (uint32_t i = 1; i < d.slices; i++) found += layer[i] != nullptr;
-    // nothing rendered at the other slices: an array of zeros helps no one (cube maps the game samples
-    // from a 2D image keep their six-face copy, update_cube_proxy)
-    if (!found) {
-        static int none = 0;
-        if (dim == Latte::E_DIM::DIM_2D_ARRAY && none++ < 10)
-            LOG("[gfx] array %08X %ux%u f%X: %u layers, none rendered at the other slices", d.addr, d.width, d.height, d.format, d.slices);
-        return s;
+}
+static void register_occupancy(Surface* t) {
+    for (uint32_t mip = 0; mip < t->mips; mip++)
+        for (uint32_t slice = 0; slice < t->mip_slices(mip); slice++) {
+            SliceMip* sm = t->slice_mip(slice, mip);
+            for_occ_buckets(sm->addrStart, sm->addrEnd, [&](std::vector<Occ>& b) { b.push_back({sm->addrStart, sm->addrEnd, sm}); });
+        }
+}
+static void unregister_occupancy(Surface* t) {
+    for (uint32_t mip = 0; mip < t->mips; mip++)
+        for (uint32_t slice = 0; slice < t->mip_slices(mip); slice++) {
+            SliceMip* sm = t->slice_mip(slice, mip);
+            for_occ_buckets(sm->addrStart, sm->addrEnd, [&](std::vector<Occ>& b) {
+                b.erase(std::remove_if(b.begin(), b.end(), [t](const Occ& o) { return o.sm->tex == t; }), b.end());
+            });
+        }
+}
+
+// ---- format compatibility
+// whether two formats' textures may share data (synchronised copies between them)
+static bool format_view_compatible(uint32_t a, uint32_t b) {
+    if (a == b) return true;
+    for (int swap = 0; swap < 2; swap++) {
+        const auto fa = (Latte::E_GX2SURFFMT)a, fb = (Latte::E_GX2SURFFMT)b;
+        const auto ha = Latte::GetHWFormat(fa), hb = Latte::GetHWFormat(fb);
+        if (ha == Latte::E_HWFMT::HWFMT_2_10_10_10 && fb == Latte::E_GX2SURFFMT::R11_G11_B10_FLOAT) return false;
+        if (ha == Latte::E_HWFMT::HWFMT_2_10_10_10 && fb == Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM) return false;
+        if (fa == Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM || fb == Latte::E_GX2SURFFMT::A1_B5_G5_R5_UNORM) return false;
+        if (fa == Latte::E_GX2SURFFMT::D24_S8_UNORM && fb == Latte::E_GX2SURFFMT::R10_G10_B10_A2_SNORM) return false;
+        if (fa == Latte::E_GX2SURFFMT::R32_FLOAT && fb == Latte::E_GX2SURFFMT::R10_G10_B10_A2_SNORM) return false;
+        (void)hb;
+        std::swap(a, b);
     }
-    auto* c = s->layerArray.get();
-    if (c && (layer_count(c->tex) != d.slices || c->tex.width != w || c->tex.height != h || c->tex.pixelFormat != s->tex.pixelFormat ||
-              c->tex.textureType != (dim == Latte::E_DIM::DIM_CUBEMAP ? MTLTextureTypeCubeArray : MTLTextureType2DArray))) {
-        s->layerArray.reset();
-        c = nullptr;
-        g_surface_gen++;
+    return true;
+}
+static bool texel_size_compatible(uint32_t a, uint32_t b) {
+    const auto fa = (Latte::E_GX2SURFFMT)a, fb = (Latte::E_GX2SURFFMT)b;
+    if (fa == Latte::E_GX2SURFFMT::D24_S8_UNORM && fb == Latte::E_GX2SURFFMT::D32_FLOAT) return false;
+    if (Latte::IsCompressedFormat(fa) && Latte::IsCompressedFormat(fb) && Latte::GetHWFormat(fa) != Latte::GetHWFormat(fb)) return false;
+    return Latte::GetFormatBits(fa) == Latte::GetFormatBits(fb);
+}
+static bool blocked_relation(Surface* a, Surface* b) {
+    for (int swap = 0; swap < 2; swap++) {
+        // a depth->colour copy ends up in R only: not for RGBA8 (Smash)
+        if (a->isDepth && !b->isDepth && (Latte::E_GX2SURFFMT)a->format == Latte::E_GX2SURFFMT::D32_FLOAT &&
+            Latte::GetHWFormat((Latte::E_GX2SURFFMT)b->format) == Latte::E_HWFMT::HWFMT_8_8_8_8)
+            return true;
+        std::swap(a, b);
     }
-    if (R.binding) return c ? c : s;  // prepared by the draw's texture preflight, before its encoder opened
-    if (dim == Latte::E_DIM::DIM_CUBEMAP && (d.slices % 6 || w != h)) return s;
-    if (!c) {
-        auto arr = std::make_shared<Surface>();
-        c = arr.get();
-        c->addr = s->addr; c->mipAddr = d.mipAddr;
-        c->width = s->width; c->height = s->height; c->slices = d.slices; c->mips = 1;
-        c->format = s->format; c->dim = d.dim; c->fmt = s->fmt;
-        c->sx = s->sx; c->sy = s->sy; c->scale = s->scale; c->gpuWritten = true;
-        MTLTextureDescriptor* td = [MTLTextureDescriptor new];
-        td.textureType = dim == Latte::E_DIM::DIM_CUBEMAP ? MTLTextureTypeCubeArray : MTLTextureType2DArray;
-        td.pixelFormat = s->tex.pixelFormat;
-        td.width = w;
-        td.height = h;
-        td.arrayLength = dim == Latte::E_DIM::DIM_CUBEMAP ? d.slices / 6 : d.slices;
-        td.usage = MTLTextureUsageShaderRead;
-        td.storageMode = MTLStorageModePrivate;
-        c->tex = [R.device newTextureWithDescriptor:td];
-        if (!c->tex) return s;
-        s->layerArray = std::move(arr);
-        s->layerArraySeq = ~0ull;
+    return false;
+}
+
+// ---- GPU copies between surfaces
+static const char* kConvertShader = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 pos [[position]]; float2 uv; };
+vertex VOut cv_vs(uint vid [[vertex_id]], constant float2& uvMax [[buffer(0)]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2);
+    VOut o;
+    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    o.uv = p * uvMax;
+    return o;
+}
+fragment float4 cv_depth_to_color(VOut in [[stage_in]], depth2d<float> t [[texture(0)]]) {
+    float d = t.read(uint2(in.uv * float2(t.get_width(), t.get_height())));
+    return float4(d, d, d, d);
+}
+struct DOut { float d [[depth(any)]]; };
+fragment DOut cv_color_to_depth(VOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {
+    DOut o;
+    o.d = t.read(uint2(in.uv * float2(t.get_width(), t.get_height()))).x;
+    return o;
+}
+)";
+// one level/slice of src into dst's level/slice, top-left w x h texture pixels, where one is a depth
+// texture and the other is not (Cemu: surfaceCopy_copySurfaceWithFormatConversion; depth goes to R)
+static void convert_copy(Surface* src, uint32_t srcSlice, uint32_t srcMip, Surface* dst, uint32_t dstSlice, uint32_t dstMip, uint32_t w, uint32_t h) {
+    static id<MTLLibrary> lib;
+    static std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipes;
+    static id<MTLDepthStencilState> writeDepth;
+    if (!lib) {
+        NSError* err = nil;
+        lib = [R.device newLibraryWithSource:[NSString stringWithUTF8String:kConvertShader] options:nil error:&err];
+        if (!lib) { LOG("[gfx] format conversion shader: %s", err.localizedDescription.UTF8String); return; }
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = YES;
+        writeDepth = [R.device newDepthStencilStateWithDescriptor:dd];
     }
-    if (s->layerArraySeq == key) return c;
+    if (src->fmt.compressed || dst->fmt.compressed || src->fmt.kind != FormatInfo::FLOAT || dst->fmt.kind != FormatInfo::FLOAT) return;
+    const bool toDepth = dst->fmt.depth;
+    const uint64_t key = (uint64_t)dst->tex.pixelFormat | (toDepth ? 1ull << 40 : 0);
+    auto it = pipes.find(key);
+    if (it == pipes.end()) {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [lib newFunctionWithName:@"cv_vs"];
+        d.fragmentFunction = [lib newFunctionWithName:toDepth ? @"cv_color_to_depth" : @"cv_depth_to_color"];
+        if (toDepth) {
+            d.depthAttachmentPixelFormat = dst->tex.pixelFormat;
+            if (dst->fmt.stencil) d.stencilAttachmentPixelFormat = dst->tex.pixelFormat;
+        } else {
+            d.colorAttachments[0].pixelFormat = dst->tex.pixelFormat;
+        }
+        NSError* err = nil;
+        it = pipes.emplace(key, [R.device newRenderPipelineStateWithDescriptor:d error:&err]).first;
+        if (!it->second) LOG("[gfx] format conversion pipeline (pixel %lu): %s", (unsigned long)dst->tex.pixelFormat, err.localizedDescription.UTF8String);
+    }
+    if (!it->second) return;
+    end_encoder();
+    const MTLTextureType srcType = src->tex.textureType == MTLTextureType3D ? MTLTextureType3D : MTLTextureType2D;
+    if (srcType == MTLTextureType3D) return;  // volumes: not converted
+    id<MTLTexture> sv = [src->tex newTextureViewWithPixelFormat:src->tex.pixelFormat textureType:MTLTextureType2D
+                                                         levels:NSMakeRange(srcMip, 1) slices:NSMakeRange(srcSlice, 1)];
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    const NSUInteger dw = std::max<NSUInteger>(dst->tex.width >> dstMip, 1), dh = std::max<NSUInteger>(dst->tex.height >> dstMip, 1);
+    const bool whole = w >= dw && h >= dh;
+    if (toDepth) {
+        rp.depthAttachment.texture = dst->tex;
+        rp.depthAttachment.slice = dstSlice;
+        rp.depthAttachment.level = dstMip;
+        rp.depthAttachment.loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        if (dst->fmt.stencil) {
+            rp.stencilAttachment.texture = dst->tex;
+            rp.stencilAttachment.slice = dstSlice;
+            rp.stencilAttachment.level = dstMip;
+            rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    } else {
+        rp.colorAttachments[0].texture = dst->tex;
+        if (dst->tex.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = dstSlice;
+        else rp.colorAttachments[0].slice = dstSlice;
+        rp.colorAttachments[0].level = dstMip;
+        rp.colorAttachments[0].loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    time_render_pass(rp, __FILE_NAME__, __LINE__);
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:it->second];
+    if (toDepth) [e setDepthStencilState:writeDepth];
+    [e setViewport:MTLViewport{0, 0, (double)std::min<NSUInteger>(w, dw), (double)std::min<NSUInteger>(h, dh), 0, 1}];
+    const NSUInteger sw = std::max<NSUInteger>(src->tex.width >> srcMip, 1), sh = std::max<NSUInteger>(src->tex.height >> srcMip, 1);
+    float uv[2] = {std::min(1.0f, (float)w / sw), std::min(1.0f, (float)h / sh)};
+    [e setVertexBytes:uv length:sizeof uv atIndex:0];
+    [e setFragmentTexture:sv atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+// src (slice, mip) region at (sx, sy) into dst (slice, mip) at (dx, dy), w x h texture pixels, raw texels
+// (Cemu: texture_copyImageSubData). Different host formats: same texel size through a buffer, else drawn.
+static void gpu_copy(Surface* src, uint32_t srcSlice, uint32_t srcMip, uint32_t sx, uint32_t sy, Surface* dst, uint32_t dstSlice, uint32_t dstMip,
+                     uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
+    if (!src->tex || !dst->tex || !w || !h) return;
+    if (src->fmt.depth != dst->fmt.depth) { convert_copy(src, srcSlice, srcMip, dst, dstSlice, dstMip, w, h); return; }
+    const NSUInteger sw = std::max<NSUInteger>(src->tex.width >> srcMip, 1), shh = std::max<NSUInteger>(src->tex.height >> srcMip, 1);
+    const NSUInteger dw = std::max<NSUInteger>(dst->tex.width >> dstMip, 1), dh = std::max<NSUInteger>(dst->tex.height >> dstMip, 1);
+    if (sx >= sw || sy >= shh || dx >= dw || dy >= dh) return;
+    w = (uint32_t)std::min<NSUInteger>({(NSUInteger)w, sw - sx, dw - dx});
+    h = (uint32_t)std::min<NSUInteger>({(NSUInteger)h, shh - sy, dh - dy});
+    const bool s3 = src->tex.textureType == MTLTextureType3D, d3 = dst->tex.textureType == MTLTextureType3D;
+    if (srcMip >= src->tex.mipmapLevelCount || dstMip >= dst->tex.mipmapLevelCount) return;
+    if ((!s3 && srcSlice >= layer_count(src->tex)) || (!d3 && dstSlice >= layer_count(dst->tex))) return;
     end_encoder();
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-    static id<MTLBuffer> zeros = nil;
-    const NSUInteger bpp = s->fmt.hostBytesPerBlock ? s->fmt.hostBytesPerBlock : 16;
-    const NSUInteger need = (NSUInteger)w * bpp * h;
-    if (!zeros || zeros.length < need) zeros = [R.device newBufferWithLength:need options:MTLResourceStorageModePrivate];
-    if (zeros.length >= need) [b fillBuffer:zeros range:NSMakeRange(0, need) value:0];
-    for (uint32_t i = 0; i < d.slices; i++) {
-        if (layer[i])
-            [b copyFromTexture:layer[i]->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
-                     toTexture:c->tex destinationSlice:i destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-        else
-            [b copyFromBuffer:zeros sourceOffset:0 sourceBytesPerRow:w * bpp sourceBytesPerImage:need sourceSize:MTLSizeMake(w, h, 1)
-                    toTexture:c->tex destinationSlice:i destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    const MTLOrigin so = MTLOriginMake(sx, sy, s3 ? srcSlice : 0), dorig = MTLOriginMake(dx, dy, d3 ? dstSlice : 0);
+    if (src->tex.pixelFormat == dst->tex.pixelFormat) {
+        if (src->fmt.compressed) {  // block-aligned
+            w = (w + 3) & ~3u;
+            h = (h + 3) & ~3u;
+            w = (uint32_t)std::min<NSUInteger>(w, std::min(sw - sx, dw - dx));
+            h = (uint32_t)std::min<NSUInteger>(h, std::min(shh - sy, dh - dy));
+        }
+        [b copyFromTexture:src->tex sourceSlice:s3 ? 0 : srcSlice sourceLevel:srcMip sourceOrigin:so sourceSize:MTLSizeMake(w, h, 1)
+                 toTexture:dst->tex destinationSlice:d3 ? 0 : dstSlice destinationLevel:dstMip destinationOrigin:dorig];
+    } else if (!src->fmt.compressed && !dst->fmt.compressed && src->fmt.hostBytesPerBlock == dst->fmt.hostBytesPerBlock && !src->fmt.depth) {
+        const NSUInteger bpp = dst->fmt.hostBytesPerBlock, row = (NSUInteger)w * bpp, image = row * h;
+        id<MTLBuffer> tmp = [R.device newBufferWithLength:image options:MTLResourceStorageModePrivate];
+        if (tmp) {
+            [b copyFromTexture:src->tex sourceSlice:s3 ? 0 : srcSlice sourceLevel:srcMip sourceOrigin:so sourceSize:MTLSizeMake(w, h, 1)
+                      toBuffer:tmp destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:image];
+            [b copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:dst->tex destinationSlice:d3 ? 0 : dstSlice destinationLevel:dstMip destinationOrigin:dorig];
+        }
+    } else {
+        static int logged = 0;
+        if (logged++ < 10)
+            LOG("[tc] no copy between %08X f%X (pixel %lu) and %08X f%X (pixel %lu)", src->addr, src->format, (unsigned long)src->tex.pixelFormat,
+                dst->addr, dst->format, (unsigned long)dst->tex.pixelFormat);
     }
     [b endEncoding];
-    s->layerArraySeq = key;
-    static int logged = 0;
-    if (logged++ < 20) {
-        LOG("[gfx] array %08X %ux%u f%X: %u layers assembled from render targets (%d of %u found)", d.addr, d.width, d.height, d.format,
-            d.slices, found, d.slices - 1);
+}
+
+static bool same_scale(const Surface* a, const Surface* b) {
+    const double d = (double)a->sx / (double)b->sx;
+    return std::fabs(1.0 - d) <= 0.05 && std::fabs(1.0 - (double)a->sy / (double)b->sy) <= 0.05;
+}
+static uint32_t eff(uint32_t v, float s) { return (uint32_t)std::lround(v * s); }
+
+// guest region (width x height at srcX/srcY -> dstX/dstY) of one slice/mip into another surface's
+static void copy_slice(Surface* src, uint32_t srcSlice, uint32_t srcMip, Surface* dst, uint32_t dstSlice, uint32_t dstMip, uint32_t srcX, uint32_t srcY,
+                       uint32_t dstX, uint32_t dstY, uint32_t width, uint32_t height) {
+    if (!same_scale(src, dst)) {
+        static int logged = 0;
+        if (logged++ < 20)
+            LOG("[tc] not synced (scale %.2f vs %.2f): %08X %ux%u f%X -> %08X %ux%u f%X", src->sx, dst->sx, src->addr, src->width, src->height,
+                src->format, dst->addr, dst->width, dst->height, dst->format);
+        return;
     }
-    return c;
+    gpu_copy(src, srcSlice, srcMip, eff(srcX, src->sx), eff(srcY, src->sy), dst, dstSlice, dstMip, eff(dstX, dst->sx), eff(dstY, dst->sy),
+             eff(width, src->sx), eff(height, src->sy));
 }
 
-static Surface* sampled_texture_uncached(const uint32_t* w, bool isDepthSampler);
-
-// Draws look up the same few textures over and over (BotW: thousands of draws a frame, a handful of
-// texture descriptors each). The answer only changes when a surface is created, written (CPU upload
-// or GPU render: next_write_seq), invalidated or rescaled, or a new frame starts (the once-a-frame CPU
-// write check): until then a lookup with the same descriptor words returns the same surface.
-// Not while binding (lookups there skip the companion blits). WWHD_NO_TEX_CACHE=1: off.
-Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
-    static const bool off = getenv("WWHD_NO_TEX_CACHE") != nullptr || getenv("WWHD_TRACE_TEX") != nullptr;
-    if (off || R.binding) return sampled_texture_uncached(w, isDepthSampler);
-    struct Entry { uint32_t w[6]; bool depth; uint64_t gen, frame; Surface* s; };
-    static Entry cache[512];
-    uint64_t h = (uint64_t)w[2] * 0x9E3779B97F4A7C15ull ^ (uint64_t)w[0] * 0xC2B2AE3D27D4EB4Full ^ w[1] ^ ((uint64_t)w[4] << 32) ^ w[5] ^
-                 ((uint64_t)w[3] << 17) ^ isDepthSampler;
-    Entry& e = cache[(h ^ (h >> 29)) & 511];
-    if (e.gen == g_surface_gen && e.frame == R.frame && e.depth == isDepthSampler && !memcmp(e.w, w, sizeof e.w)) return e.s;
-    Surface* s = sampled_texture_uncached(w, isDepthSampler);
-    // the lookup itself may have written surfaces (uploads, companion copies): cache against the generation after it
-    memcpy(e.w, w, sizeof e.w);
-    e.depth = isDepthSampler;
-    e.gen = g_surface_gen;
-    e.frame = R.frame;
-    e.s = s;
-    return s;
+// every slice of the first mipCount levels of src into dst (a recreated surface)
+static void copy_data(Surface* src, Surface* dst, uint32_t mipCount, uint32_t sliceCount) {
+    if (!same_scale(src, dst)) return;
+    for (uint32_t mip = 0; mip < mipCount && mip < dst->mips; mip++) {
+        const uint32_t w = std::max(src->width >> mip, 1u), h = std::max(src->height >> mip, 1u);
+        const uint32_t n = src->dim == 2 ? std::max(sliceCount >> mip, 1u) : sliceCount;
+        for (uint32_t slice = 0; slice < n && slice < dst->mip_slices(mip); slice++) {
+            gpu_copy(src, slice, mip, 0, 0, dst, slice, mip, 0, 0, eff(w, src->sx), eff(h, src->sy));
+            dst->slice_mip(slice, mip)->lastDynamicUpdate = src->slice_mip(slice, mip)->lastDynamicUpdate;
+        }
+    }
 }
 
-static Surface* sampled_texture_uncached(const uint32_t* w, bool isDepthSampler) {
+static void sync_slice(Surface* src, uint32_t srcSlice, uint32_t srcMip, Surface* dst, uint32_t dstSlice, uint32_t dstMip) {
+    uint32_t srcW = src->width, srcH = src->height, dstW = dst->width, dstH = dst->height;
+    // a linear 2D surface holding a stack of slices of a smaller array (Ninja Gaiden's 24x576 -> 24x24x24)
+    if (srcMip == 0 && dstMip == 0 &&
+        (src->tileMode == (uint32_t)Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED || src->tileMode == (uint32_t)Latte::E_HWTILEMODE::TM_1D_TILED_THIN1) &&
+        src->height > dst->height && src->height % dst->height == 0) {
+        bool match = src->tileMode == (uint32_t)Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED ||
+                     (src->tileMode == (uint32_t)Latte::E_HWTILEMODE::TM_1D_TILED_THIN1 && src->width == 32);
+        if (match && !src->fmt.compressed && !dst->fmt.compressed) {
+            const uint32_t virt = src->height / dst->height;
+            if (dst->slices == virt)
+                for (uint32_t s = 0; s < virt; s++)
+                    copy_slice(src, srcSlice, srcMip, dst, dstSlice + s, dstMip, 0, s * dst->height, 0, 0, std::min(srcW, dstW), std::min(srcH, dstH));
+            return;
+        }
+    }
+    if (src->fmt.compressed != dst->fmt.compressed) {  // in the source's units
+        if (!src->fmt.compressed) { dstW >>= 2; dstH >>= 2; }
+        else { dstW <<= 2; dstH <<= 2; }
+    }
+    srcW = std::max(srcW >> srcMip, 1u);
+    srcH = std::max(srcH >> srcMip, 1u);
+    dstW = std::max(dstW >> dstMip, 1u);
+    dstH = std::max(dstH >> dstMip, 1u);
+    copy_slice(src, srcSlice, srcMip, dst, dstSlice, dstMip, 0, 0, 0, 0, std::min(srcW, dstW), std::min(srcH, dstH));
+}
+
+// bring t up to date with the newer GPU writes of related surfaces (LatteTexture_UpdateTextureFromDynamicChanges)
+static void update_from_dynamic(Surface* t) {
+    for (size_t r = 0; r < t->relations.size(); r++) {
+        TexRelation* rel = t->relations[r];
+        Surface* base = rel->base;
+        Surface* sub = rel->sub;
+        for (uint32_t m = 0; m < rel->mipCount; m++) {
+            uint32_t n = rel->sliceCount;
+            if (base->dim == 2) n = std::max(n >> m, 1u);
+            for (uint32_t s = 0; s < n; s++) {
+                if (rel->baseSlice + s >= base->mip_slices(rel->baseMip + m) || s >= sub->mip_slices(m)) continue;
+                SliceMip* bi = base->slice_mip(rel->baseSlice + s, rel->baseMip + m);
+                SliceMip* si = sub->slice_mip(s, m);
+                if (t == base) {
+                    if (bi->lastDynamicUpdate < si->lastDynamicUpdate) {
+                        sync_slice(sub, s, m, base, rel->baseSlice + s, rel->baseMip + m);
+                        bi->lastDynamicUpdate = si->lastDynamicUpdate;
+                        if (sub->gpuWritten) t->gpuWritten = true;
+                    }
+                } else if (si->lastDynamicUpdate < bi->lastDynamicUpdate) {
+                    sync_slice(base, rel->baseSlice + s, rel->baseMip + m, sub, s, m);
+                    si->lastDynamicUpdate = bi->lastDynamicUpdate;
+                    if (base->gpuWritten) t->gpuWritten = true;
+                }
+            }
+        }
+    }
+}
+
+void mark_gpu_written(Surface* s, uint32_t slice, uint32_t mip) {
+    const uint64_t ev = next_write_seq();
+    s->gpuWritten = true;
+    s->writeSeq = ev;
+    if (!s->sm.empty() && mip < s->mips && slice < s->mip_slices(mip)) s->slice_mip(slice, mip)->lastDynamicUpdate = ev;
+    for (TexRelation* rel : s->relations) {
+        Surface* other = rel->base == s ? rel->sub : rel->base;
+        other->reloadFromDynamic = true;
+    }
+}
+
+// ---- relations
+static bool find_sub_slice_mip(Surface* base, Surface* sub, uint32_t& baseSlice, uint32_t& baseMip) {
+    SliceMip* si = sub->slice_mip(0, 0);
+    for (uint32_t mip = 0; mip < base->mips; mip++)
+        for (uint32_t slice = 0; slice < base->mip_slices(mip); slice++) {
+            SliceMip* bi = base->slice_mip(slice, mip);
+            if (bi->addrStart == si->addrStart && bi->subIndex == si->subIndex) {
+                baseSlice = slice;
+                baseMip = mip;
+                return true;
+            }
+        }
+    return false;
+}
+static void track_relation(Surface* a, Surface* b) {
+    if (a->addr > b->addr) std::swap(a, b);  // b at a's level 0 or beyond
+    for (TexRelation* r : a->relations)
+        if (r->base == a && r->sub == b) return;
+    if (blocked_relation(a, b)) return;
+    uint32_t baseSlice = 0, baseMip = 0;
+    if (a->addr != b->addr && !find_sub_slice_mip(a, b, baseSlice, baseMip)) return;
+    SliceMip* ai = a->slice_mip(baseSlice, baseMip);
+    SliceMip* bi = b->slice_mip(0, 0);
+    const bool tileOk = (baseMip == 0) ? a->tileMode == b->tileMode : ai->tileMode == bi->tileMode;
+    if (!tileOk || ai->pitch != bi->pitch) return;
+    const uint32_t remaining = a->mip_slices(baseMip) - baseSlice;
+    TexRelation* r = new TexRelation{a, b, baseSlice, baseMip, std::min(remaining, b->slices), 1};
+    a->relations.push_back(r);
+    b->relations.push_back(r);
+}
+static void track_overlap(SliceMip* sm, SliceMip* other) {
+    if (!(sm->addrEnd > other->addrStart && sm->addrStart < other->addrEnd)) return;
+    for (auto& o : sm->overlaps)
+        if (o.second == other) return;
+    sm->overlaps.push_back({other->tex, other});
+    other->overlaps.push_back({sm->tex, sm});
+}
+static void gather_relations(Surface* t) {
+    for (uint32_t mip = 0; mip < t->mips; mip++)
+        for (uint32_t slice = 0; slice < t->mip_slices(mip); slice++) {
+            SliceMip* sm = t->slice_mip(slice, mip);
+            for_occ_buckets(sm->addrStart, sm->addrEnd, [&](std::vector<Occ>& b) {
+                for (size_t i = 0; i < b.size(); i++) {
+                    Occ o = b[i];
+                    Surface* other = o.sm->tex;
+                    if (other == t) continue;
+                    if (!(sm->addrEnd >= o.start && sm->addrStart < o.end)) continue;
+                    if (sm->addrStart == o.start && sm->subIndex == o.sm->subIndex) {
+                        if (sm->pitch == o.sm->pitch && texel_size_compatible(t->format, other->format) && sm->tileMode == o.sm->tileMode &&
+                            format_view_compatible(t->format, other->format))
+                            track_relation(t, other);
+                    } else {
+                        track_overlap(sm, o.sm);
+                    }
+                }
+            });
+        }
+}
+static void delete_relations(Surface* t) {
+    while (!t->relations.empty()) {
+        TexRelation* r = t->relations.front();
+        for (Surface* x : {r->base, r->sub}) x->relations.erase(std::find(x->relations.begin(), x->relations.end(), r));
+        delete r;
+    }
+}
+static void delete_overlaps(Surface* t) {
+    for (auto& sm : t->sm) {
+        for (auto& [other, osm] : sm.overlaps)
+            osm->overlaps.erase(std::remove_if(osm->overlaps.begin(), osm->overlaps.end(), [t](auto& e) { return e.first == t; }), osm->overlaps.end());
+        sm.overlaps.clear();
+    }
+}
+
+// ---- creation and deletion
+static void delete_surface(Surface* t) {
+    if (t->deleted) return;
+    // attached to the open pass: end it (the texture stays alive until the frame's end)
+    bool attached = R.passDepth == t;
+    for (Surface* c : R.passColor) attached = attached || c == t;
+    if (attached) end_encoder();
+    t->deleted = true;
+    for (TexView* v : t->views) view_lookup_remove(v);
+    delete_relations(t);
+    delete_overlaps(t);
+    unregister_occupancy(t);
+    forget_surface_ranges(t);
+    R.linearTargets.erase(std::remove(R.linearTargets.begin(), R.linearTargets.end(), t), R.linearTargets.end());
+    g_all.erase(std::remove(g_all.begin(), g_all.end(), t), g_all.end());
+    auto range = R.surfaces.equal_range(t->addr);
+    for (auto it = range.first; it != range.second; ++it)
+        if (it->second.get() == t) {
+            g_graveyard.push_back(std::move(it->second));
+            R.surfaces.erase(it);
+            break;
+        }
+    g_repeat_texture_init = true;
+}
+
+static MTLTextureType texture_type_for(const Surface* s) {
+    switch ((Latte::E_DIM)s->dim) {
+    case Latte::E_DIM::DIM_1D: return s->slices > 1 ? MTLTextureType1DArray : MTLTextureType1D;
+    case Latte::E_DIM::DIM_1D_ARRAY: return MTLTextureType1DArray;
+    case Latte::E_DIM::DIM_3D: return MTLTextureType3D;
+    case Latte::E_DIM::DIM_CUBEMAP:
+        if (s->slices % 6 == 0 && s->width == s->height) return s->slices == 6 ? MTLTextureTypeCube : MTLTextureTypeCubeArray;
+        return MTLTextureType2DArray;
+    default: return s->slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+    }
+}
+
+static TexView* create_surface(uint32_t dim, uint32_t addr, uint32_t mipAddr, uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
+                               uint32_t pitch, uint32_t mips, uint32_t swizzle, uint32_t tileMode, bool isDepth, float minScale = 0.0f) {
+    auto up = std::make_unique<Surface>();
+    Surface* t = up.get();
+    t->addr = addr;
+    t->mipAddr = mipAddr;
+    t->dim = dim;
+    t->format = format;
+    t->width = std::max(width, 1u);
+    t->height = std::max(height, 1u);
+    t->slices = std::max(depth, 1u);
+    t->pitch = pitch;
+    t->mips = std::max(mips, 1u);
+    t->swizzle = swizzle;
+    t->tileMode = tileMode;
+    t->isDepth = isDepth;
+    t->minScale = minScale;
+    t->fmt = format_info(format, isDepth);
+    if ((Latte::E_DIM)dim == Latte::E_DIM::DIM_3D) t->mips = std::min(t->mips, 1u + (uint32_t)std::log2((double)std::max({t->width, t->height, t->slices})));
+    else t->mips = std::min(t->mips, 1u + (uint32_t)std::log2((double)std::max(t->width, t->height)));
+    float ax, ay;
+    target_aspect(t, ax, ay);
+    t->tex = make_texture(t, texture_type_for(t), target_scale(t), ax, ay);
+    if (!t->tex) {
+        LOG("[gfx] cannot create %ux%ux%u texture (format %X, pixel %lu, mips %u)", t->width, t->height, t->slices, t->format,
+            (unsigned long)t->fmt.pixel, t->mips);
+        return nullptr;
+    }
+    init_slice_mips(t);
+    register_occupancy(t);
+    note_surface_range(t, addr, std::max<uint32_t>(t->dataSize, t->pitch * t->height * 4));  // as invalidate's estimate
+    R.surfaces.emplace(addr, std::move(up));
+    g_all.push_back(t);
+    if (!isDepth && (Latte::E_HWTILEMODE)tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED) R.linearTargets.push_back(t);
+    // the guest memory's current contents (Cemu loads every new texture)
+    t->lastCheckedFrame = R.frame;
+    check_texture(t);
+    t->lastUseFrame = R.frame;
+    t->baseView = get_or_create_view(t, dim, format, 0, t->mips, 0, t->slices);
+    g_repeat_texture_init = true;
+    return t->baseView;
+}
+
+enum ViewCompat { VIEW_COMPATIBLE, VIEW_BASE_TOO_SMALL, VIEW_NOT_COMPATIBLE };
+static bool dim_view_compatible(uint32_t base, uint32_t view) {
+    using D = Latte::E_DIM;
+    const D b = (D)base, v = (D)view;
+    return b == v || (b == D::DIM_CUBEMAP && v == D::DIM_2D) || (b == D::DIM_2D && v == D::DIM_2D_ARRAY) || (b == D::DIM_2D_ARRAY && v == D::DIM_2D) ||
+           (b == D::DIM_CUBEMAP && v == D::DIM_2D_ARRAY) || (b == D::DIM_2D_ARRAY && v == D::DIM_CUBEMAP) || (b == D::DIM_3D && v == D::DIM_2D_ARRAY) ||
+           (b == D::DIM_1D && v == D::DIM_2D) || (b == D::DIM_2D && v == D::DIM_1D);
+}
+static ViewCompat can_be_view(Surface* t, uint32_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint32_t dimView, uint32_t format, bool isDepth,
+                              uint32_t firstMip, uint32_t numMip, uint32_t firstSlice, uint32_t numSlice, uint32_t& relMip, uint32_t& relSlice) {
+    relMip = relSlice = 0;
+    if (!format_view_compatible(t->format, format)) return VIEW_NOT_COMPATIBLE;
+    if (t->addr == addr && t->pitch == pitch) {
+        if (t->isDepth != isDepth) return VIEW_NOT_COMPATIBLE;
+        if (!texel_size_compatible(t->format, format) || t->width != width || t->height != height) return VIEW_NOT_COMPATIBLE;
+        // a volume's slices rendered one at a time: views of one slice (this renderer renders into depth planes)
+        const bool volume = (Latte::E_DIM)dimView == Latte::E_DIM::DIM_3D && (Latte::E_DIM)t->dim == Latte::E_DIM::DIM_3D;
+        if (!volume && !dim_view_compatible(t->dim, dimView)) return VIEW_NOT_COMPATIBLE;
+        if (t->format != format) return VIEW_NOT_COMPATIBLE;  // one texture per format; related textures sync
+        if (firstMip + numMip > t->mips || firstSlice + numSlice > t->slices) return VIEW_BASE_TOO_SMALL;
+        return VIEW_COMPATIBLE;
+    }
+    // another address or pitch: one of its mips or slices?
+    if (numMip > 1 || (Latte::E_DIM)t->dim == Latte::E_DIM::DIM_3D) return VIEW_NOT_COMPATIBLE;
+    if (LatteAddrLib::TM_IsThickAndMacroTiled((Latte::E_HWTILEMODE)t->tileMode)) return VIEW_NOT_COMPATIBLE;
+    for (uint32_t m = 0; m < t->mips; m++) {
+        if (t->slice_mip(0, m)->pitch != pitch) continue;
+        for (uint32_t s = 0; s < t->mip_slices(m); s++) {
+            SliceMip* sm = t->slice_mip(s, m);
+            if (sm->addrStart != addr || sm->pitch != pitch) continue;
+            if (t->isDepth != isDepth) return VIEW_NOT_COMPATIBLE;
+            if (std::max(t->width >> m, 1u) != width || std::max(t->height >> m, 1u) != height) return VIEW_NOT_COMPATIBLE;
+            if (!texel_size_compatible(t->format, format) || !dim_view_compatible(t->dim, dimView) || t->format != format) return VIEW_NOT_COMPATIBLE;
+            relMip = m;
+            relSlice = s;
+            if (m + firstMip + numMip > t->mips || s + firstSlice + numSlice > t->slices) return VIEW_BASE_TOO_SMALL;
+            return VIEW_COMPATIBLE;
+        }
+    }
+    return VIEW_NOT_COMPATIBLE;
+}
+
+// related surfaces that are now views of t: dropped (their data is in t)
+static void delete_absorbed(Surface* t) {
+    for (bool again = true; again;) {
+        again = false;
+        for (TexRelation* rel : t->relations) {
+            Surface* o = rel->base != t ? rel->base : rel->sub;
+            uint32_t rm, rs;
+            if (can_be_view(t, o->addr, o->width, o->height, o->pitch, o->dim, o->format, o->isDepth, 0, o->mips, 0, o->slices, rm, rs) ==
+                VIEW_COMPATIBLE) {
+                delete_surface(o);
+                again = true;
+                break;
+            }
+        }
+    }
+}
+
+static TexView* create_mapping(uint32_t addr, uint32_t mipAddr, uint32_t width, uint32_t height, uint32_t depth, uint32_t pitch, uint32_t tileMode,
+                               uint32_t swizzle, uint32_t firstMip, uint32_t numMip, uint32_t firstSlice, uint32_t numSlice, uint32_t format,
+                               uint32_t dimBase, uint32_t dimView, bool isDepth, bool allowCreate = true);
+
+static bool recreate_bigger(Surface* t, uint32_t mipAddr, uint32_t newMips, uint32_t newDepth) {
+    uint32_t dim = t->dim;
+    if ((Latte::E_DIM)dim == Latte::E_DIM::DIM_2D && newDepth > 1) dim = (uint32_t)Latte::E_DIM::DIM_2D_ARRAY;
+    else if ((Latte::E_DIM)dim == Latte::E_DIM::DIM_1D && newDepth > 1) dim = (uint32_t)Latte::E_DIM::DIM_1D_ARRAY;
+    end_encoder();
+    TexView* v = create_surface(dim, t->addr, mipAddr, t->format, t->width, t->height, newDepth, t->pitch, newMips, t->swizzle, t->tileMode, t->isDepth,
+                                t->minScale);
+    if (!v) return false;
+    Surface* n = v->tex;
+    if (n->mips < newMips || n->slices < newDepth) {  // could not grow (size limits): keep the old one
+        delete_surface(n);
+        return false;
+    }
+    if (t->gpuWritten) {
+        copy_data(t, n, std::min(t->mips, n->mips), std::min(t->slices, n->slices));
+        n->gpuWritten = true;
+        n->writeSeq = t->writeSeq;
+    }
+    n->lastRenderTargetSwizzle = t->lastRenderTargetSwizzle;
+    static int logged = 0;
+    if (logged++ < 40)
+        LOG("[tc] %08X %ux%u f%X%s: %u mips x %u slices -> %u x %u", t->addr, t->width, t->height, t->format, t->isDepth ? " depth" : "", t->mips,
+            t->slices, n->mips, n->slices);
+    delete_surface(t);
+    gather_relations(n);
+    update_from_dynamic(n);
+    delete_absorbed(n);
+    return true;
+}
+
+static TexView* create_mapping(uint32_t addr, uint32_t mipAddr, uint32_t width, uint32_t height, uint32_t depth, uint32_t pitch, uint32_t tileMode,
+                               uint32_t swizzle, uint32_t firstMip, uint32_t numMip, uint32_t firstSlice, uint32_t numSlice, uint32_t format,
+                               uint32_t dimBase, uint32_t dimView, bool isDepth, bool allowCreate) {
+    if (!format || !width || !height) return nullptr;
+    depth = std::max(depth, 1u);
+    numMip = std::max(numMip, 1u);
+    numSlice = std::max(numSlice, 1u);
+    // surfaces starting at the address of one of the requested slices
+    std::vector<Surface*> overlapping;
+    const uint32_t sliceCount = std::min(firstSlice + numSlice, std::max(depth, firstSlice + numSlice));
+    for (uint32_t slice = 0; slice < sliceCount && slice < 64; slice++) {
+        uint32_t a = 0, size = 0;
+        sint32 sub = 0;
+        LatteAddrLib::CalculateMipAndSliceAddr(addr, mipAddr, (Latte::E_GX2SURFFMT)format, width, height, std::max(depth, sliceCount), (Latte::E_DIM)dimBase,
+                                               (Latte::E_HWTILEMODE)tileMode, swizzle, 0, 0, slice, &a, &size, &sub);
+        for_occ_buckets(a, a + size, [&](std::vector<Occ>& b) {
+            for (auto& o : b)
+                if (a + size >= o.start && a < o.end && a == o.start &&
+                    std::find(overlapping.begin(), overlapping.end(), o.sm->tex) == overlapping.end())
+                    overlapping.push_back(o.sm->tex);
+        });
+    }
+    for (Surface* t : overlapping) {
+        if (t->deleted) continue;
+        uint32_t rm, rs;
+        ViewCompat c = can_be_view(t, addr, width, height, pitch, dimView, format, isDepth, firstMip, numMip, firstSlice, numSlice, rm, rs);
+        if (c == VIEW_NOT_COMPATIBLE) { allowCreate = true; continue; }
+        if (c == VIEW_BASE_TOO_SMALL) {
+            if (rm || rs) { allowCreate = true; continue; }
+            const uint32_t newDepth = std::max(rs + firstSlice + numSlice, std::max(depth, t->slices));
+            const uint32_t newMips = std::max(rm + firstMip + numMip, t->mips);
+            if (!recreate_bigger(t, rm + firstMip + numMip > 1 ? mipAddr : t->mipAddr, newMips, newDepth)) { allowCreate = true; continue; }
+            return create_mapping(addr, mipAddr, width, height, depth, pitch, tileMode, swizzle, firstMip, numMip, firstSlice, numSlice, format, dimBase,
+                                  dimView, isDepth);
+        }
+        TexView* v = get_or_create_view(t, dimView, format, rm + firstMip, numMip, rs + firstSlice, numSlice);
+        if (rm || rs) view_lookup_add(v, rm, rs);  // also found by this address
+        return v;
+    }
+    if (!allowCreate) return nullptr;
+    TexView* base = create_surface(dimBase, addr, mipAddr, format, width, height, std::max(depth, firstSlice + numSlice), pitch, firstMip + numMip,
+                                   swizzle, tileMode, isDepth);
+    if (!base) return nullptr;
+    Surface* t = base->tex;
+    gather_relations(t);
+    update_from_dynamic(t);
+    delete_absorbed(t);
+    return get_or_create_view(t, dimView, format, firstMip, std::min(numMip, t->mips - std::min(firstMip, t->mips - 1)), firstSlice, numSlice);
+}
+
+// a surface written by other GPU writes over all of its first levels' memory (Cemu: LatteTC_IsTextureDataOverwritten)
+static bool data_overwritten(Surface* t) {
+    for (uint32_t mip = 0; mip < std::min(t->mips, 3u); mip++)
+        for (uint32_t slice = 0; slice < t->mip_slices(mip); slice++) {
+            SliceMip* sm = t->slice_mip(slice, mip);
+            bool outdated = false;
+            for (auto& [o, osm] : sm->overlaps)
+                if (sm->lastDynamicUpdate < osm->lastDynamicUpdate) { outdated = true; break; }
+            if (!outdated) return false;
+        }
+    return true;
+}
+
+// keep t's contents current before a use: CPU writes to its memory (once a frame), newer GPU writes to related surfaces
+static void update_to_latest(Surface* t) {
+    if (!t->gpuWritten && t->lastCheckedFrame != R.frame) {
+        t->lastCheckedFrame = R.frame;
+        check_texture(t);
+    }
+    if (t->reloadFromDynamic) {
+        t->reloadFromDynamic = false;
+        update_from_dynamic(t);
+    }
+    t->lastUseFrame = R.frame;
+}
+
+void texture_cache_frame_end() {
+    // Cemu's cleanup: a few surfaces a frame. CPU textures unused for a long time (reloaded from guest
+    // memory when needed again) and surfaces all of whose memory other GPU writes have replaced.
+    static size_t scan = 0;
+    int deleted = 0;
+    for (int c = 0; c < 25 && !g_all.empty() && deleted < 10; c++) {
+        if (scan >= g_all.size()) scan = 0;
+        Surface* t = g_all[scan++];
+        const uint64_t idle = R.frame - t->lastUseFrame;
+        if ((!t->gpuWritten && idle >= 2000) || (idle >= 6 && data_overwritten(t))) {
+            delete_surface(t);
+            deleted++;
+            scan--;
+        }
+    }
+    if (!g_graveyard.empty()) {
+        end_encoder();
+        for (auto& t : g_graveyard)
+            for (TexView* v : t->views) delete v;
+        g_graveyard.clear();
+        forget_texture_views();
+    }
+    g_repeat_texture_init = false;
+}
+
+// ---- lookups
+TexView* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     Latte::LATTE_SQ_TEX_RESOURCE_WORD0_N w0;
     Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N w1;
     Latte::LATTE_SQ_TEX_RESOURCE_WORD4_N w4;
@@ -883,8 +1224,7 @@ static Surface* sampled_texture_uncached(const uint32_t* w, bool isDepthSampler)
     uint32_t width = w0.get_WIDTH() + 1;
     uint32_t height = w1.get_HEIGHT() + 1;
     uint32_t depth = w1.get_DEPTH();
-    if (dim == Latte::E_DIM::DIM_2D_ARRAY || dim == Latte::E_DIM::DIM_3D || dim == Latte::E_DIM::DIM_2D_ARRAY_MSAA ||
-        dim == Latte::E_DIM::DIM_1D_ARRAY)
+    if (dim == Latte::E_DIM::DIM_2D_ARRAY || dim == Latte::E_DIM::DIM_3D || dim == Latte::E_DIM::DIM_2D_ARRAY_MSAA || dim == Latte::E_DIM::DIM_1D_ARRAY)
         depth += 1;
     else {
         if (dim == Latte::E_DIM::DIM_CUBEMAP) depth = 6 * (depth + 1);
@@ -893,56 +1233,159 @@ static Surface* sampled_texture_uncached(const uint32_t* w, bool isDepthSampler)
     if (dim == Latte::E_DIM::DIM_1D || dim == Latte::E_DIM::DIM_1D_ARRAY) height = 1;
     auto tileMode = w0.get_TILE_MODE();
     if (Latte::IsCompressedFormat(w1.get_DATA_FORMAT())) pitch /= 4;
+    // the view: first slice / mip and how many (Cemu: word5 BASE_ARRAY..LAST_ARRAY, word4 BASE_LEVEL..word5 LAST_LEVEL)
+    uint32_t firstSlice = w5.get_BASE_ARRAY(), lastSlice = w5.get_LAST_ARRAY();
+    uint32_t numSlice = lastSlice >= firstSlice ? lastSlice + 1 - firstSlice : 1;
+    uint32_t firstMip = w4.get_BASE_LEVEL(), lastMip = w5.get_LAST_LEVEL();
+    uint32_t numMip = lastMip >= firstMip ? lastMip + 1 - firstMip : 1;
+    if (dim == Latte::E_DIM::DIM_2D_MSAA || !mipAddr) { firstMip = 0; numMip = 1; }
+    {  // levels the size has
+        uint32_t m = std::max(width, height);
+        if (dim == Latte::E_DIM::DIM_3D) m = std::max(m, depth);
+        const uint32_t maxMips = 1 + (uint32_t)std::log2((double)m);
+        firstMip = std::min(firstMip, maxMips - 1);
+        numMip = std::max(1u, std::min(numMip, maxMips - firstMip));
+    }
+    if (firstSlice >= depth) { firstSlice = 0; numSlice = depth; }
+    numSlice = std::min(numSlice, depth - firstSlice);
+    if (dim == Latte::E_DIM::DIM_3D) { firstSlice = 0; numSlice = depth; }
     uint32_t swizzle = 0;
     if (Latte::TM_IsMacroTiled(tileMode)) {
         swizzle = addr & 0x700;
         addr &= ~0x700u;
     }
-    SurfaceDesc d;
-    d.addr = addr;
-    d.mipAddr = mipAddr;
-    d.width = width;
-    d.height = height;
-    d.slices = depth;
-    d.pitch = pitch;
-    d.mips = w5.get_LAST_LEVEL() + 1;
-    d.format = (uint32_t)LatteTexture_ReconstructGX2Format(w1, w4);
-    d.dim = (uint32_t)dim;
-    d.tileMode = (uint32_t)tileMode;
-    d.swizzle = swizzle;
-    d.isDepth = false;
-    // a depth-compare fetch (shadow maps) reads the depth buffer the game rendered at this address.
-    // Look among depth surfaces first, like the Vulkan renderer: the generic lookup below also
-    // accepts colour surfaces, and a GPU-written colour surface of the same size and format at that
-    // address (memory the game used for something else earlier in the session) would win over it,
-    // which makes the result depend on what was rendered before. No depth surface there yet (the
-    // map isn't rendered): the generic lookup as before, no CPU-uploaded depth texture.
-    if (isDepthSampler) {
-        SurfaceDesc dd = d;
-        dd.isDepth = true;
-        if (Surface* s = find_surface(dd, false); s && s->gpuWritten) return s;
+    const uint32_t format = (uint32_t)LatteTexture_ReconstructGX2Format(w1, w4);
+    TexView* v = isDepthSampler ? view_lookup(addr, width, height, pitch, firstMip, numMip, firstSlice, numSlice, format, (uint32_t)dim, 1)
+                                : view_lookup(addr, width, height, pitch, firstMip, numMip, firstSlice, numSlice, format, (uint32_t)dim);
+    if (!v) {
+        if (R.binding) return nullptr;  // looked up by the draw's preflight; nothing is created while binding
+        v = create_mapping(addr, mipAddr, width, height, depth, pitch, (uint32_t)tileMode, swizzle, firstMip, numMip, firstSlice, numSlice, format,
+                           (uint32_t)dim, (uint32_t)dim, isDepthSampler);
+        if (!v) return nullptr;
     }
-    Surface* s = find_or_create_surface(d, false);
-    if (s && !s->gpuWritten && s->lastCheckedFrame != R.frame) {
-        s->lastCheckedFrame = R.frame;
-        check_texture(s);
+    Surface* t = v->tex;
+    if (R.binding) return v;
+    // a changed swizzle or mip address: the same memory holds something else now (unless the last render used that swizzle)
+    bool reload = false;
+    if (t->swizzle != swizzle) {
+        if (swizzle == t->lastRenderTargetSwizzle) t->swizzle = swizzle;
+        else reload = true;
+    } else if (firstMip + numMip > 1 && t->mipAddr != mipAddr && mipAddr) {
+        reload = true;
+    }
+    if (reload && t->gpuWritten) {  // GPU contents are kept (Cemu reloads from guest memory here)
+        static int logged = 0;
+        if (logged++ < 20)
+            LOG("[tc] %08X %ux%u f%X sampled with swizzle %X / mip address %08X (was %X / %08X)", t->addr, t->width, t->height, t->format, swizzle,
+                mipAddr, t->swizzle, t->mipAddr);
+        reload = false;
+    }
+    if (reload) {
+        t->swizzle = swizzle;
+        if (firstMip + numMip > 1 && mipAddr) t->mipAddr = mipAddr;
+        {
+            t->dirty = true;
+            t->contentHash = 0;
+            t->writeSeq = 0;
+            t->gpuWritten = false;
+            t->levelRanges.clear();
+            t->lastCheckedFrame = R.frame;
+            check_texture(t);
+        }
     }
     {  // debug: WWHD_TRACE_TEX=hexaddr logs what a sampled lookup at that address resolved to (60 times)
         static const uint32_t trace = getenv("WWHD_TRACE_TEX") ? (uint32_t)strtoul(getenv("WWHD_TRACE_TEX"), nullptr, 16) : 0;
         static int traced = 0;
-        if (trace && d.addr == trace && traced++ < 60) {
-            int n = 0;
-            auto range = R.surfaces.equal_range(d.addr);
-            for (auto it = range.first; it != range.second; ++it) n++;
-            LOG("[tracetex] f%llu want %ux%u x%u f%X dim %u mips %u tm %u -> %s %ux%u x%u f%X tex %lux%lux%lu type %lu gpu %d seq %llu (%d surfaces here)",
-                (unsigned long long)R.frame, d.width, d.height, d.slices, d.format, d.dim, d.mips, d.tileMode, s ? "found" : "none",
-                s ? s->width : 0, s ? s->height : 0, s ? s->slices : 0, s ? s->format : 0, s && s->tex ? (unsigned long)s->tex.width : 0,
-                s && s->tex ? (unsigned long)s->tex.height : 0, s && s->tex ? (unsigned long)s->tex.arrayLength : 0,
-                s && s->tex ? (unsigned long)s->tex.textureType : 0, s ? s->gpuWritten : 0, s ? (unsigned long long)s->writeSeq : 0, n);
-        }
+        if (trace && addr == trace && traced++ < 60)
+            LOG("[tracetex] f%llu want %ux%u x%u f%X dim %u mips %u+%u slices %u+%u -> %08X %ux%u x%u f%X mips %u tex %lux%lu gpu %d seq %llu",
+                (unsigned long long)R.frame, width, height, depth, format, (uint32_t)dim, firstMip, numMip, firstSlice, numSlice, t->addr, t->width,
+                t->height, t->slices, t->format, t->mips, (unsigned long)t->tex.width, (unsigned long)t->tex.height, t->gpuWritten,
+                (unsigned long long)t->writeSeq);
     }
-    if (s && s->gpuWritten && !isDepthSampler && d.slices > 1) return with_array_layers(s, d);
-    return s && s->gpuWritten && d.mips > 1 && !isDepthSampler ? with_mip_chain(s, d) : s;
+    update_to_latest(t);
+    return v;
+}
+
+// a render target: a view of one slice of one level (Cemu: LatteMRT::GetColorAttachmentTexture / UpdateCurrentFBO)
+static TexView* target_view(uint32_t addr, uint32_t width, uint32_t height, uint32_t slices, uint32_t pitch, uint32_t tileMode, uint32_t format,
+                            uint32_t slice, bool volume, bool isDepth) {
+    uint32_t swizzle = 0;
+    if (Latte::TM_IsMacroTiled((Latte::E_HWTILEMODE)tileMode)) {
+        swizzle = addr & 0x700;
+        addr &= ~0x700u;
+    }
+    TexView* v = view_lookup_slice(addr, width, height, pitch, 0, slice, format, isDepth ? 1 : 0);
+    if (v && volume && (Latte::E_DIM)v->dim != Latte::E_DIM::DIM_3D) v = nullptr;
+    if (!v) {
+        const uint32_t dimBase = volume ? (uint32_t)Latte::E_DIM::DIM_3D : slices > 1 ? (uint32_t)Latte::E_DIM::DIM_2D_ARRAY : (uint32_t)Latte::E_DIM::DIM_2D;
+        const uint32_t dimView = volume ? (uint32_t)Latte::E_DIM::DIM_3D : (uint32_t)Latte::E_DIM::DIM_2D;
+        v = create_mapping(addr, 0, width, height, std::max(slices, slice + 1), pitch, tileMode, swizzle, 0, 1, slice, 1, format, dimBase, dimView, isDepth);
+        if (!v) return nullptr;
+    }
+    Surface* t = v->tex;
+    if (t->swizzle != swizzle) t->lastRenderTargetSwizzle = swizzle;
+    update_to_latest(t);
+    // the internal resolution (or aspect ratio) changed since it was made: reallocate it
+    rescale(t);
+    return v;
+}
+
+// CB_COLOR_BASE holds the full guest address; CB_COLOR_TILE/FRAG hold width/height (our convention).
+TexView* color_target(const uint32_t* regs, int i) {
+    uint32_t base = regs[mmCB_COLOR0_BASE + i];
+    if (!base) return nullptr;
+    uint32_t size = regs[mmCB_COLOR0_SIZE + i], info = regs[mmCB_COLOR0_INFO + i];
+    uint32_t pitch = ((size & 0x3FF) + 1) * 8;
+    uint32_t height = (((size >> 10) & 0xFFFFF) + 1) * 64 / pitch;
+    // our convention (GX2SetColorBuffer, gx2.h kColorTarget3D): TILE = width | slices << 16 | volume flag, FRAG = height
+    uint32_t tile = regs[mmCB_COLOR0_TILE + i];
+    uint32_t w = tile & 0xFFFF, h = regs[mmCB_COLOR0_FRAG + i];
+    uint32_t slices = gx2::color_target_slices(tile);
+    bool volume = (tile & gx2::kColorTarget3D) != 0;
+    uint32_t slice = slices > 1 ? std::min<uint32_t>(regs[mmCB_COLOR0_VIEW + i] & 0x7FF, slices - 1) : 0;
+    static const uint32_t numberBits[8] = {0, 0x200, 0, 0, 0x100, 0x300, 0x400, 0x800};
+    uint32_t format = ((info >> 2) & 0x3F) | numberBits[(info >> 12) & 7];
+    return target_view(base, w ? w : pitch, h ? h : height, slices, pitch, (info >> 8) & 0xF, format, slice, volume, false);
+}
+
+TexView* depth_target(const uint32_t* regs) {
+    uint32_t base = regs[mmDB_DEPTH_BASE];
+    if (!base) return nullptr;
+    uint32_t slices = std::max<uint32_t>(regs[gx2::kDepthSlicesReg], 1);
+    uint32_t slice = slices > 1 ? std::min<uint32_t>(regs[mmDB_DEPTH_VIEW] & 0x7FF, slices - 1) : 0;
+    uint32_t size = regs[mmDB_DEPTH_SIZE], info = regs[mmDB_DEPTH_INFO];
+    uint32_t pitch = ((size & 0x3FF) + 1) * 8;
+    uint32_t height = (((size >> 10) & 0xFFFFF) + 1) * 64 / pitch;
+    uint32_t wh = regs[mmDB_HTILE_DATA_BASE];  // our convention: width << 16 | height
+    static const uint32_t fmts[8] = {0, 0x005, 0, 0x011, 0, 0x811, 0x80E, 0x81C};
+    return target_view(base, wh ? (wh >> 16) : pitch, wh ? (wh & 0xFFFF) : height, slices, pitch, (info >> 15) & 0xF, fmts[info & 7], slice, false, true);
+}
+
+TexView* surface_from_color_buffer(uint32_t addr, uint32_t* numSlices) {
+    auto* cb = (GX2::GX2ColorBuffer*)mem::ptr(addr);
+    const bool volume = cb->surface.dim.value() == Latte::E_DIM::DIM_3D;
+    const uint32_t slices = cb->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(cb->surface.depth, 1)
+                            : volume ? std::max<uint32_t>(cb->surface.depth >> cb->viewMip, 1) : 1;
+    const uint32_t first = std::min<uint32_t>(cb->viewFirstSlice, slices - 1);
+    if (numSlices) *numSlices = std::clamp<uint32_t>(cb->viewNumSlices, 1, slices - first);
+    LatteAddrLib::AddrSurfaceInfo_OUT info{};
+    LatteAddrLib::GX2CalculateSurfaceInfo(cb->surface.format, cb->surface.width, cb->surface.height, cb->surface.depth, cb->surface.dim,
+                                          cb->surface.tileMode, cb->surface.aa, cb->viewMip, &info);
+    return target_view(gx2::color_buffer_address(cb), std::max<uint32_t>(cb->surface.width >> cb->viewMip, 1),
+                       std::max<uint32_t>(cb->surface.height >> cb->viewMip, 1), slices, cb->viewMip ? info.pitch : (uint32_t)cb->surface.pitch,
+                       (uint32_t)info.hwTileMode, (uint32_t)cb->surface.format.value(), first, volume, false);
+}
+
+TexView* surface_from_depth_buffer(uint32_t addr, uint32_t* numSlices) {
+    auto* db = (GX2::GX2DepthBuffer*)mem::ptr(addr);
+    const uint32_t slices = db->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(db->surface.depth, 1) : 1;
+    const uint32_t first = std::min<uint32_t>(db->viewFirstSlice, slices - 1);
+    if (numSlices) *numSlices = std::clamp<uint32_t>(db->viewNumSlices, 1, slices - first);
+    LatteAddrLib::AddrSurfaceInfo_OUT info{};
+    LatteAddrLib::GX2CalculateSurfaceInfo(db->surface.format, db->surface.width, db->surface.height, db->surface.depth, db->surface.dim,
+                                          db->surface.tileMode, db->surface.aa, 0, &info);
+    return target_view(gx2::depth_buffer_address(db), db->surface.width, db->surface.height, slices, db->surface.pitch, (uint32_t)info.hwTileMode,
+                       (uint32_t)db->surface.format.value(), first, false, true);
 }
 
 // Guest ranges of every level the upload reads (base first), computed once: a Surface's geometry
@@ -1199,7 +1642,8 @@ uint64_t g_stat_pass_splits;
 static double ms_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 void upload_surface(Surface* s) {
-    if (!s->tex || s->gpuWritten) return;
+    // depth buffers are not loaded from guest memory (their contents come from the GPU)
+    if (!s->tex || s->gpuWritten || s->fmt.depth) return;
     const FormatInfo& f = s->fmt;
     const auto& ranges = level_ranges(s);
     const double t0 = ms_now();
@@ -1213,8 +1657,25 @@ void upload_surface(Surface* s) {
     if (R.enc) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
     end_encoder();
     const double t1 = ms_now();
+    // a texture at the internal resolution (its size matched a scaling rule): the guest-size picture is
+    // uploaded to a scratch texture and filtered up into level 0 (a CPU texture at a render target's size)
+    const bool scaled = s->sx != 1.0f || s->sy != 1.0f;
+    id<MTLTexture> target = s->tex;
+    if (scaled) {
+        if (f.compressed || s->tex.textureType == MTLTextureType3D) return;
+        MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+        td.textureType = s->slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+        td.pixelFormat = s->tex.pixelFormat;
+        td.width = s->width;
+        td.height = s->height;
+        td.arrayLength = s->slices > 1 ? s->slices : 1;
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        target = [R.device newTextureWithDescriptor:td];
+        if (!target) return;
+    }
     id<MTLBlitCommandEncoder> blit = TIMED_BLIT();
-    for (uint32_t level = 0; level < ranges.size(); level++) {
+    for (uint32_t level = 0; level < (scaled ? 1u : (uint32_t)ranges.size()); level++) {
         uint32_t base = ranges[level].first;
         uint32_t w, h, slices, bw, bh;
         level_dims(s, level, w, h, slices, bw, bh);
@@ -1223,24 +1684,34 @@ void upload_surface(Surface* s) {
         uint8_t* dst = nullptr;
         id<MTLBuffer> staging = upload_reserve((uint32_t)((size_t)bw * bh * slices * f.hostBytesPerBlock), &stagingOffset, &dst);
         decode_level(s, level, base, dst);
-        bool is3D = s->tex.textureType == MTLTextureType3D;
-        uint32_t layers = (uint32_t)layer_count(s->tex);
+        bool is3D = target.textureType == MTLTextureType3D;
+        uint32_t layers = (uint32_t)layer_count(target);
         uint32_t perSlice = bw * bh * f.hostBytesPerBlock;
         for (uint32_t z = 0; z < (is3D ? 1 : std::min(slices, layers)); z++) {
             [blit copyFromBuffer:staging
                      sourceOffset:stagingOffset + (NSUInteger)z * perSlice
                 sourceBytesPerRow:bw * f.hostBytesPerBlock
               sourceBytesPerImage:perSlice
-                       sourceSize:MTLSizeMake(f.compressed ? std::min<NSUInteger>(bw * 4, std::max<NSUInteger>(s->tex.width >> level, 1)) : w,
-                                              f.compressed ? std::min<NSUInteger>(bh * 4, std::max<NSUInteger>(s->tex.height >> level, 1)) : h,
+                       sourceSize:MTLSizeMake(f.compressed ? std::min<NSUInteger>(bw * 4, std::max<NSUInteger>(target.width >> level, 1)) : w,
+                                              f.compressed ? std::min<NSUInteger>(bh * 4, std::max<NSUInteger>(target.height >> level, 1)) : h,
                                               is3D ? slices : 1)
-                        toTexture:s->tex
+                        toTexture:target
                  destinationSlice:z
                  destinationLevel:level
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
     }
     [blit endEncoding];
+    if (scaled)
+        for (uint32_t z = 0; z < std::min<uint32_t>(s->slices, (uint32_t)layer_count(s->tex)); z++) {
+            id<MTLTexture> sv = [target newTextureViewWithPixelFormat:target.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1)
+                                                               slices:NSMakeRange(z, 1)];
+            id<MTLTexture> dv = [s->tex newTextureViewWithPixelFormat:s->tex.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1)
+                                                               slices:NSMakeRange(z, 1)];
+            g_resample_why = "scaled upload";
+            resample(sv, dv, f, 1);
+            g_resample_why = nullptr;
+        }
     g_stat_decode_ms += ms_now() - t1;
 }
 
@@ -1402,16 +1873,11 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
     uint32_t w = std::max<uint32_t>(s->width >> srcMip, 1), h = std::max<uint32_t>(s->height >> srcMip, 1);
     FormatInfo f = format_info((uint32_t)s->format.value(), false);
 
-    // GPU-produced source: copy texture to texture. Of the source's GPU images (format views), the
-    // one in the source's format, else the most recent; a newer view is copied into it first.
-    Surface* gpuSrc = nullptr;
-    auto range = R.surfaces.equal_range(sbase);
-    for (auto it = range.first; it != range.second; ++it) {
-        Surface* c = it->second.get();
-        if (!c->gpuWritten || c->width != w || c->height != h) continue;
-        auto key = [&](Surface* x) { return std::make_pair(x->format == (uint32_t)s->format.value(), x->writeSeq); };
-        if (!gpuSrc || key(c) > key(gpuSrc)) gpuSrc = c;
-    }
+    // Cemu (LatteSurfaceCopy_copySurfaceNew): with the source in the texture cache, a GPU copy into the
+    // destination's surface (made if needed); else the copy is done in guest memory.
+    LatteAddrLib::AddrSurfaceInfo_OUT si{}, di{};
+    LatteAddrLib::GX2CalculateSurfaceInfo(s->format, s->width, s->height, s->depth, s->dim, s->tileMode, s->aa, srcMip, &si);
+    LatteAddrLib::GX2CalculateSurfaceInfo(d->format, d->width, d->height, d->depth, d->dim, d->tileMode, d->aa, dstMip, &di);
     // each distinct kind of copy is logged once (size, formats, tile modes, path taken): finds
     // copies that silently produce nothing (save thumbnails were black)
     auto note = [&](const char* path) {
@@ -1425,88 +1891,77 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         if (path[0] == 'C') { g_copy_cpu++; g_copy_cpu_bytes += (uint64_t)w * h * 4; }
         else g_copy_gpu++;
     };
-    if (gpuSrc) {
-        Surface* src = adopt_newer_alias(gpuSrc);
-        SurfaceDesc dd;
-        dd.addr = dbase;
-        dd.width = std::max<uint32_t>(d->width >> dstMip, 1);
-        dd.height = std::max<uint32_t>(d->height >> dstMip, 1);
-        dd.pitch = d->pitch;
-        dd.format = (uint32_t)d->format.value();
-        dd.tileMode = (uint32_t)d->tileMode.value();
-        // an array (or cube) destination is looked up whole and the copy goes to its slice; slice 0 of a
-        // one-layer alias left the array's other layers unwritten (BotW's water reads layer 1 of one)
-        const auto ddim = d->dim.value();
-        if (ddim == Latte::E_DIM::DIM_2D_ARRAY || ddim == Latte::E_DIM::DIM_CUBEMAP) {
-            dd.slices = std::max<uint32_t>((uint32_t)d->depth, 1);
-            dd.dim = (uint32_t)ddim;
+    auto split = [](uint32_t a, Latte::E_HWTILEMODE hwTileMode, uint32_t& swz) {
+        swz = 0;
+        if (Latte::TM_IsMacroTiled(hwTileMode)) { swz = a & 0x700; a &= ~0x700u; }
+        return a;
+    };
+    const uint32_t sformat = (uint32_t)s->format.value(), dformat = (uint32_t)d->format.value();
+    uint32_t sswzBits = 0, dswzBits = 0;
+    const uint32_t sAddr = split(srcMip ? sbase : sbase ^ (Latte::TM_IsMacroTiled((Latte::E_HWTILEMODE)si.hwTileMode) ? (s->swizzle & 0x700) : 0),
+                                 si.hwTileMode, sswzBits);
+    const uint32_t dAddr = split(dstMip ? dbase : dbase ^ (Latte::TM_IsMacroTiled((Latte::E_HWTILEMODE)di.hwTileMode) ? (d->swizzle & 0x700) : 0),
+                                 di.hwTileMode, dswzBits);
+    const uint32_t sPitch = si.pitch, dPitch = di.pitch;
+    TexView* sv = (Latte::E_GX2TILEMODE)s->tileMode.value() == Latte::E_GX2TILEMODE::TM_LINEAR_SPECIAL
+                      ? nullptr
+                      : view_lookup_slice_min(sAddr, w, h, sPitch, 0, srcSlice, sformat);
+    if (!sv && (Latte::E_GX2TILEMODE)s->tileMode.value() != Latte::E_GX2TILEMODE::TM_LINEAR_SPECIAL)
+        sv = create_mapping(sAddr, 0, w, h, srcSlice + 1, sPitch, (uint32_t)si.hwTileMode, sswzBits, 0, 1, srcSlice, 1, sformat,
+                            srcSlice ? (uint32_t)Latte::E_DIM::DIM_2D_ARRAY : (uint32_t)Latte::E_DIM::DIM_2D, (uint32_t)Latte::E_DIM::DIM_2D, false, false);
+    if (sv && !sv->tex->gpuWritten) sv = nullptr;  // CPU data only: the guest-memory copy below is exact
+    if (sv) {
+        Surface* src = sv->tex;
+        update_to_latest(src);
+        const uint32_t dw = std::max<uint32_t>(d->width >> dstMip, 1), dh = std::max<uint32_t>(d->height >> dstMip, 1);
+        TexView* dv = view_lookup_slice_min(dAddr, std::min(w, dw), std::min(h, dh), dPitch, 0, dstSlice, dformat);
+        if (!dv) {
+            const auto ddim = d->dim.value();
+            uint32_t dimBase = (uint32_t)Latte::E_DIM::DIM_2D;
+            uint32_t depth = 1;
+            if (ddim == Latte::E_DIM::DIM_2D_ARRAY || ddim == Latte::E_DIM::DIM_CUBEMAP) {
+                depth = std::max<uint32_t>((uint32_t)d->depth, dstSlice + 1);
+                dimBase = ddim == Latte::E_DIM::DIM_CUBEMAP && depth % 6 == 0 ? (uint32_t)Latte::E_DIM::DIM_CUBEMAP : (uint32_t)Latte::E_DIM::DIM_2D_ARRAY;
+            }
+            dv = create_mapping(dAddr, 0, dw, dh, depth, dPitch, (uint32_t)di.hwTileMode, dswzBits, 0, 1, dstSlice, 1, dformat, dimBase,
+                                (uint32_t)Latte::E_DIM::DIM_2D, false);
         }
-        Surface* dst = find_or_create_surface(dd, true);
-        if (!dst) {
-            note("GPU source, no destination image (skipped)");
+        if (!dv) {
+            note("GPU source, no destination surface (skipped)");
             return;
         }
-        const NSUInteger srcLayer = srcSlice < layer_count(src->tex) ? srcSlice : 0;
-        const NSUInteger dstLayer = std::min<NSUInteger>(dstSlice, layer_count(dst->tex) - 1);
-        // the source's image can be in another host format than a fresh one for the destination
-        // (same GX2 format, e.g. an sRGB view: the save thumbnail, 256x144 1A tm 4 -> linear). Same
-        // texel size: the bits are copied through a view in the destination's format; else drawn.
-        id<MTLTexture> srcTex = src->tex;
-        bool convert = false, bitsViaBuffer = false;
-        if (dst->fmt.pixel != src->fmt.pixel) {
-            if (src->fmt.hostBytesPerBlock == dst->fmt.hostBytesPerBlock && !src->fmt.compressed && !dst->fmt.compressed) {
-                if (src->tex.usage & MTLTextureUsagePixelFormatView) srcTex = [src->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat];
-                else bitsViaBuffer = true;
-            } else
-                convert = true;
-            note(convert ? "GPU source, other format: drawn" : "GPU source, other format: copied through a view");
+        Surface* dst = dv->tex;
+        if (!same_scale(src, dst)) {
+            note("GPU source, other internal resolution: resampled");
+            // not in Cemu (it skips these): filtered, so a picture survives (save thumbnails)
+            const uint32_t cw = std::min(w, std::max(dst->width >> dv->firstMip, 1u)), ch = std::min(h, std::max(dst->height >> dv->firstMip, 1u));
+            id<MTLTexture> sview = [src->tex newTextureViewWithPixelFormat:src->tex.pixelFormat textureType:MTLTextureType2D
+                                                                    levels:NSMakeRange(sv->firstMip, 1) slices:NSMakeRange(sv->firstSlice, 1)];
+            id<MTLTexture> dview = [dst->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat textureType:MTLTextureType2D
+                                                                    levels:NSMakeRange(dv->firstMip, 1) slices:NSMakeRange(dv->firstSlice, 1)];
+            if (sview && dview && src->fmt.depth == dst->fmt.depth) {
+                g_resample_why = "copy";
+                resample(sview, dview, dst->fmt, 1, std::min(1.0f, cw * src->sx / sview.width), std::min(1.0f, ch * src->sy / sview.height),
+                         eff(cw, dst->sx), eff(ch, dst->sy));
+                g_resample_why = nullptr;
+            }
         } else {
-            note("GPU source");
+            note(src->fmt.pixel == dst->fmt.pixel ? "GPU source" : "GPU source, other format");
+            gpu_copy(src, sv->firstSlice, sv->firstMip, 0, 0, dst, dv->firstSlice, dv->firstMip, 0, 0, eff(w, src->sx), eff(h, src->sy));
         }
-        end_encoder();
-        // region in guest pixels, then in each texture's pixels (both may be scaled for the internal resolution)
-        uint32_t cw = std::min(w, dst->width), ch = std::min(h, dst->height);
-        uint32_t spw = std::min<uint32_t>((uint32_t)std::lround(cw * src->sx), (uint32_t)src->tex.width);
-        uint32_t sph = std::min<uint32_t>((uint32_t)std::lround(ch * src->sy), (uint32_t)src->tex.height);
-        uint32_t dpw = std::min<uint32_t>((uint32_t)std::lround(cw * dst->sx), (uint32_t)dst->tex.width);
-        uint32_t dph = std::min<uint32_t>((uint32_t)std::lround(ch * dst->sy), (uint32_t)dst->tex.height);
-        if (spw == dpw && sph == dph && !convert) {
-            id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-            if (bitsViaBuffer)
-                copy_bits_via_buffer(b, srcTex, srcLayer, 0, dst->tex, dstLayer, 0, MTLSizeMake(spw, sph, 1), dst->fmt.hostBytesPerBlock);
-            else
-                [b copyFromTexture:srcTex sourceSlice:srcLayer sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                        sourceSize:MTLSizeMake(spw, sph, 1)
-                         toTexture:dst->tex destinationSlice:dstLayer destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-            [b endEncoding];
-        } else {
-            // one layer of each (resample draws into slice 0 of what it is given)
-            id<MTLTexture> sv = layer_count(src->tex) > 1 && src->tex.textureType != MTLTextureType3D
-                                    ? [src->tex newTextureViewWithPixelFormat:src->tex.pixelFormat textureType:MTLTextureType2D
-                                                                      levels:NSMakeRange(0, 1) slices:NSMakeRange(srcLayer, 1)]
-                                    : src->tex;
-            id<MTLTexture> dv = layer_count(dst->tex) > 1 && dst->tex.textureType != MTLTextureType3D
-                                    ? [dst->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat textureType:MTLTextureType2D
-                                                                      levels:NSMakeRange(0, 1) slices:NSMakeRange(dstLayer, 1)]
-                                    : dst->tex;
-            g_resample_why = "copy";
-            resample(sv, dv, dst->fmt, 1, (float)spw / src->tex.width, (float)sph / src->tex.height, dpw, dph);
-            g_resample_why = nullptr;
-        }
-        mark_gpu_written(dst);
-        write_back_linear_copy(dst, d, dbase, dstMip, dstSlice, cw, ch);
+        mark_gpu_written(dst, dv->firstSlice, dv->firstMip);
+        dst->lastUseFrame = src->lastUseFrame = R.frame;
+        if (dv->firstMip == 0 && dv->firstSlice == 0) write_back_linear_copy(dst, d, dbase, dstMip, dstSlice, std::min(w, dst->width), std::min(h, dst->height));
         return;
     }
 
     // CPU-produced source: re-tile in guest memory; texture uploads pick up the change
     {
         bool gpuAtAddr = false;
+        auto range = R.surfaces.equal_range(sAddr);
         for (auto it = range.first; it != range.second; ++it) gpuAtAddr |= it->second->gpuWritten;
         note(gpuAtAddr ? "CPU path, but a GPU image of another size is at the source" : "CPU path");
     }
-    LatteAddrLib::AddrSurfaceInfo_OUT si{}, di{};
-    LatteAddrLib::GX2CalculateSurfaceInfo(s->format, s->width, s->height, s->depth, s->dim, s->tileMode, s->aa, srcMip, &si);
-    LatteAddrLib::GX2CalculateSurfaceInfo(d->format, d->width, d->height, d->depth, d->dim, d->tileMode, d->aa, dstMip, &di);
     auto stm = (Latte::E_HWTILEMODE)si.hwTileMode, dtm = (Latte::E_HWTILEMODE)di.hwTileMode;
     uint32_t bpp = f.bytesPerBlock * 8;
     uint32_t bw = f.compressed ? (w + 3) / 4 : w, bh = f.compressed ? (h + 3) / 4 : h;
@@ -1528,11 +1983,10 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
             memcpy(mem::ptr(dbase + dofs), mem::ptr(sbase + so), f.bytesPerBlock);
         }
     // force re-upload of any texture made from the destination
-    auto dr = R.surfaces.equal_range(dbase);
+    auto dr = R.surfaces.equal_range(dAddr);
     for (auto it = dr.first; it != dr.second; ++it) {
         it->second->lastCheckedFrame = ~0ull;
         it->second->dirty = true;
-        g_surface_gen++;
     }
 }
 
@@ -1546,7 +2000,6 @@ void ss_reset_surfaces() {
     for (auto& [a, s] : R.surfaces) {
         s->dirty = true;
         s->lastCheckedFrame = ~0ull;
-        g_surface_gen++;
     }
 }
 }  // namespace gfx

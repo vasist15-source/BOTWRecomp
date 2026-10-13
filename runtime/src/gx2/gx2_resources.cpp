@@ -43,6 +43,14 @@ uint32 color_buffer_address(const GX2::GX2ColorBuffer* cb) {
     if (TM_IsMacroTiled(cb->surface.tileMode) && mip < ((swizzle >> 16) & 0xFF)) base ^= (swizzle & 0xFFFF);
     return base;
 }
+// the depth buffer's address with its swizzle bits, like the colour buffer's and texture addresses (the
+// texture cache matches them up by address and swizzle)
+uint32 depth_buffer_address(const GX2::GX2DepthBuffer* db) {
+    uint32 base = db->surface.imagePtr;
+    uint32 swizzle = db->surface.swizzle;
+    if (TM_IsMacroTiled(db->surface.tileMode) && ((swizzle >> 16) & 0xFF) > 0) base ^= (swizzle & 0xFFFF);
+    return base;
+}
 }  // namespace gx2
 
 HLE(gx2, GX2SetColorBuffer) {
@@ -77,7 +85,7 @@ HLE(gx2, GX2SetDepthBuffer) {
     }
     uint32 view = (db->viewFirstSlice & 0x7FF) | (((db->viewNumSlices + db->viewFirstSlice - 1) & 0x7FF) << 13);
     set_reg(mmDB_DEPTH_SIZE, db->reg_size);
-    set_reg(mmDB_DEPTH_BASE, db->surface.imagePtr);  // full address; our renderer's convention
+    set_reg(mmDB_DEPTH_BASE, gx2::depth_buffer_address(db));  // full address with swizzle bits; our renderer's convention
     set_reg(mmDB_DEPTH_INFO, info);
     set_reg(mmDB_DEPTH_VIEW, view);
     set_reg(mmDB_HTILE_DATA_BASE, (uint32)db->surface.width << 16 | (db->surface.height & 0xFFFF));  // our convention

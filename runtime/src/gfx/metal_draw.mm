@@ -1270,42 +1270,50 @@ static id<MTLTexture> null_texture(MTLTextureType type) {
 static std::unordered_map<uint64_t, id<MTLTexture>> g_views;
 void forget_texture_views() { g_views.clear(); }
 
-static id<MTLTexture> texture_view(Surface* s, MTLTextureType type, uint32_t word4) {
+// a host view of a cache view: its mips and slices, the requested texture type and the component swizzle
+static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t word4) {
+    Surface* s = tv->tex;
     LATTE_SQ_TEX_RESOURCE_WORD4_N w4;
     memcpy(&w4, &word4, 4);
     uint32_t sel[4] = {(uint32_t)w4.get_DST_SEL_X(), (uint32_t)w4.get_DST_SEL_Y(), (uint32_t)w4.get_DST_SEL_Z(), (uint32_t)w4.get_DST_SEL_W()};
     id<MTLTexture> base = s->tex;
-    uint64_t key = (uint64_t)(uintptr_t)(__bridge void*)base ^ ((uint64_t)type << 56) ^ ((uint64_t)(sel[0] | sel[1] << 4 | sel[2] << 8 | sel[3] << 12) << 40);
+    uint64_t key = (uint64_t)(uintptr_t)tv * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)(__bridge void*)base ^ ((uint64_t)type << 56) ^
+                   ((uint64_t)(sel[0] | sel[1] << 4 | sel[2] << 8 | sel[3] << 12) << 40);
     auto it = g_views.find(key);
     if (it != g_views.end()) return it->second;
     static const MTLTextureSwizzle sw[8] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha,
                                             MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleZero, MTLTextureSwizzleZero};
     MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(sw[sel[0]], sw[sel[1]], sw[sel[2]], sw[sel[3]]);
-    NSUInteger slices = layer_count(base);
-    if (type == MTLTextureTypeCube && slices < 6) type = base.textureType;
+    const NSUInteger levels = base.mipmapLevelCount;
+    const NSUInteger firstMip = std::min<NSUInteger>(tv->firstMip, levels - 1);
+    const NSUInteger numMip = std::max<NSUInteger>(1, std::min<NSUInteger>(tv->numMip, levels - firstMip));
+    const NSUInteger layers = layer_count(base);
+    NSUInteger firstSlice = base.textureType == MTLTextureType3D ? 0 : std::min<NSUInteger>(tv->firstSlice, layers - 1);
+    NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : std::max<NSUInteger>(1, std::min<NSUInteger>(tv->numSlice, layers - firstSlice));
+    // what the shader declared vs what the texture is
+    if (type == MTLTextureTypeCube && (slices < 6 || base.textureType == MTLTextureType2D)) type = slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+    if (type == MTLTextureTypeCube && slices > 6) slices = 6;
+    if (type == MTLTextureTypeCubeArray) slices -= slices % 6;
     if ((type == MTLTextureType2D || type == MTLTextureType1D) && slices > 1) slices = 1;
-    if (type == MTLTextureType2DArray && base.textureType == MTLTextureType2D) slices = 1;
-    if (type == MTLTextureType3D && base.textureType != MTLTextureType3D) return nil;
-    if (base.textureType == MTLTextureType3D && type != MTLTextureType3D) return nil;
+    if (type == MTLTextureType1D && base.textureType != MTLTextureType1D && base.textureType != MTLTextureType1DArray) type = MTLTextureType2D;
+    if (type == MTLTextureType2D && (base.textureType == MTLTextureType1D || base.textureType == MTLTextureType1DArray)) type = MTLTextureType1D;
+    if (type == MTLTextureType3D && base.textureType != MTLTextureType3D) { g_views[key] = nil; return nil; }
+    if (base.textureType == MTLTextureType3D && type != MTLTextureType3D) { g_views[key] = nil; return nil; }
     id<MTLTexture> v;
     if (s->fmt.depth) {
         // depth formats can't be swizzled; samplers read .x
-        v = [base newTextureViewWithPixelFormat:base.pixelFormat
-                                      textureType:type
-                                           levels:NSMakeRange(0, base.mipmapLevelCount)
-                                           slices:NSMakeRange(0, slices)];
+        v = [base newTextureViewWithPixelFormat:base.pixelFormat textureType:type levels:NSMakeRange(firstMip, numMip)
+                                         slices:NSMakeRange(firstSlice, slices)];
     } else {
-        v = [base newTextureViewWithPixelFormat:base.pixelFormat
-                                      textureType:type
-                                           levels:NSMakeRange(0, base.mipmapLevelCount)
-                                           slices:NSMakeRange(0, slices)
-                                          swizzle:ch];
+        v = [base newTextureViewWithPixelFormat:base.pixelFormat textureType:type levels:NSMakeRange(firstMip, numMip)
+                                         slices:NSMakeRange(firstSlice, slices) swizzle:ch];
     }
     if (!v) {
         static int warned = 0;
         if (warned++ < 10)
-            LOG("[gfx] texture view failed: %ux%u pixel %lu type %lu -> %lu", s->width, s->height, (unsigned long)s->tex.pixelFormat,
-                (unsigned long)base.textureType, (unsigned long)type);
+            LOG("[gfx] texture view failed: %ux%u pixel %lu type %lu -> %lu (mips %lu+%lu slices %lu+%lu)", s->width, s->height,
+                (unsigned long)s->tex.pixelFormat, (unsigned long)base.textureType, (unsigned long)type, (unsigned long)firstMip,
+                (unsigned long)numMip, (unsigned long)firstSlice, (unsigned long)slices);
     }
     g_views[key] = v;
     return v;
@@ -1330,7 +1338,7 @@ static uint64_t g_hires_frame = ~0ull;       // frame the private copy was last 
 static Surface g_hires_color, g_hires_depth;
 
 MTLTextureUsage format_view_usage();
-void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice);
+void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice, uint32_t level);
 
 static Surface* hires_surface(Surface& dst, const Surface* like) {
     uint32_t w = like->width * 3 / 2, h = like->height * 3 / 2;
@@ -1343,7 +1351,10 @@ static Surface* hires_surface(Surface& dst, const Surface* like) {
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | format_view_usage();
         d.storageMode = MTLStorageModePrivate;
         dst = *like;
-        dst.mipChain.reset();
+        dst.sm.clear();
+        dst.relations.clear();
+        dst.views.clear();
+        dst.baseView = nullptr;
         dst.tex = [R.device newTextureWithDescriptor:d];
         dst.addr = 0;  // private: never found by address lookups
         dst.width = w;
@@ -1394,7 +1405,7 @@ static StreamoutDraw g_so;
 static uint64_t g_streamout_draws = 0, g_streamout_notarget = 0;  // the latter: ran with no render target
 
 // each texture unit's surface as the current draw's preflight found it ([0] vertex, [1] pixel stage)
-static Surface* g_unit_tex[2][18];
+static TexView* g_unit_tex[2][18];
 static bool g_unit_tex_valid[2][18];
 
 // What the current render encoder has bound, so draws skip rebinding what the previous draw left in
@@ -1489,12 +1500,17 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         MTLTextureType type = texture_type_for_dim(dec->textureUnitDim[unit]);
         const uint32_t* tw = &regs[texBase + unit * 7];
         // the draw's texture preflight looked this unit up already (same registers, same draw)
-        Surface* s = unit < 18 && g_unit_tex_valid[vertex ? 0 : 1][unit] ? g_unit_tex[vertex ? 0 : 1][unit]
-                                                                        : sampled_texture(tw, dec->textureUsesDepthCompare[unit]);
-        if (!vertex && s && g_hires_src && s->addr == g_hires_src && g_hires_frame == R.frame && ao_hires_enabled() &&
-            sh->kind == gfx::ProgramKind::OcclusionPixel)
-            s = &g_hires_color;
-        id<MTLTexture> tex = s && s->tex ? texture_view(s, type, tw[4]) : nil;
+        TexView* tv = unit < 18 && g_unit_tex_valid[vertex ? 0 : 1][unit] ? g_unit_tex[vertex ? 0 : 1][unit]
+                                                                         : sampled_texture(tw, dec->textureUsesDepthCompare[unit]);
+        if (!vertex && tv && g_hires_src && tv->tex->addr == g_hires_src && g_hires_frame == R.frame && ao_hires_enabled() &&
+            sh->kind == gfx::ProgramKind::OcclusionPixel) {
+            static TexView hiresView;
+            hiresView.tex = &g_hires_color;
+            hiresView.format = g_hires_color.format;
+            tv = &hiresView;
+        }
+        Surface* s = tv ? tv->tex : nullptr;
+        id<MTLTexture> tex = s && s->tex ? texture_view(tv, type, tw[4]) : nil;
         if (s && unit < 18) { texScale[unit][0] = s->sx; texScale[unit][1] = s->sy; }
         uint32_t samplerIdx = dec->textureUnitSamplerAssignment[unit];
         DLOG("[draw]   %s tex%u %08X %ux%u fmt %X gpu=%d view=%d smp %08X %08X %08X", vertex ? "VS" : "PS", unit, tw[2] << 8,
@@ -1806,20 +1822,22 @@ static Surface* const* g_draw_sampled = nullptr;  // surfaces the draw being set
 static int g_draw_sampled_n = 0;
 static void occl_attach(MTLRenderPassDescriptor* rp);
 static void occl_new_encoder();
-static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Surface* depth, uint32_t depthSlice, bool noAttachments = false) {
+static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, const uint32_t* colorMips, Surface* depth, uint32_t depthSlice,
+                        uint32_t depthMip, bool noAttachments = false) {
     g_target_mask_clear = 0;
     if (R.enc) {
-        bool same = R.passDepth == depth && (!depth || R.passDepthSlice == depthSlice);
+        bool same = R.passDepth == depth && (!depth || (R.passDepthSlice == depthSlice && R.passDepthMip == depthMip));
         for (int i = 0; i < 8 && same; i++)
-            same = R.passColor[i] == colors[i] && (!colors[i] || R.passColorSlice[i] == colorSlices[i]);
+            same = R.passColor[i] == colors[i] && (!colors[i] || (R.passColorSlice[i] == colorSlices[i] && R.passColorMip[i] == colorMips[i]));
         if (same) return true;
         static const bool merge = !(getenv("WWHD_NO_PASS_MERGE") && atoi(getenv("WWHD_NO_PASS_MERGE")));
-        bool subset = merge && !noAttachments && (R.passDepth == depth ? (!depth || R.passDepthSlice == depthSlice) : !depth);
+        bool subset = merge && !noAttachments &&
+                      (R.passDepth == depth ? (!depth || (R.passDepthSlice == depthSlice && R.passDepthMip == depthMip)) : !depth);
         bool any = false;
         uint32_t clear = 0;
         for (int i = 0; i < 8 && subset; i++) {
             if (colors[i]) {
-                subset = R.passColor[i] == colors[i] && R.passColorSlice[i] == colorSlices[i];
+                subset = R.passColor[i] == colors[i] && R.passColorSlice[i] == colorSlices[i] && R.passColorMip[i] == colorMips[i];
                 any = true;
             } else if (R.passColor[i]) {
                 clear |= 0xFu << (4 * i);
@@ -1886,28 +1904,31 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
     for (int i = 0; i < 8; i++) {
         if (!colors[i]) continue;
         rp.colorAttachments[i].texture = colors[i]->tex;
+        rp.colorAttachments[i].level = colorMips[i];
         // a volume's slice is a depth plane
         if (colors[i]->tex.textureType == MTLTextureType3D) rp.colorAttachments[i].depthPlane = colorSlices[i];
         else rp.colorAttachments[i].slice = colorSlices[i];
         rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
-        take_pending_clear(rp, i, colors[i]->tex, colorSlices[i]);
-        mark_gpu_written(colors[i]);
+        take_pending_clear(rp, i, colors[i]->tex, colorSlices[i], colorMips[i]);
+        mark_gpu_written(colors[i], colorSlices[i], colorMips[i]);
         any = true;
     }
     if (depth) {
         rp.depthAttachment.texture = depth->tex;
         rp.depthAttachment.slice = depthSlice;
+        rp.depthAttachment.level = depthMip;
         rp.depthAttachment.loadAction = MTLLoadActionLoad;
         rp.depthAttachment.storeAction = MTLStoreActionStore;
         if (depth->fmt.stencil) {
             rp.stencilAttachment.texture = depth->tex;
             rp.stencilAttachment.slice = depthSlice;
+            rp.stencilAttachment.level = depthMip;
             rp.stencilAttachment.loadAction = MTLLoadActionLoad;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
         }
-        take_pending_clear(rp, -1, depth->tex, depthSlice);
-        mark_gpu_written(depth);
+        take_pending_clear(rp, -1, depth->tex, depthSlice, depthMip);
+        mark_gpu_written(depth, depthSlice, depthMip);
         any = true;
     }
     if (!any) {
@@ -1943,9 +1964,11 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
     for (int i = 0; i < 8; i++) {
         R.passColor[i] = colors[i];
         R.passColorSlice[i] = colorSlices[i];
+        R.passColorMip[i] = colorMips[i];
     }
     R.passDepth = depth;
     R.passDepthSlice = depthSlice;
+    R.passDepthMip = depthMip;
     return R.enc != nil;
 }
 
@@ -2564,33 +2587,65 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     }
     rprof::mark(rprof::kShader);
 
+    // Textures first, then the render targets (Cemu: LatteTexture_updateTextures, then UpdateCurrentFBO).
+    // A lookup that created or dropped surfaces (a texture grown to more mips or slices, an absorbed one)
+    // can leave earlier lookups of this draw stale: everything is looked up again.
+    static Surface* sampled[64];
+    int nSampled = 0;
+    TexView* colorViews[8] = {};
+    TexView* depthView = nullptr;
+    const bool wantDepth = LatteMRT::GetActiveDepthBufferMask(lcr);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        g_repeat_texture_init = false;
+        nSampled = 0;
+        memset(g_unit_tex_valid, 0, sizeof g_unit_tex_valid);
+        for (Shader* sh : {vs, ps}) {
+            const int st = sh == vs ? 0 : 1;
+            uint32_t texBase = sh == vs ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+            for (int u = 0; u < sh->dec->textureUnitListCount; u++) {
+                uint8_t unit = sh->dec->textureUnitList[u];
+                TexView* v = sampled_texture(&regs[texBase + unit * 7], sh->dec->textureUsesDepthCompare[unit]);
+                if (unit < 18) { g_unit_tex[st][unit] = v; g_unit_tex_valid[st][unit] = true; }
+                if (v && nSampled < 64) sampled[nSampled++] = v->tex;
+            }
+        }
+        for (int i = 0; i < 8; i++) colorViews[i] = (mask & (1 << i)) ? color_target(regs, i) : nullptr;
+        depthView = wantDepth ? depth_target(regs) : nullptr;
+        if (!g_repeat_texture_init) break;
+    }
+    rprof::mark(rprof::kTextures);
+
     Surface* colors[8] = {};
-    uint32_t colorSlices[8] = {}, depthSlice = 0;
+    uint32_t colorSlices[8] = {}, colorMips[8] = {}, depthSlice = 0, depthMip = 0;
     for (int i = 0; i < 8; i++)
-        if (mask & (1 << i)) colors[i] = color_target(regs, i, &colorSlices[i]);
-    Surface* depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(regs, &depthSlice) : nullptr;
+        if (colorViews[i]) { colors[i] = colorViews[i]->tex; colorSlices[i] = colorViews[i]->firstSlice; colorMips[i] = colorViews[i]->firstMip; }
+    Surface* depth = depthView ? depthView->tex : nullptr;
+    if (depthView) { depthSlice = depthView->firstSlice; depthMip = depthView->firstMip; }
     if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
-    uint32_t guestW = colors[0] ? colors[0]->width : 0;  // the game's target size (viewport registers refer to it)
-    uint32_t guestH = colors[0] ? colors[0]->height : 0;
+    // the game's target size (viewport registers refer to it)
+    uint32_t guestW = colors[0] ? std::max(colors[0]->width >> colorMips[0], 1u) : 0;
+    uint32_t guestH = colors[0] ? std::max(colors[0]->height >> colorMips[0], 1u) : 0;
     if (g_hires_redraw && colors[0]) {
         g_hires_src = colors[0]->addr;
         colors[0] = hires_surface(g_hires_color, colors[0]);
-        colorSlices[0] = 0;
-        if (depth) { depth = hires_surface(g_hires_depth, depth); depthSlice = 0; }
+        colorSlices[0] = colorMips[0] = 0;
+        if (depth) { depth = hires_surface(g_hires_depth, depth); depthSlice = depthMip = 0; }
     }
     // Metal requires matching attachment sizes; drop mismatching ones. Sizes here are the textures'
-    // (internal resolution); kx/ky = texture pixels per guest pixel of the target.
+    // (internal resolution) at the attached level; kx/ky = texture pixels per guest pixel of the target.
+    auto levelW = [](Surface* t, uint32_t mip) { return (uint32_t)std::max<NSUInteger>(t->tex.width >> mip, 1); };
+    auto levelH = [](Surface* t, uint32_t mip) { return (uint32_t)std::max<NSUInteger>(t->tex.height >> mip, 1); };
     uint32_t w = 0, h = 0;
     float kx = 1.0f, ky = 1.0f;
-    for (auto* c : colors)
-        if (c) { w = (uint32_t)c->tex.width; h = (uint32_t)c->tex.height; kx = c->sx; ky = c->sy; break; }
-    if (depth && w && (depth->tex.width < w || depth->tex.height < h))
+    for (int i = 0; i < 8; i++)
+        if (colors[i]) { w = levelW(colors[i], colorMips[i]); h = levelH(colors[i], colorMips[i]); kx = colors[i]->sx; ky = colors[i]->sy; break; }
+    if (depth && w && (levelW(depth, depthMip) < w || levelH(depth, depthMip) < h))
         for (auto* c : colors)
             if (c) { depth = match_depth_scale(depth, c); break; }
-    if (depth && w && (depth->tex.width < w || depth->tex.height < h)) { depth = nullptr; g_skip[SK_DROPPED_DEPTH]++; }
-    if (!w && depth) { w = (uint32_t)depth->tex.width; h = (uint32_t)depth->tex.height; kx = depth->sx; ky = depth->sy; }
-    for (auto& c : colors)
-        if (c && (c->tex.width != w || c->tex.height != h)) { c = nullptr; g_skip[SK_DROPPED_COLOR]++; }
+    if (depth && w && (levelW(depth, depthMip) < w || levelH(depth, depthMip) < h)) { depth = nullptr; g_skip[SK_DROPPED_DEPTH]++; }
+    if (!w && depth) { w = levelW(depth, depthMip); h = levelH(depth, depthMip); kx = depth->sx; ky = depth->sy; }
+    for (int i = 0; i < 8; i++)
+        if (colors[i] && (levelW(colors[i], colorMips[i]) != w || levelH(colors[i], colorMips[i]) != h)) { colors[i] = nullptr; g_skip[SK_DROPPED_COLOR]++; }
     const bool noAttachments = !w && streamout && (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22));
     if (noAttachments) { w = h = 1; g_streamout_notarget++; }
     else if (!w) { g_skip[SK_NO_TARGET]++; return; }
@@ -2618,26 +2673,12 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                 : prim == 4 ? MTLPrimitiveTypeTriangle : MTLPrimitiveTypeTriangleStrip;
     } else if (!build_indices(prim, count, indexType, indexAddr, indices, ptype)) { g_skip[SK_PRIM]++; return; }
     rprof::mark(rprof::kIndices);
-    static Surface* sampled[64];
-    int nSampled = 0;
-    memset(g_unit_tex_valid, 0, sizeof g_unit_tex_valid);
-    for (Shader* sh : {vs, ps}) {
-        const int st = sh == vs ? 0 : 1;
-        uint32_t texBase = sh == vs ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
-        for (int u = 0; u < sh->dec->textureUnitListCount; u++) {
-            uint8_t unit = sh->dec->textureUnitList[u];
-            Surface* s = sampled_texture(&regs[texBase + unit * 7], sh->dec->textureUsesDepthCompare[unit]);
-            if (unit < 18) { g_unit_tex[st][unit] = s; g_unit_tex_valid[st][unit] = true; }
-            if (s && nSampled < 64) sampled[nSampled++] = s;
-        }
-    }
     g_draw_sampled = sampled;
     g_draw_sampled_n = nSampled;
     g_pt_ps = regs[mmSQ_PGM_START_PS] << 8;
     g_pt_ps_shader = ps;
 
-    rprof::mark(rprof::kTextures);
-    if (!ensure_pass(colors, colorSlices, depth, depthSlice, noAttachments)) { g_skip[SK_PASS]++; return; }
+    if (!ensure_pass(colors, colorSlices, colorMips, depth, depthSlice, depthMip, noAttachments)) { g_skip[SK_PASS]++; return; }
     rprof::mark(rprof::kPass);
     TargetFormats tf;  // the pass's attachments (a merged pass can have more than the draw targets)
     for (int i = 0; i < 8; i++)

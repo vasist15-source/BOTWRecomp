@@ -165,7 +165,7 @@ static id<MTLCommandBuffer> raw_command_buffer() {
 // Any other GPU work (blits, other passes, commits) encodes the held clears first, in order.
 struct PendingClear {
     id<MTLTexture> tex;
-    uint32_t slice;
+    uint32_t slice, level;
     bool isDepth, hasStencil, clearDepth, clearStencil;
     float rgba[4];
     float depth;
@@ -177,6 +177,7 @@ std::atomic<uint64_t> g_clears_folded{0}, g_clears_flushed{0};
 static void encode_clear(const PendingClear& c) {
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.depthAttachment.slice = rp.stencilAttachment.slice = c.slice;
+    rp.depthAttachment.level = rp.stencilAttachment.level = rp.colorAttachments[0].level = c.level;
     if (c.tex.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = c.slice;
     else rp.colorAttachments[0].slice = c.slice;
     if (c.isDepth) {
@@ -209,10 +210,10 @@ void flush_pending_clears() {
 }
 
 // a pass about to attach tex/slice: turn a held clear of it into the attachment's load action
-void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice) {
+void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice, uint32_t level) {
     for (size_t i = 0; i < g_pending_clears.size(); i++) {
         PendingClear& c = g_pending_clears[i];
-        if (c.tex != tex || c.slice != slice) continue;
+        if (c.tex != tex || c.slice != slice || c.level != level) continue;
         if (colorIndex >= 0) {
             if (c.isDepth) return;
             rp.colorAttachments[colorIndex].loadAction = MTLLoadActionClear;
@@ -348,19 +349,21 @@ void run_main_loop() { [NSApp run]; }
 std::string device_name() { return R.device ? std::string(R.device.name.UTF8String) : std::string(); }
 
 // ---------------------------------------------------------------- clears
-static void clear_surface(Surface* s, const float* rgba, bool clearDepth, float depth, bool clearStencil, uint32_t stencil,
-                          uint32_t firstSlice = 0, uint32_t numSlices = 1) {
+static void clear_surface(TexView* v, const float* rgba, bool clearDepth, float depth, bool clearStencil, uint32_t stencil, uint32_t numSlices = 1) {
+    Surface* s = v ? v->tex : nullptr;
     if (!s || !s->tex) return;
     end_encoder();
+    const uint32_t level = v->firstMip, firstSlice = v->firstSlice;
     bool pass_dump_on();
     if (pass_dump_on())
-        LOG("[pass] clear %08X %lux%lu f%X%s%s%s", s->addr, (unsigned long)s->tex.width, (unsigned long)s->tex.height, s->format,
-            s->isDepth ? " depth" : " color", clearDepth ? " d" : "", clearStencil ? " s" : "");
+        LOG("[pass] clear %08X %lux%lu f%X%s%s%s level %u", s->addr, (unsigned long)s->tex.width, (unsigned long)s->tex.height, s->format,
+            s->isDepth ? " depth" : " color", clearDepth ? " d" : "", clearStencil ? " s" : "", level);
     static const bool fold = getenv("WWHD_NO_CLEAR_FOLD") == nullptr;
-    for (uint32_t slice = firstSlice; slice < firstSlice + numSlices; slice++) {
+    for (uint32_t slice = firstSlice; slice < firstSlice + numSlices && slice < s->mip_slices(level); slice++) {
         PendingClear c{};
         c.tex = s->tex;
         c.slice = slice;
+        c.level = level;
         c.isDepth = s->isDepth;
         c.hasStencil = s->isDepth && s->fmt.stencil;
         c.clearDepth = clearDepth;
@@ -370,29 +373,30 @@ static void clear_surface(Surface* s, const float* rgba, bool clearDepth, float 
         c.stencil = stencil;
         // a second clear of a slice already held: encode the first (rare; keeps partial depth/stencil clears exact)
         for (auto& p : g_pending_clears)
-            if (p.tex == c.tex && p.slice == c.slice) { flush_pending_clears(); break; }
+            if (p.tex == c.tex && p.slice == c.slice && p.level == c.level) { flush_pending_clears(); break; }
         if (fold) g_pending_clears.push_back(c);
         else encode_clear(c);
+        mark_gpu_written(s, slice, level);
     }
-    mark_gpu_written(s);
 }
 
 void clear_color(const uint32_t* regs, uint32_t cb, const float rgba[4]) {
-    uint32_t first = 0, num = 1;
-    Surface* s = surface_from_color_buffer(cb, &first, &num);
-    if (log_this_frame() && s)
-        LOG("[clear] color %08X %ux%u fmt %X -> %.3f %.3f %.3f %.3f", s->addr, s->width, s->height, s->format, rgba[0], rgba[1], rgba[2], rgba[3]);
-    clear_surface(s, rgba, false, 0, false, 0, first, num);
+    uint32_t num = 1;
+    TexView* v = surface_from_color_buffer(cb, &num);
+    if (log_this_frame() && v)
+        LOG("[clear] color %08X %ux%u fmt %X -> %.3f %.3f %.3f %.3f", v->tex->addr, v->tex->width, v->tex->height, v->tex->format, rgba[0], rgba[1],
+            rgba[2], rgba[3]);
+    clear_surface(v, rgba, false, 0, false, 0, num);
 }
 
 void clear_depth_stencil(const uint32_t* regs, uint32_t db, float depth, uint32_t stencil, uint32_t flags) {
     // flags: 1 = depth, 2 = stencil
-    uint32_t first = 0, num = 1;
-    Surface* s = surface_from_depth_buffer(db, &first, &num);
-    if (log_this_frame() && s)
-        LOG("[clear] depth %08X %ux%ux%u fmt %X pixel %lu -> depth %.4f stencil %u flags %u slices %u+%u", s->addr, s->width, s->height,
-            s->slices, s->format, (unsigned long)s->fmt.pixel, depth, stencil, flags, first, num);
-    clear_surface(s, nullptr, flags & 1, depth, (flags & 2) != 0, stencil, first, num);
+    uint32_t num = 1;
+    TexView* v = surface_from_depth_buffer(db, &num);
+    if (log_this_frame() && v)
+        LOG("[clear] depth %08X %ux%ux%u fmt %X pixel %lu -> depth %.4f stencil %u flags %u slices %u+%u", v->tex->addr, v->tex->width,
+            v->tex->height, v->tex->slices, v->tex->format, (unsigned long)v->tex->fmt.pixel, depth, stencil, flags, v->firstSlice, num);
+    clear_surface(v, nullptr, flags & 1, depth, (flags & 2) != 0, stencil, num);
 }
 
 // ---------------------------------------------------------------- copies
@@ -405,11 +409,13 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
     // target: 1 = TV, 4/8 = GamePad
     if (log_this_frame()) LOG("[scan] copy %08X to %s", cb, (target & 1) ? "TV" : "DRC");
     Screen& scr = (target & 1) ? R.tv : R.drc;
-    Surface* s = surface_from_color_buffer(cb);
+    TexView* v = surface_from_color_buffer(cb);
+    Surface* s = v ? v->tex : nullptr;
     if (!s || !s->tex) return;
     end_encoder();
     // the image as rendered (internal resolution); the present pass scales it to the window
-    NSUInteger w = s->tex.width, h = s->tex.height;
+    const uint32_t level = v->firstMip;
+    NSUInteger w = std::max<NSUInteger>(s->tex.width >> level, 1), h = std::max<NSUInteger>(s->tex.height >> level, 1);
     if (!scr.tex || scr.tex.width != w || scr.tex.height != h || scr.tex.pixelFormat != s->tex.pixelFormat) {
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->tex.pixelFormat
                                                                                      width:w
@@ -420,7 +426,8 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
         scr.tex = [R.device newTextureWithDescriptor:d];
     }
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
-    [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+    [b copyFromTexture:s->tex sourceSlice:s->tex.textureType == MTLTextureType3D ? 0 : v->firstSlice sourceLevel:level
+          sourceOrigin:MTLOriginMake(0, 0, s->tex.textureType == MTLTextureType3D ? v->firstSlice : 0)
             sourceSize:MTLSizeMake(w, h, 1) toTexture:scr.tex destinationSlice:0 destinationLevel:0
      destinationOrigin:MTLOriginMake(0, 0, 0)];
     [b endEncoding];
@@ -649,6 +656,7 @@ void swap() {
     static bool sync_gpu = getenv("WWHD_SYNC_GPU") != nullptr;  // debug: no CPU/GPU overlap
     if (sync_gpu) wait_idle();
     end_encoder();
+    texture_cache_frame_end();
     if (log_this_frame()) LOG("[frame] end %llu", (unsigned long long)R.frame);
     void pass_timing_end_frame(id<MTLCommandBuffer>);
     pass_timing_end_frame(command_buffer());
@@ -802,6 +810,22 @@ void note_surface_range(Surface* s, uint32_t addr, uint32_t size) {
         if (v.empty() || v.back() != s) v.push_back(s);
     }
 }
+void forget_surface_ranges(Surface* s) {
+    g_big_surfaces.erase(std::remove(g_big_surfaces.begin(), g_big_surfaces.end(), s), g_big_surfaces.end());
+    auto drop = [&](uint32_t addr, uint32_t size) {
+        if (!size) return;
+        uint64_t first = addr >> 12, last = ((uint64_t)addr + size - 1) >> 12;
+        if (last - first >= kBigPages) return;
+        for (uint64_t pg = first; pg <= last; pg++) {
+            auto it = g_page_surfaces.find((uint32_t)pg);
+            if (it == g_page_surfaces.end()) continue;
+            it->second.erase(std::remove(it->second.begin(), it->second.end(), s), it->second.end());
+            if (it->second.empty()) g_page_surfaces.erase(it);
+        }
+    };
+    drop(s->addr, std::max<uint32_t>(s->dataSize, s->pitch * s->height * 4));
+    for (auto& [a, n] : s->levelRanges) drop(a, n);
+}
 
 extern uint64_t g_stat_invalidates, g_stat_invalidated_surfaces;
 void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
@@ -837,7 +861,6 @@ void invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
         if (!s->gpuWritten && !(a >= 0xF4000000 && a < 0xF6000000) && hits(s)) {
             s->lastCheckedFrame = ~0ull;
             s->dirty = true;
-            g_surface_gen++;
             g_stat_invalidated_surfaces++;
             static int lg = 0;
             if (logInval && lg++ < 300)

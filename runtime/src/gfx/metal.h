@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -24,31 +25,50 @@ inline NSUInteger layer_count(id<MTLTexture> t) {
 }
 void peek_z(const uint32_t*, uint32_t);
 
-// A host texture backing a guest surface (render target, depth buffer or sampled texture).
-// index of the guest ranges each surface's texture check reads, so invalidate() only looks at the
-// surfaces sharing a 4 KiB page with the range (metal_main.mm); surfaces are never removed
+// Texture cache after Cemu's (Cafe/HW/Latte/Core/LatteTexture*.cpp, MPL-2.0): a Surface is one host
+// texture for one guest surface definition (address, size, pitch, format, tile mode, its mip levels and
+// slices). What draws sample and render to are views into it (a mip and slice range, TexView). Surfaces
+// that share guest memory at the same layout are related (TexRelation) and copy each other's GPU-written
+// slices when used. metal_surfaces.mm.
 struct Surface;
 void note_surface_range(Surface* s, uint32_t addr, uint32_t size);
+void forget_surface_ranges(Surface* s);  // metal_main.mm: the surface is being deleted
 // staging memory from the upload pool (metal_draw.mm), filled by the caller
 id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr);
 
+struct TexView {
+    Surface* tex = nullptr;
+    uint32_t firstMip = 0, numMip = 1, firstSlice = 0, numSlice = 1;
+    uint32_t format = 0, dim = 1;  // E_GX2SURFFMT (always the texture's), E_DIM
+    std::vector<uint32_t> keys, keysNoRes;  // view lookup buckets it is registered in
+};
+// one slice of one mip level: its guest memory and when the GPU last wrote it
+struct SliceMip {
+    uint32_t addrStart = 0, addrEnd = 0, subIndex = 0, pitch = 0, tileMode = 0;
+    uint32_t slice = 0, mip = 0;
+    Surface* tex = nullptr;
+    uint64_t lastDynamicUpdate = 0;
+    std::vector<std::pair<Surface*, SliceMip*>> overlaps;  // other surfaces' slices overlapping this memory at an offset
+};
+// sub is the same memory as base's (baseSlice, baseMip) onward, at a compatible layout
+struct TexRelation {
+    Surface* base;
+    Surface* sub;
+    uint32_t baseSlice, baseMip, sliceCount, mipCount;
+};
+
 struct Surface {
-    std::shared_ptr<Surface> mipChain; // sampled companion assembled from GPU-rendered levels
-    uint64_t mipChainSeq = ~0ull;
-    uint64_t mipLevelSeq[16] = {};      // per companion level: the source write it was built from (0: never)
-    std::shared_ptr<Surface> layerArray; // sampled companion: an array assembled from GPU-rendered layers
-    uint64_t layerArraySeq = ~0ull;
     id<MTLTexture> tex = nil;
     uint32_t addr = 0, mipAddr = 0;
     uint32_t width = 0, height = 0, slices = 1, pitch = 0, mips = 1;
     uint32_t format = 0;       // E_GX2SURFFMT
     uint32_t dim = 1;          // E_DIM
     uint32_t tileMode = 0;     // E_HWTILEMODE
-    uint32_t swizzle = 0;
+    uint32_t swizzle = 0;      // pipe/bank swizzle bits (address & 0x700)
+    uint32_t lastRenderTargetSwizzle = 0;
     bool isDepth = false;
     bool gpuWritten = false;   // contents produced by the GPU; never reload from guest memory
-    uint64_t writeSeq = 0;     // when the GPU last wrote it (several surfaces can alias one address)
-    bool formatViews = false;     // another surface at this address has the same texel bits in another format (adopt_newer_alias)
+    uint64_t writeSeq = 0;     // the latest GPU write event (next_write_seq) of any of its slices
     uint64_t writtenBackSeq = 0;  // writeSeq when last written back to guest memory (linear surfaces)
     uint64_t contentHash = 0;  // hash of all guest bytes (every level) at the last check
     uint64_t lastCheckedFrame = ~0ull;
@@ -67,6 +87,16 @@ struct Surface {
     float ax = 1.0f, ay = 1.0f;  // ... and the aspect-ratio factors (screen-shaped targets, metal_surfaces.mm)
     float sx = 1.0f, sy = 1.0f;
     float minScale = 0.0f;  // at least this factor: a depth buffer drawn with colour targets scaled more (match_depth_scale)
+    // texture cache
+    std::vector<SliceMip> sm;  // [mip * slices + slice]
+    std::vector<TexRelation*> relations;
+    std::vector<TexView*> views;
+    TexView* baseView = nullptr;
+    bool reloadFromDynamic = false;  // a related surface was written: sync before use
+    bool deleted = false;            // removed from the cache; freed at the end of the frame
+    uint64_t lastUseFrame = 0;
+    SliceMip* slice_mip(uint32_t slice, uint32_t mip) { return &sm[(size_t)mip * slices + slice]; }
+    uint32_t mip_slices(uint32_t mip) const { return dim == 2 /* DIM_3D */ ? std::max(slices >> mip, 1u) : slices; }
 };
 
 // A display output: the TV or the GamePad screen, each in its own window.
@@ -79,8 +109,11 @@ struct Screen {
 
 uint64_t next_write_seq();
 Surface* match_depth_scale(Surface* depth, const Surface* color);
-extern uint64_t g_surface_gen;  // bumped whenever any surface changes (sampled_texture lookup cache)
-inline void mark_gpu_written(Surface* s) { s->gpuWritten = true; s->writeSeq = next_write_seq(); }
+// a draw, clear or copy wrote this slice of this level on the GPU (related surfaces sync from it)
+void mark_gpu_written(Surface* s, uint32_t slice, uint32_t mip);
+// frame boundary: unused / overwritten surfaces are dropped and deleted ones freed (swap)
+void texture_cache_frame_end();
+extern bool g_repeat_texture_init;  // a lookup created or deleted surfaces: the draw redoes its lookups
 
 struct Renderer {
     id<MTLDevice> device = nil;
@@ -94,6 +127,7 @@ struct Renderer {
     uint32_t mainDepthAddr = 0;
     Surface* passDepth = nullptr;
     uint32_t passColorSlice[8] = {}, passDepthSlice = 0;
+    uint32_t passColorMip[8] = {}, passDepthMip = 0;
 
     // guest memory visible to the GPU (no-copy buffers)
     struct GuestRange {
@@ -128,20 +162,13 @@ void end_encoder();
 // guest memory -> (buffer, offset); returns nil if the address is not GPU-visible
 id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset);
 
-// surfaces
-struct SurfaceDesc {
-    uint32_t addr = 0, mipAddr = 0, width = 0, height = 0, slices = 1, pitch = 0, mips = 1;
-    uint32_t format = 0, dim = 1, tileMode = 0, swizzle = 0;
-    bool isDepth = false;
-};
-Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering);
-// render targets; `slice` receives the array slice the view renders to
-Surface* color_target(const uint32_t* regs, int index, uint32_t* slice = nullptr);  // from CB_COLOR* registers
-Surface* depth_target(const uint32_t* regs, uint32_t* slice = nullptr);             // from DB_DEPTH_* registers
-// from GX2ColorBuffer / GX2DepthBuffer structs; optional: the view's slice range
-Surface* surface_from_color_buffer(uint32_t gx2ColorBuffer, uint32_t* firstSlice = nullptr, uint32_t* numSlices = nullptr);
-Surface* surface_from_depth_buffer(uint32_t gx2DepthBuffer, uint32_t* firstSlice = nullptr, uint32_t* numSlices = nullptr);
-Surface* sampled_texture(const uint32_t* texWords, bool isDepthSampler);  // from SQ_TEX_RESOURCE words
+// views: what draws sample (SQ_TEX_RESOURCE words) and render to (CB_COLOR* / DB_DEPTH_* registers, or
+// GX2ColorBuffer / GX2DepthBuffer structs; numSlices: the view's slice count for clears)
+TexView* sampled_texture(const uint32_t* texWords, bool isDepthSampler);
+TexView* color_target(const uint32_t* regs, int index);
+TexView* depth_target(const uint32_t* regs);
+TexView* surface_from_color_buffer(uint32_t gx2ColorBuffer, uint32_t* numSlices = nullptr);
+TexView* surface_from_depth_buffer(uint32_t gx2DepthBuffer, uint32_t* numSlices = nullptr);
 void upload_surface(Surface* s);
 
 // internal resolution (Graphics menu / R / WWHD_RES_SCALE): render targets are allocated at this
