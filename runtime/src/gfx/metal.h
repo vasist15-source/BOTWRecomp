@@ -80,6 +80,9 @@ struct Surface {
     std::vector<std::pair<uint32_t, uint32_t>> levelRanges;
     uint64_t watchStamp = 0;
     bool watched = false;
+    // GPU-written surfaces outside MEM1: guest memory hash when watched, so a CPU write reloads them (Cemu)
+    bool gpuWatched = false;
+    uint64_t gpuRamHash = 0;
     FormatInfo fmt;
     // internal resolution: width/height above are the guest's (logical) size, used for every lookup and
     // guest-memory computation; the texture may be larger. sx/sy = texture size / logical size.

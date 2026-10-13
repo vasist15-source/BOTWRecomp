@@ -1210,10 +1210,54 @@ static bool data_overwritten(Surface* t) {
 }
 
 // keep t's contents current before a use: CPU writes to its memory (once a frame), newer GPU writes to related surfaces
+static const std::vector<std::pair<uint32_t, uint32_t>>& level_ranges(Surface* s);
+static uint64_t content_hash(Surface* s);
+
+// a GPU-written surface whose guest memory the CPU has since changed: reloaded from it, as Cemu does
+// (LatteTC_HasTextureChanged hashes GPU-updated textures too). BotW streams its terrain and grass maps
+// into memory that earlier frames drew into.
+static void check_cpu_overwrite(Surface* t) {
+    static const bool off = getenv("WWHD_NO_GPU_RELOAD") != nullptr;
+    if (off || !wwatch::active() || !t->tex || t->fmt.depth) return;
+    const auto& ranges = level_ranges(t);
+    auto arm = [&] {
+        uint64_t stamp = ~0ull;
+        for (auto& [a, n] : ranges) stamp = std::min(stamp, wwatch::arm(a, n));
+        t->watchStamp = stamp;
+    };
+    if (!t->gpuWatched) {
+        arm();
+        t->gpuRamHash = content_hash(t);
+        t->gpuWatched = true;
+        return;
+    }
+    bool hit = false;
+    for (auto& [a, n] : ranges)
+        if (wwatch::written_since(a, n, t->watchStamp)) { hit = true; break; }
+    if (!hit) return;
+    arm();
+    const uint64_t h = content_hash(t);
+    if (h == t->gpuRamHash) return;
+    t->gpuRamHash = h;
+    static int logged = 0;
+    if (logged++ < 60)
+        LOG("[tc] CPU wrote GPU surface %08X %ux%u x%u f%X mips %u: reloaded", t->addr, t->width, t->height, t->slices, t->format, t->mips);
+    t->gpuWritten = false;
+    t->contentHash = 0;
+    t->watched = true;
+    t->dirty = false;
+    t->gpuWatched = false;
+    upload_surface(t);
+    // the newest data of every slice now: related surfaces sync from it
+    for (auto& sm : t->sm) sm.lastDynamicUpdate = t->writeSeq;
+    for (TexRelation* rel : t->relations) (rel->base == t ? rel->sub : rel->base)->reloadFromDynamic = true;
+}
+
 static void update_to_latest(Surface* t) {
-    if (!t->gpuWritten && t->lastCheckedFrame != R.frame && !in_mem1(t->addr)) {
+    if (t->lastCheckedFrame != R.frame && !in_mem1(t->addr)) {
         t->lastCheckedFrame = R.frame;
-        check_texture(t);
+        if (!t->gpuWritten) check_texture(t);
+        else check_cpu_overwrite(t);
     }
     if (t->reloadFromDynamic) {
         t->reloadFromDynamic = false;
@@ -1846,6 +1890,7 @@ static void write_back_linear_copy(Surface* img, GX2Surface* d, uint32_t dbase, 
             memcpy(mem::ptr(dbase + element_offset(di, dtm, x, y, dstSlice, bytes * 8, d->swizzle, nullptr)),
                    texels.data() + ((size_t)y * w + x) * bytes, bytes);
     img->writtenBackSeq = img->writeSeq;
+    img->gpuWatched = false;  // our own write to its memory: not a CPU change
     rprof::add_write_back(0, 1, texels.size(), rprof::now_ns() - r0);
 }
 // GX2DrawDone: linear render targets drawn since their last write-back
@@ -1883,6 +1928,7 @@ void write_back_linear_targets() {
     for (Surface* s : R.linearTargets) {
         if (!s->gpuWritten || s->writtenBackSeq == s->writeSeq || !s->tex) continue;
         s->writtenBackSeq = s->writeSeq;
+        s->gpuWatched = false;
         if (s->slices != 1 || !can_write_back(s)) continue;
         const uint32_t addr = s->addr;
         const uint32_t bytes = s->fmt.bytesPerBlock, pitch = std::max(s->pitch, s->width);
