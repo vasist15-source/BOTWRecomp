@@ -92,6 +92,52 @@ const char* capture_begin_frame() {
     return g_capture_dir.c_str();
 }
 
+// F12 capture: every slice and level of the GPU-made textures that vertex shaders and array-reading
+// passes sample (terrain and grass maps), as raw texels with per-channel statistics, written at the
+// end of the captured frame: <dir>/full_<addr>_f<fmt>_s<slice>_m<mip>_<w>x<h>_pf<pixel>.raw
+struct FullDump {
+    id<MTLTexture> tex;
+    uint32_t addr, format, bpp;
+};
+static std::vector<FullDump> g_full_dumps;
+static void capture_full(Surface* s) {
+    if (!s || !s->tex || s->fmt.compressed || s->fmt.depth) return;
+    for (auto& d : g_full_dumps)
+        if (d.tex == s->tex) return;
+    if (g_full_dumps.size() >= 48 || s->tex.width * s->tex.height > 2048u * 2048u) return;
+    g_full_dumps.push_back({s->tex, s->addr, s->format, s->fmt.hostBytesPerBlock});
+}
+void capture_flush_full_dumps() {
+    if (g_full_dumps.empty()) return;
+    const std::string dir = g_capture_dir;
+    for (auto& d : g_full_dumps) {
+        id<MTLTexture> t = d.tex;
+        const bool is3D = t.textureType == MTLTextureType3D;
+        const NSUInteger layers = is3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+        const NSUInteger bpp = d.bpp;
+        if (!bpp) { LOG("[capture] %08X: pixel format %lu not dumped", d.addr, (unsigned long)t.pixelFormat); continue; }
+        for (NSUInteger m = 0; m < t.mipmapLevelCount && m < 6; m++)
+            for (NSUInteger sl = 0; sl < layers && sl < 16; sl++) {
+                const NSUInteger w = std::max<NSUInteger>(t.width >> m, 1), h = std::max<NSUInteger>(t.height >> m, 1);
+                const NSUInteger row = w * bpp, size = row * h;
+                id<MTLBuffer> b = [R.device newBufferWithLength:size options:MTLResourceStorageModeShared];
+                id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+                [blit copyFromTexture:t sourceSlice:sl sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                             toBuffer:b destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:size];
+                [blit endEncoding];
+                char name[256];
+                snprintf(name, sizeof name, "%s/full_%08X_f%X_s%lu_m%lu_%lux%lu_pf%lu.raw", dir.c_str(), d.addr, d.format, (unsigned long)sl,
+                         (unsigned long)m, (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat);
+                std::string file = name;
+                [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+                    if (FILE* f = fopen(file.c_str(), "wb")) { fwrite(b.contents, 1, size, f); fclose(f); }
+                }];
+            }
+    }
+    LOG("[capture] %zu GPU textures dumped in full (all slices and levels)", g_full_dumps.size());
+    g_full_dumps.clear();
+}
+
 // fast 64-bit hash over 8-byte words (tail handled bytewise)
 static uint64_t hash_bytes(const void* data, size_t n, uint64_t h = 0x9E3779B97F4A7C15ull) {
     const uint8_t* p = (const uint8_t*)data;
@@ -313,8 +359,9 @@ static void report_compile_error(const char* src, uint64_t key, NSError* err, in
 // sample placed exactly on a texel boundary (e.g. the game's 2:1 depth downsample) then picks a
 // neighbour depending on interpolation noise, which shows up as streaks in ambient occlusion.
 // Snapping 2D float-texture coordinates to the 1/256 grid makes those picks consistent again.
+// A Wind Waker HD fix (its AO); not in Cemu, so off for BotW: WWHD_UV_SNAP=1 turns it on.
 static std::string snap_texcoords(const char* src) {
-    static const bool off = getenv("WWHD_NO_UV_SNAP") != nullptr;
+    static const bool off = !getenv("WWHD_UV_SNAP") || !strcmp(getenv("WWHD_UV_SNAP"), "0");
     std::string s = src;
     if (off) return s;
     // one pass each over the declarations and the sample calls (this runs on the render thread for
@@ -1483,6 +1530,17 @@ static inline void bc_bytes(id<MTLRenderCommandEncoder> enc, bool vertex, const 
 
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
+    if (capturing() && vertex && dec->textureUnitListCount > 0) {  // vertex texture fetches (grass, terrain): their MSL
+        static std::set<std::string> done;
+        char name[200];
+        snprintf(name, sizeof name, "%s/vs_%08X.metal", g_capture_dir.c_str(), regs[mmSQ_PGM_START_VS] << 8);
+        if (done.insert(name).second) {
+            if (FILE* f = fopen(name, "w")) {
+                fputs(dec->strBuf_shaderSource ? dec->strBuf_shaderSource->c_str() : "// source released after compiling\n", f);
+                fclose(f);
+            }
+        }
+    }
     float texScale[18][2];
     for (auto& t : texScale) t[0] = t[1] = 1.0f;
     auto& rm = dec->resourceMapping;
@@ -1513,8 +1571,11 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         id<MTLTexture> tex = s && s->tex ? texture_view(tv, type, tw[4]) : nil;
         if (s && unit < 18) { texScale[unit][0] = s->sx; texScale[unit][1] = s->sy; }
         uint32_t samplerIdx = dec->textureUnitSamplerAssignment[unit];
-        DLOG("[draw]   %s tex%u %08X %ux%u fmt %X gpu=%d view=%d smp %08X %08X %08X", vertex ? "VS" : "PS", unit, tw[2] << 8,
-             s ? s->width : 0, s ? s->height : 0, s ? s->format : 0, s ? s->gpuWritten : -1, tex != nil,
+        if (capturing() && s && s->gpuWritten && (vertex || s->slices > 1)) capture_full(s);
+        DLOG("[draw]   %s tex%u %08X %ux%u fmt %X gpu=%d view=%d [mips %u+%u of %u, slices %u+%u of %u, dim %u] smp %08X %08X %08X",
+             vertex ? "VS" : "PS", unit, tw[2] << 8, s ? s->width : 0, s ? s->height : 0, s ? s->format : 0, s ? s->gpuWritten : -1, tex != nil,
+             tv ? tv->firstMip : 0, tv ? tv->numMip : 0, s ? s->mips : 0, tv ? tv->firstSlice : 0, tv ? tv->numSlice : 0, s ? s->slices : 0,
+             tv ? tv->dim : 0,
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3],
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 1],
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 2]);

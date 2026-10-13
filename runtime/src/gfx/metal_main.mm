@@ -656,6 +656,8 @@ void swap() {
     static bool sync_gpu = getenv("WWHD_SYNC_GPU") != nullptr;  // debug: no CPU/GPU overlap
     if (sync_gpu) wait_idle();
     end_encoder();
+    void capture_flush_full_dumps();
+    capture_flush_full_dumps();
     texture_cache_frame_end();
     if (log_this_frame()) LOG("[frame] end %llu", (unsigned long long)R.frame);
     void pass_timing_end_frame(id<MTLCommandBuffer>);

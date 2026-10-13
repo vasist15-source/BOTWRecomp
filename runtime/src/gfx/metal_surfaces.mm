@@ -54,6 +54,9 @@ static float parse_scale(const char* e) {
 static std::atomic<float> g_res_requested{parse_scale(getenv("WWHD_RES_SCALE"))};
 static float g_res_frame = g_res_requested.load();
 static void latch_aspect();  // render thread: the factor for this frame
+static void rescale_all_surfaces();
+static float g_aspect_kx_latched();
+static float g_aspect_ky_latched();
 float res_scale() { return g_res_frame; }
 void set_res_scale(float f) {
     g_res_requested = std::clamp(f, 1.0f, 4.0f);
@@ -74,8 +77,12 @@ void latch_res_scale() {
     }();
     for (auto& [f, v] : at)
         if (R.frame == f) set_res_scale(v);
+    const float before = g_res_frame, kx = g_aspect_kx_latched(), ky = g_aspect_ky_latched();
     g_res_frame = g_res_requested.load(std::memory_order_relaxed);
     latch_aspect();
+    // every surface made at the old factor follows at once: one left at the old factor (sampled, not
+    // drawn to since) can no longer be synced with its related surfaces and keeps stale contents
+    if (g_res_frame != before || kx != g_aspect_kx_latched() || ky != g_aspect_ky_latched()) rescale_all_surfaces();
 }
 
 // ---------------------------------------------------------------- aspect ratio
@@ -95,6 +102,8 @@ static void latch_aspect() {
     g_aspect_kx = kx;
     g_aspect_ky = ky;
 }
+static float g_aspect_kx_latched() { return g_aspect_kx; }
+static float g_aspect_ky_latched() { return g_aspect_ky; }
 // the game's screen-sized buffers and their reductions (1920x1080 ... 60x33); not the GamePad's
 // (854x480, shown in its own window), not shadow maps, mip chains or textures
 static bool screen_shaped(const Surface* s) {
@@ -469,6 +478,17 @@ inline void for_occ_buckets(uint32_t start, uint32_t end, F f) {
 std::vector<Surface*> g_all;                          // every live surface (cleanup scan)
 std::vector<std::unique_ptr<Surface>> g_graveyard;    // deleted this frame, freed at its end
 }  // namespace
+
+static void rescale_all_surfaces() {
+    size_t n = 0;
+    for (Surface* t : g_all) {
+        if (t->deleted) continue;
+        id<MTLTexture> before = t->tex;
+        rescale(t);
+        n += t->tex != before;
+    }
+    LOG("[gfx] %zu surfaces reallocated for internal resolution %gx", n, res_scale());
+}
 
 static void view_lookup_add(TexView* v, uint32_t baseMip = 0, uint32_t baseSlice = 0) {
     Surface* t = v->tex;
