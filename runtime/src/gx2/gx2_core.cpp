@@ -113,7 +113,42 @@ static bool metal_key_changes(uint32 reg, uint32 old, uint32 val) {
         const uint32 word = (reg - uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0)) % 3;
         return word == 0 && ((old ^ val) & 0xF8000000) != 0;
     }
-    return true;
+    // everything else: only the registers the shader key reads (metal_draw.mm get_shader_uncached and
+    // stage_state_hash). Viewport, scissor, blend, stencil and the like changed on most draws and made
+    // every draw recompute both keys. WWHD_SHADER_KEY_ALL_REGS=1: every register counts, as before.
+    static const bool allRegs = getenv("WWHD_SHADER_KEY_ALL_REGS") != nullptr;
+    if (allRegs) return true;
+    static const std::vector<bool> keyRegs = [] {
+        std::vector<bool> k(kNumRegs);
+        auto add = [&](uint32 first, uint32 count) { for (uint32 r = first; r < first + count && r < kNumRegs; r++) k[r] = true; };
+        add(mmSQ_PGM_START_VS, 2);
+        add(mmSQ_PGM_START_PS, 2);
+        add(mmSQ_PGM_START_FS, 2);
+        add(mmVGT_STRMOUT_EN, 1);
+        for (uint32 b = 0; b < 4; b++) add(mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4, 1);
+        add(mmSQ_VTX_SEMANTIC_0, 32);
+        add(mmSPI_VS_OUT_ID_0, 10);
+        add(mmSPI_VS_OUT_CONFIG, 1);
+        add(mmPA_CL_VS_OUT_CNTL, 1);
+        add(mmSPI_PS_IN_CONTROL_0, 2);
+        add(mmSPI_PS_INPUT_CNTL_0, 32);
+        add(uint32(REGADDR::SQ_CONFIG), 1);
+        add(mmCB_SHADER_MASK, 1);
+        add(mmCB_SHADER_CONTROL, 1);
+        add(mmDB_SHADER_CONTROL, 1);
+        add(mmSPI_INPUT_Z, 1);
+        add(uint32(REGADDR::SX_ALPHA_TEST_CONTROL), 1);
+        add(uint32(REGADDR::PA_CL_VTE_CNTL), 1);
+        add(uint32(REGADDR::PA_CL_CLIP_CNTL), 1);
+        add(uint32(REGADDR::PA_SU_SC_MODE_CNTL), 1);  // both faces culled: rasterization off
+        add(uint32(REGADDR::CB_COLOR_CONTROL), 1);
+        add(uint32(REGADDR::CB_TARGET_MASK), 1);
+        add(mmCB_COLOR0_INFO, 8);
+        add(mmCB_COLOR0_BASE, 8);
+        add(uint32(REGADDR::DB_DEPTH_CONTROL), 1);
+        return k;
+    }();
+    return reg < kNumRegs && keyRegs[reg];
 }
 // debug: WWHD_GEN_STATS=1 logs, every 20000 bumps, which registers bumped the shader generation
 static void note_gen_bump(uint32 reg) {
