@@ -970,6 +970,42 @@ static MTLTextureType texture_type_for(const Surface* s) {
     }
 }
 
+static bool in_mem1(uint32_t a) { return a >= 0xF4000000 && a < 0xF6000000; }
+// every level and slice of a new texture to 0 (colour) / 1 (depth): private textures start undefined
+static void clear_surface_to_zero(Surface* t) {
+    if (t->fmt.compressed || !(t->tex.usage & MTLTextureUsageRenderTarget)) return;
+    end_encoder();
+    for (uint32_t mip = 0; mip < t->mips && mip < t->tex.mipmapLevelCount; mip++)
+        for (uint32_t slice = 0; slice < t->mip_slices(mip); slice++) {
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (t->fmt.depth) {
+                rp.depthAttachment.texture = t->tex;
+                rp.depthAttachment.level = mip;
+                rp.depthAttachment.slice = slice;
+                rp.depthAttachment.loadAction = MTLLoadActionClear;
+                rp.depthAttachment.clearDepth = 1.0;
+                rp.depthAttachment.storeAction = MTLStoreActionStore;
+                if (t->fmt.stencil) {
+                    rp.stencilAttachment.texture = t->tex;
+                    rp.stencilAttachment.level = mip;
+                    rp.stencilAttachment.slice = slice;
+                    rp.stencilAttachment.loadAction = MTLLoadActionClear;
+                    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                }
+            } else {
+                rp.colorAttachments[0].texture = t->tex;
+                rp.colorAttachments[0].level = mip;
+                if (t->tex.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = slice;
+                else rp.colorAttachments[0].slice = slice;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            }
+            time_render_pass(rp, __FILE_NAME__, __LINE__);
+            [[command_buffer() renderCommandEncoderWithDescriptor:rp] endEncoding];
+        }
+}
+
 static TexView* create_surface(uint32_t dim, uint32_t addr, uint32_t mipAddr, uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
                                uint32_t pitch, uint32_t mips, uint32_t swizzle, uint32_t tileMode, bool isDepth, float minScale = 0.0f) {
     auto up = std::make_unique<Surface>();
@@ -1004,9 +1040,13 @@ static TexView* create_surface(uint32_t dim, uint32_t addr, uint32_t mipAddr, ui
     R.surfaces.emplace(addr, std::move(up));
     g_all.push_back(t);
     if (!isDepth && (Latte::E_HWTILEMODE)tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED) R.linearTargets.push_back(t);
-    // the guest memory's current contents (Cemu loads every new texture)
-    t->lastCheckedFrame = R.frame;
-    check_texture(t);
+    // the guest memory's current contents (Cemu loads every new texture). Not in MEM1: it holds GPU
+    // results (render targets) whose guest-memory copy is stale; those start as zeros instead
+    if (in_mem1(addr)) clear_surface_to_zero(t);
+    else {
+        t->lastCheckedFrame = R.frame;
+        check_texture(t);
+    }
     t->lastUseFrame = R.frame;
     t->baseView = get_or_create_view(t, dim, format, 0, t->mips, 0, t->slices);
     g_repeat_texture_init = true;
@@ -1171,7 +1211,7 @@ static bool data_overwritten(Surface* t) {
 
 // keep t's contents current before a use: CPU writes to its memory (once a frame), newer GPU writes to related surfaces
 static void update_to_latest(Surface* t) {
-    if (!t->gpuWritten && t->lastCheckedFrame != R.frame) {
+    if (!t->gpuWritten && t->lastCheckedFrame != R.frame && !in_mem1(t->addr)) {
         t->lastCheckedFrame = R.frame;
         check_texture(t);
     }
@@ -1278,6 +1318,10 @@ TexView* sampled_texture(const uint32_t* w, bool isDepthSampler) {
         if (logged++ < 20)
             LOG("[tc] %08X %ux%u f%X sampled with swizzle %X / mip address %08X (was %X / %08X)", t->addr, t->width, t->height, t->format, swizzle,
                 mipAddr, t->swizzle, t->mipAddr);
+        reload = false;
+    }
+    if (reload && in_mem1(t->addr)) {  // GPU memory: nothing to load
+        t->swizzle = swizzle;
         reload = false;
     }
     if (reload) {
