@@ -1145,7 +1145,8 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out
                 else convert_row(f.convert, row, dst, bw);
             }
     };
-    if (units <= 1 || verify) {
+    static const bool serial = getenv("WWHD_SERIAL_DECODE") != nullptr;  // debug: decode on the render thread only
+    if (units <= 1 || verify || serial) {
         for (size_t u = 0; u < units; u++) run(u);
     } else {
         dispatch_apply(units, DISPATCH_APPLY_AUTO, ^(size_t u) { run(u); });
@@ -1173,7 +1174,8 @@ static uint64_t content_hash(Surface* s) {
     uint64_t total = 0;
     for (auto& r : ranges) total += r.second;
     g_stat_hashed_bytes += total;
-    if (total < (4u << 20)) {
+    static const bool serial = getenv("WWHD_SERIAL_DECODE") != nullptr;
+    if (total < (4u << 20) || serial) {
         uint64_t h = 0;
         for (auto& [a, n] : ranges) h = XXH3_64bits_withSeed(mem::ptr(a), n, h);
         return h;
