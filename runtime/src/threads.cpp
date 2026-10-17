@@ -814,9 +814,18 @@ HLE(coreinit, OSJoinThread) {
 HLE(coreinit, OSGetCurrentThread) { ret(c, threads::current_thread()); }
 HLE(coreinit, OSGetCoreId) { ret(c, t_self ? t_self->core : 1); }
 HLE(coreinit, OSYieldThread) {
-    // let other ready threads of the same (or higher) priority on this core run
-    BlockingScope b;
-    std::this_thread::yield();
+    // let other ready threads of the same (or higher) priority on this core run. With none (or only lower
+    // priorities) waiting, Cafe OS returns at once with the core kept: releasing it each time cost polling
+    // threads (RadarMgr, PlacementMgr) more host time than their work, and let lower priorities in
+    HostThread* t = t_self;
+    if (t && g_sched_on && t->holds_core) {
+        CoreSched& k = g_sched[t->held_core];
+        std::lock_guard<std::mutex> lk(k.m);
+        HostThread* next = best_ready(k);
+        if (!next || next->prio > t->prio) return;
+    }
+    threads::release_core();
+    threads::ensure_core();
 }
 HLE(coreinit, OSSleepTicks) {
     if (!mods::fast_forward()) {
