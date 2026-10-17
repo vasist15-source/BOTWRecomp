@@ -3,7 +3,7 @@
 // "Quit Breath of the Wild?" in a sheet on the TV window:
 //   Quit                 quits (the default button, Return)
 //   Cancel               keeps playing (Esc)
-//   Save State and Quit  writes save state slot 1 (as Save States > Save to slot 1, Shift+F1), then quits
+//   (Save State and Quit, slot 1 then quit: not offered until save states run in BotW; save_and_quit is kept)
 // Before that (boot, title screen, file select) and in test runs nothing asks (quit_prompt.h decides).
 // Closing the GamePad window still only hides it.
 //
@@ -89,14 +89,12 @@ void ask() {
     LOG("[quit] asking before quitting");
     NSAlert* a = [NSAlert new];
     a.messageText = @"Quit Breath of the Wild?";
-    a.informativeText = [NSString stringWithFormat:@"Progress since your last in-game save is lost.\n\n"
-                                                   @"Save State and Quit keeps it in save state slot %d (Save States menu), "
-                                                   @"replacing what is there.",
-                                                   quitprompt::kSaveSlot];
+    // no "Save State and Quit": save states are not serviced in BotW yet (savestate.cpp's service runs
+    // from a Wind Waker per-frame hook), so the save never happened and the quit hung for a minute
+    a.informativeText = @"Progress since your last in-game save is lost.";
     a.alertStyle = NSAlertStyleWarning;
     [a addButtonWithTitle:@"Quit"];    // default (Return)
     [a addButtonWithTitle:@"Cancel"];  // Esc
-    [a addButtonWithTitle:@"Save State and Quit"];
     g_asking = true;
     [a beginSheetModalForWindow:g_tv completionHandler:^(NSModalResponse r) {
         g_asking = false;

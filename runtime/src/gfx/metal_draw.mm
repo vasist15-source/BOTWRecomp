@@ -62,9 +62,26 @@ void request_capture() { g_capture_requested = true; }
 static bool capturing() { return R.frame == g_capture_frame; }
 bool log_this_frame() { return capturing() || (R.frame >= g_log_frame && R.frame <= g_log_frame_end); }
 // colour probe (F12 capture): raw texel of one surface at one point after each event that writes it
+// the probe's surface and point: WWHD_PROBE_ADDR / WWHD_PROBE_XY, overridden while the game runs by
+// captures/probe.txt ("<addr hex> <x> <y>", x and y fractions of the surface), read once per captured frame
+static uint32_t g_probe_addr = getenv("WWHD_PROBE_ADDR") ? (uint32_t)strtoul(getenv("WWHD_PROBE_ADDR"), nullptr, 16) : 0xF45C6000u;
+static float g_probe_fx = 0.5f, g_probe_fy = 0.5f;
+static void probe_reload() {
+    static uint64_t frame = ~0ull;
+    if (frame == R.frame) return;
+    frame = R.frame;
+    static const bool parsed = [] { if (const char* e = getenv("WWHD_PROBE_XY")) sscanf(e, "%f,%f", &g_probe_fx, &g_probe_fy); return true; }();
+    (void)parsed;
+    if (FILE* f = fopen("captures/probe.txt", "r")) {
+        unsigned a;
+        float x, y;
+        if (fscanf(f, "%x %f %f", &a, &x, &y) == 3) g_probe_addr = a, g_probe_fx = x, g_probe_fy = y;
+        fclose(f);
+    }
+}
 uint32_t probe_addr() {
-    static const uint32_t a = getenv("WWHD_PROBE_ADDR") ? (uint32_t)strtoul(getenv("WWHD_PROBE_ADDR"), nullptr, 16) : 0xF45C6000u;
-    return a;
+    if (capturing()) probe_reload();
+    return g_probe_addr;
 }
 bool probe_capturing() { return capturing(); }
 void probe_surface(Surface* s, uint32_t slice, uint32_t mip, const char* what);
@@ -72,9 +89,8 @@ struct ProbeRead { Surface* s; uint32_t slice, mip; std::string what; };
 static std::vector<ProbeRead> g_probe_reads;  // textures read by the current draw (probed after it)
 void probe_surface(Surface* s, uint32_t slice, uint32_t mip, const char* what) {
     if (!capturing() || !s || !s->tex || s->tex.isFramebufferOnly || s->fmt.compressed || s->fmt.depth) return;
-    static float fx = 0.5f, fy = 0.5f;
-    static const bool parsed = [] { if (const char* e = getenv("WWHD_PROBE_XY")) sscanf(e, "%f,%f", &fx, &fy); return true; }();
-    (void)parsed;
+    probe_reload();
+    const float fx = g_probe_fx, fy = g_probe_fy;
     static id<MTLBuffer> buf = nil;
     static uint32_t slot = 0;
     static uint64_t frame = ~0ull;
@@ -3183,9 +3199,11 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         for (auto& r : g_probe_reads) probe_surface(r.s, r.slice, r.mip, (r.what + " (draw " + std::to_string(thisDraw) + ")").c_str());
         g_probe_reads.clear();
     }
+    bool probeTarget = false;  // renders into the probed surface: its programs' MSL is saved below
     if (capturing())
         for (int i = 0; i < 8; i++)
             if (colors[i] && colors[i]->addr == probe_addr()) {
+                probeTarget = true;
                 char what[160];
                 snprintf(what, sizeof what, "draw %llu VS %08X PS %08X count %u as CB%d", (unsigned long long)thisDraw,
                          regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, count, i);
@@ -3238,7 +3256,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     }
     // vertex shaders that fetch textures (grass, terrain) and their pixel shaders: MSL, translated again
     // when the source was released after compiling
-    if (capturing() && vs->dec && vs->dec->textureUnitListCount > 0) {
+    if (capturing() && ((vs->dec && vs->dec->textureUnitListCount > 0) || probeTarget)) {
         static std::set<std::string> done;
         static std::string doneDir;
         if (doneDir != g_capture_dir) { done.clear(); doneDir = g_capture_dir; }
