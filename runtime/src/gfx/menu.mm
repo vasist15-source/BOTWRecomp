@@ -1,4 +1,3 @@
-#include "../mods/manager.h"
 // Menu bar: app menu (Quit, which asks first while a game is in progress: quit_prompt.mm), a Window
 // menu (Close Window on the TV window quits the same way) and a Graphics menu to switch fixes and
 // enhancements while playing. Each option also has a single-key shortcut in the game window.
@@ -15,20 +14,12 @@
 #include "../input_map.h"
 #include "../overlay/hostui.h"
 #include "../overlay/overlay.h"
-#include "../mods/code_mods.h"
 #include "../crashrec.h"
-#include "../aspect.h"
 #include "renderer.h"
-#ifdef WWHD_HAS_VULKAN
-#include "vulkan/settings.h"  // Presentation (present mode), kept with the other graphics options
-#endif
 #include "runtime.h"
 
 // graphics options and capture go to the renderer in use (Metal or Vulkan: renderer.h)
 namespace gfx {
-bool drc_window_available();
-bool drc_window_shown();
-void show_drc_window(bool on);
 void install_display_menu(NSMenu* bar);
 void set_host_setting(const char* key, const std::string& value);  // display.mm
 }  // namespace gfx
@@ -98,9 +89,6 @@ static void load_prefs() {
     // frame rate (BotW): 30 (the game's own), 60, or 0 (no cap). The Wind Waker interpolation modes
     // (fps60, interpFps) do not apply to this game and are not loaded.
     if (saved(@"botwFps", {"WWHD_FPS"})) gx2::set_fps_target([pref(@"botwFps") intValue]);
-#ifdef WWHD_HAS_VULKAN
-    if (saved(@"vkPresentMode", {"WWHD_VK_PRESENT_MODE"})) gfxvk::set_present_mode([pref(@"vkPresentMode") intValue]);
-#endif
 }
 static void save_prefs() {
     if (!g_prefs || !g_prefs_loaded) return;
@@ -108,9 +96,6 @@ static void save_prefs() {
     if (!env_set({"WWHD_ANISO"})) set_pref(@"aniso", @(render::aniso()));
     if (!env_set({"WWHD_FXAA"})) set_pref(@"fxaa", @(render::fxaa()));
     if (!env_set({"WWHD_FPS"})) set_pref(@"botwFps", @(gx2::fps_target()));
-#ifdef WWHD_HAS_VULKAN
-    if (!env_set({"WWHD_VK_PRESENT_MODE"})) set_pref(@"vkPresentMode", @(gfxvk::present_mode()));
-#endif
     if (NSString* p = portable_prefs_path()) [g_portable_prefs writeToFile:p atomically:YES];
 }
 
@@ -139,29 +124,6 @@ static void update_title() {
         last = noFps;
     }
     [g_tv setTitle:t];
-}
-
-// Graphics > Renderer: saved for the next start; offers to restart right away
-static void choose_renderer(render::Api a) {
-    if (a == render::preferred()) return;
-    render::set_preferred(a);
-    update_title();
-    if (a == render::active()) return;  // back to the renderer in use: nothing to restart
-    if (getenv("WWHD_NO_HOST_INPUT")) return;  // test runs: no dialogs
-    NSAlert* alert = [NSAlert new];
-    alert.messageText = [NSString stringWithFormat:@"The game will use %s after a restart.", render::api_name(a)];
-    alert.informativeText = @"Restart now? Progress since your last save (in-game save or save state) is lost.";
-    [alert addButtonWithTitle:@"Restart Now"];
-    [alert addButtonWithTitle:@"Later"];
-    [alert beginSheetModalForWindow:g_tv completionHandler:^(NSModalResponse r) {
-        if (r != NSAlertFirstButtonReturn) return;
-        if (!render::restart()) {
-            NSAlert* e = [NSAlert new];
-            e.messageText = @"The game could not restart itself.";
-            e.informativeText = @"Quit and start it again to switch the renderer.";
-            [e beginSheetModalForWindow:g_tv completionHandler:nil];
-        }
-    }];
 }
 
 // Save States menu: items are rebuilt each time it opens (slot time and area)
@@ -225,15 +187,11 @@ static WWStateMenu* g_state_menu;
 @end
 
 @implementation WWGraphicsMenu
-- (void)setBloom:(NSMenuItem*)item { render::set_bloom_strength(item.tag / 100.0f); update_title(); }
-- (void)setAO:(NSMenuItem*)item { render::set_ao_mode((int)item.tag); update_title(); }
 - (void)toggleAniso:(NSMenuItem*)item { render::set_aniso(!render::aniso()); update_title(); }
 - (void)capture:(NSMenuItem*)item { render::request_capture(); }
 - (void)screenshot:(NSMenuItem*)item { screenshot::request(); }
 - (void)openScreenshots:(NSMenuItem*)item { hostui::open_folder(screenshot::dir()); }
-- (void)toggleScreenshotGamePad:(NSMenuItem*)item { screenshot::set_gamepad_too(!screenshot::gamepad_too()); }
 - (void)openSettings:(NSMenuItem*)item { overlay::set_open(!overlay::is_open()); }  // Cmd+, toggles
-- (void)setRenderer:(NSMenuItem*)item { choose_renderer((render::Api)item.tag); }
 - (void)recordSound:(NSMenuItem*)item { gfx::menu_hotkey(kVK_ANSI_9); }
 - (void)setController:(NSMenuItem*)item {
     input::set_pro_controller(item.tag == 1);
@@ -247,33 +205,11 @@ static WWStateMenu* g_state_menu;
     input_map::set_current(m);
 }
 - (void)setFps:(NSMenuItem*)item { gx2::set_fps_target((int)item.tag); update_title(); }
-- (void)toggleInterp:(NSMenuItem*)item { interp::set_mode(interp::mode() == item.tag ? 0 : (int)item.tag); update_title(); }
-- (void)toggleInterpFps:(NSMenuItem*)item { interp::toggle_fps((int)item.tag); update_title(); }
-- (void)toggleDrcWindow:(NSMenuItem*)item { gfx::show_drc_window(!gfx::drc_window_shown()); }
 - (void)toggleFxaa:(NSMenuItem*)item { render::set_fxaa(!render::fxaa()); update_title(); }
-- (void)toggleHires:(NSMenuItem*)item { render::set_ao_hires(!render::ao_hires()); update_title(); }
 - (void)setRes:(NSMenuItem*)item { set_res(kResScales[item.tag]); update_title(); }
-- (void)setAspect:(NSMenuItem*)item {
-    aspect::set_mode((int)item.tag);
-    gfx::set_host_setting("aspectMode", std::to_string((int)item.tag));  // as the settings overlay saves it
-    update_title();
-}
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
     if (item.action == @selector(setRes:))
         item.state = fabsf(kResScales[item.tag] - current_res_scale()) < 0.01f ? NSControlStateValueOn : NSControlStateValueOff;
-    if (item.action == @selector(setAspect:)) item.state = item.tag == aspect::mode() ? NSControlStateValueOn : NSControlStateValueOff;
-    if (item.action == @selector(setAO:)) {
-        item.state = item.tag == render::ao_mode() ? NSControlStateValueOn : NSControlStateValueOff;
-        return render::feature_available(render::kFeatureAO);
-    }
-    if (item.action == @selector(setRenderer:)) {
-        render::Api a = (render::Api)item.tag;
-        item.state = a == render::preferred() ? NSControlStateValueOn : NSControlStateValueOff;
-        NSString* name = a == render::Api::Vulkan ? @"    Vulkan (MoltenVK)" : @"    Metal";
-        item.title = a == render::active() ? [name stringByAppendingString:@"  \u2014 in use"] : name;
-        if (!render::compiled(a)) return NO;
-        return YES;
-    }
     if (item.action == @selector(setController:))
         item.state = (item.tag == 1) == input::pro_controller() ? NSControlStateValueOn : NSControlStateValueOff;
     if (item.action == @selector(setFaceLayout:)) {
@@ -282,22 +218,9 @@ static WWStateMenu* g_state_menu;
         item.state = on ? NSControlStateValueOn : NSControlStateValueOff;
     }
     if (item.action == @selector(setFps:)) item.state = gx2::fps_target() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
-    if (item.action == @selector(toggleInterp:)) item.state = interp::mode() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
-    if (item.action == @selector(toggleInterpFps:))
-        item.state = interp::mode() == 1 && interp::fps() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
-    if (item.action == @selector(toggleDrcWindow:)) {
-        item.state = gfx::drc_window_shown() ? NSControlStateValueOn : NSControlStateValueOff;
-        return gfx::drc_window_available();
-    }
-    if (item.action == @selector(setBloom:))
-        item.state = fabsf(render::bloom_strength() * 100.0f - item.tag) < 0.5f ? NSControlStateValueOn : NSControlStateValueOff;
     if (item.action == @selector(toggleFxaa:)) {
         item.state = render::fxaa() ? NSControlStateValueOn : NSControlStateValueOff;
         return render::feature_available(render::kFeatureFXAA);
-    }
-    if (item.action == @selector(toggleHires:)) {
-        item.state = render::ao_hires() ? NSControlStateValueOn : NSControlStateValueOff;
-        return render::feature_available(render::kFeatureAOHires);
     }
     if (item.action == @selector(toggleAniso:)) {
         item.state = render::aniso() ? NSControlStateValueOn : NSControlStateValueOff;
@@ -311,41 +234,11 @@ static WWStateMenu* g_state_menu;
         item.title = k == input_map::kNoKey ? @"Take Screenshot"
                                             : [NSString stringWithFormat:@"Take Screenshot (%s)", input_map::key_label(k).c_str()];
     }
-    if (item.action == @selector(toggleScreenshotGamePad:))
-        item.state = screenshot::gamepad_too() ? NSControlStateValueOn : NSControlStateValueOff;
     return YES;
 }
 @end
 
 static WWGraphicsMenu* g_target;
-
-// Menu items backed by two blocks: `get` gives the check mark, `set` is called with !get() on a click.
-// Used by the Gameplay menu: one line per option (see install_menu).
-@interface WWBlockItem : NSObject <NSMenuItemValidation>
-@property(copy) BOOL (^get)(void);
-@property(copy) void (^set)(BOOL);
-@end
-@implementation WWBlockItem
-- (void)act:(NSMenuItem*)item { self.set(!self.get()); update_title(); }
-- (BOOL)validateMenuItem:(NSMenuItem*)item {
-    item.state = self.get() ? NSControlStateValueOn : NSControlStateValueOff;
-    return YES;
-}
-@end
-static NSMutableArray<WWBlockItem*>* g_block_items;  // menu items hold their targets weakly
-
-// add a checkable item: toggle(menu, @"Title", ^{ return state(); }, ^(BOOL on) { set_state(on); })
-static NSMenuItem* toggle(NSMenu* m, NSString* title, BOOL (^get)(void), void (^set)(BOOL), NSString* tip = @"") {
-    WWBlockItem* t = [WWBlockItem new];
-    t.get = get;
-    t.set = set;
-    if (!g_block_items) g_block_items = [NSMutableArray new];
-    [g_block_items addObject:t];
-    NSMenuItem* it = [m addItemWithTitle:title action:@selector(act:) keyEquivalent:@""];
-    it.target = t;
-    if (tip.length) it.toolTip = tip;
-    return it;
-}
 
 static NSMenuItem* add(NSMenu* m, NSString* title, SEL action, NSString* key, NSInteger tag = 0) {
     NSMenuItem* it = [m addItemWithTitle:title action:action keyEquivalent:@""];
@@ -356,7 +249,6 @@ static NSMenuItem* add(NSMenu* m, NSString* title, SEL action, NSString* key, NS
     return it;
 }
 
-namespace mods { bool climb_enabled(); void set_climb_enabled(bool on); }  // mods/climb.cpp
 
 namespace gfx {
 
@@ -418,6 +310,8 @@ void install_menu(NSWindow* tv) {
     [in addItem:gfx::controls_menu_item()];
     inItem.submenu = in;
     install_display_menu(bar);  // Display: full screen, scaling, GamePad screen mode (display.mm)
+
+    mods::mouse_init((__bridge void*)tv);  // mouse input: gyro aiming with the mouse (mods/mouse.mm)
 
     // Save States: 5 slots (savestate.cpp); Shift+F1..F5 save, F1..F5 load
     NSMenuItem* ssItem = [bar addItemWithTitle:@"Save States" action:nil keyEquivalent:@""];
