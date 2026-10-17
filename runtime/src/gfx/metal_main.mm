@@ -383,6 +383,16 @@ static void clear_surface(TexView* v, const float* rgba, bool clearDepth, float 
 void clear_color(const uint32_t* regs, uint32_t cb, const float rgba[4]) {
     uint32_t num = 1;
     TexView* v = surface_from_color_buffer(cb, &num);
+    // clears of data targets (not screen-shaped), always: what a grass/terrain map starts from
+    if (v && !log_this_frame()) {
+        static int logged = 0;
+        const float r = v->tex->height ? (float)v->tex->width * 9.0f / ((float)v->tex->height * 16.0f) : 0.0f;
+        if (logged < 400 && !(v->tex->width >= 160 && r > 0.97f && r < 1.03f)) {
+            logged++;
+            LOG("[dataclear] f%llu %08X %ux%u x%u fmt %X slice %u+%u -> %.3f %.3f %.3f %.3f", (unsigned long long)R.frame, v->tex->addr, v->tex->width,
+                v->tex->height, v->tex->slices, v->tex->format, v->firstSlice, num, rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+    }
     if (log_this_frame() && v)
         LOG("[clear] color %08X %ux%u fmt %X -> %.3f %.3f %.3f %.3f", v->tex->addr, v->tex->width, v->tex->height, v->tex->format, rgba[0], rgba[1],
             rgba[2], rgba[3]);

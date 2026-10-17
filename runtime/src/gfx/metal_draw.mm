@@ -2722,12 +2722,18 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     static const bool arrayLog = getenv("WWHD_NO_ARRAY_LOG") == nullptr;
     if (arrayLog)
         for (int i = 0; i < 8; i++) {
-            if (!colors[i] || colors[i]->slices <= 1) continue;
+            // array targets and every other data target (not screen-shaped: grass, terrain, interaction maps)
+            if (!colors[i]) continue;
+            {
+                const uint32_t cw = colors[i]->width >> colorMips[i], ch = colors[i]->height >> colorMips[i];
+                const float r = ch ? (float)cw * 9.0f / ((float)ch * 16.0f) : 0.0f;
+                if (colors[i]->slices <= 1 && cw >= 160 && r > 0.97f && r < 1.03f) continue;
+            }
             static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> seen;
             static int logged = 0;
             TexView* src0 = ps->dec->textureUnitListCount ? g_unit_tex[1][ps->dec->textureUnitList[0]] : nullptr;
             const uint32_t srcKey = src0 ? src0->tex->addr ^ (src0->tex->width << 20) ^ src0->tex->format : 0;
-            if (logged >= 600 || !seen.insert({regs[mmSQ_PGM_START_PS] << 8, colors[i]->addr, colorMips[i], srcKey}).second) break;
+            if (logged >= 2500 || !seen.insert({regs[mmSQ_PGM_START_PS] << 8, colors[i]->addr, colorMips[i], srcKey}).second) break;
             logged++;
             std::string l;
             char t[200];
