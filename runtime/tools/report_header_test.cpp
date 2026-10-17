@@ -107,7 +107,7 @@ int main() {
     in.bufferCache = 0;
     in.overrides = {"WWHD_VK_REUSE_VERTEX_SNAPSHOTS=0"};
     expect(format(in),
-           "Wind Waker HD v0.2.5 (2ff030c), Windows 11 23H2 (build 22631.4317), AMD Radeon RX 6700 XT, driver 2.0.302, "
+           "Breath of the Wild (recompiled) v0.2.5 (2ff030c), Windows 11 23H2 (build 22631.4317), AMD Radeon RX 6700 XT, driver 2.0.302, "
            "Vulkan 1.3.287\n"
            "performance report: renderer Vulkan, host SDL, 60 fps interpolation, internal scale 2.0x, buffer cache off; "
            "overrides: WWHD_VK_REUSE_VERTEX_SNAPSHOTS=0\n",
@@ -129,11 +129,11 @@ int main() {
     m.fps = "30 fps";
     m.scale = 1.5f;
     expect(format(m),
-           "Wind Waker HD v0.2.5+3 (abcdef0-dirty), macOS 15.6.1 (24G90), Apple M3 Max\n"
+           "Breath of the Wild (recompiled) v0.2.5+3 (abcdef0-dirty), macOS 15.6.1 (24G90), Apple M3 Max\n"
            "performance report: renderer Metal, host AppKit, 30 fps, internal scale 1.5x\n",
            "Metal header");
     m.gpu.clear();
-    expect(format(m).substr(0, format(m).find('\n')), "Wind Waker HD v0.2.5+3 (abcdef0-dirty), macOS 15.6.1 (24G90)",
+    expect(format(m).substr(0, format(m).find('\n')), "Breath of the Wild (recompiled) v0.2.5+3 (abcdef0-dirty), macOS 15.6.1 (24G90)",
            "header before the renderer started");
 
     // ---- this build on this system (the GPU line comes from the running renderer; a sample here)
