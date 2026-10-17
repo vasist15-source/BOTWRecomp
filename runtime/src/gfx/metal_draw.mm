@@ -461,6 +461,10 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
         if (patchFile && snapped.find("col0") != std::string::npos) {  // which shaders read a render target
             size_t at = snapped.find("// shader ");
             LOG("[gfx] patch candidate: %s", at == std::string::npos ? "(no hash line)" : snapped.substr(at, 27).c_str());
+            if (patchMatch && snapped.find(patchMatch) != std::string::npos) {  // the live source, before the patch
+                std::string out = std::string(patchFile) + ".live";
+                if (FILE* f = fopen(out.c_str(), "w")) { fputs(snapped.c_str(), f); fclose(f); }
+            }
         }
         if (patchFile && patchMatch && snapped.find(patchMatch) != std::string::npos)
             if (FILE* f = fopen(patchFile, "rb")) {
