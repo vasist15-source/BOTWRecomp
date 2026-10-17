@@ -782,15 +782,16 @@ void swap() {
             g_pass_why[0].exchange(0) / 300.0, g_pass_why[1].exchange(0) / 300.0, g_pass_why[2].exchange(0) / 300.0,
             g_pass_why[3].exchange(0) / 300.0, g_pass_why[4].exchange(0) / 300.0, g_pass_why[5].exchange(0) / 300.0,
             g_pass_why[6].exchange(0) / 300.0);
-        extern std::atomic<uint64_t> g_copy_cpu, g_copy_cpu_bytes, g_copy_gpu, g_write_backs, g_write_back_bytes;
+        extern std::atomic<uint64_t> g_copy_cpu, g_copy_cpu_bytes, g_copy_gpu, g_write_backs, g_write_back_bytes, g_write_backs_sync;
         uint64_t cond = 0, queries = wwhd_query_counts(&cond);
         extern uint64_t g_alpha_to_mask_draws;
         LOG("[gfx] last 300 frames: %.1f draws/frame with alpha-to-coverage on", g_alpha_to_mask_draws / 300.0);
         g_alpha_to_mask_draws = 0;
         LOG("[gfx] last 300 frames: surface copies %.1f/frame on the GPU, %.1f on the CPU (%.2f MiB/frame); linear write-backs %.1f/frame "
-            "(%.2f MiB/frame); occlusion queries %.1f/frame, conditional renders %.1f/frame",
+            "(%.2f MiB/frame, %.2f/frame waited for: probes); occlusion queries %.1f/frame, conditional renders %.1f/frame",
             g_copy_gpu.exchange(0) / 300.0, g_copy_cpu.exchange(0) / 300.0, g_copy_cpu_bytes.exchange(0) / 300.0 / 1048576.0,
-            g_write_backs.exchange(0) / 300.0, g_write_back_bytes.exchange(0) / 300.0 / 1048576.0, queries / 300.0, cond / 300.0);
+            g_write_backs.exchange(0) / 300.0, g_write_back_bytes.exchange(0) / 300.0 / 1048576.0, g_write_backs_sync.exchange(0) / 300.0, queries / 300.0,
+            cond / 300.0);
         LOG("[gfx] last 300 frames: %.1f clears/frame folded into the next pass, %.1f encoded on their own",
             g_clears_folded.exchange(0) / 300.0, g_clears_flushed.exchange(0) / 300.0);
         LOG("[gfx] frame %llu, %llu draws so far, GPU %.1f ms/frame, render thread CPU %.2f ms/frame", (unsigned long long)R.frame,

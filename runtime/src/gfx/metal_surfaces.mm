@@ -2009,13 +2009,15 @@ void drain_write_backs(bool all) {
     }
     g_pending_write_backs.erase(g_pending_write_backs.begin(), g_pending_write_backs.begin() + done);
 }
-std::atomic<uint64_t> g_copy_cpu{0}, g_copy_cpu_bytes{0}, g_copy_gpu{0}, g_write_backs{0}, g_write_back_bytes{0};
+std::atomic<uint64_t> g_copy_cpu{0}, g_copy_cpu_bytes{0}, g_copy_gpu{0}, g_write_backs{0}, g_write_back_bytes{0}, g_write_backs_sync{0};
 void write_back_linear_targets() {
     static const bool sync = getenv("WWHD_SYNC_WRITE_BACK") && atoi(getenv("WWHD_SYNC_WRITE_BACK")) != 0;
     const uint64_t t0 = rprof::now_ns();
     uint64_t readNs = 0, bytesDone = 0;
     uint32_t count = 0;
     drain_write_backs(false);
+    struct Probe { id<MTLBuffer> buf; uint32_t addr, w, h, bytes, pitch; };
+    std::vector<Probe> probes;  // read together after one wait
     // linear aligned only: a tile mode of 0 can also be GX2's "default" (a tiled copy destination)
     for (Surface* s : R.linearTargets) {
         if (!s->gpuWritten || s->writtenBackSeq == s->writeSeq || !s->tex) continue;
@@ -2028,6 +2030,15 @@ void write_back_linear_targets() {
             static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seen;
             if (seen.insert({s->width, s->height, s->format}).second)
                 LOG("[gfx] linear render target written back: %ux%u format %X at %08X", s->width, s->height, s->format, addr);
+        }
+        // tiny targets are readback probes: the game draws a pixel (a colour sampled on the GPU), waits for
+        // DrawDone and reads it. A frame late, its water colour table (BotW) took each value one slot off and
+        // kept a white default in the first, on the boots where the copy lagged (white water). One wait for
+        // all of a DrawDone's probes, only on the frames that draw them; the big targets stay asynchronous.
+        const bool probe = (uint64_t)s->width * s->height <= 64;
+        if (probe && !sync) {
+            probes.push_back({encode_texel_read(s, s->width, s->height), addr, s->width, s->height, bytes, pitch});
+            continue;
         }
         if (!sync) {
             id<MTLBuffer> buf = encode_texel_read(s, s->width, s->height);
@@ -2044,6 +2055,19 @@ void write_back_linear_targets() {
         readNs += rprof::now_ns() - r0;
         bytesDone += texels.size();
         count++;
+    }
+    if (!probes.empty()) {
+        const uint64_t r0 = rprof::now_ns();
+        wait_idle();
+        for (const Probe& p : probes) {
+            const uint8_t* raw = (const uint8_t*)p.buf.contents;
+            for (uint32_t y = 0; y < p.h; y++)
+                memcpy(mem::ptr(p.addr + y * p.pitch * p.bytes), raw + (size_t)y * p.w * p.bytes, (size_t)p.w * p.bytes);
+            bytesDone += (uint64_t)p.w * p.h * p.bytes;
+            count++;
+        }
+        g_write_backs_sync++;  // waits, not probes
+        readNs += rprof::now_ns() - r0;
     }
     rprof::add_write_back(std::max<uint64_t>(1, rprof::now_ns() - t0 - readNs), count, bytesDone, readNs);
 }

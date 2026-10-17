@@ -102,7 +102,11 @@ struct sigaction g_old_segv, g_old_bus;
 uint32_t g_trap = 0, g_trap_size = 0x300;
 std::atomic<int> g_trap_logs{0};
 void trap_log(uintptr_t a, void* uc) {
-    if (!g_trap || a < (uintptr_t)g_base + g_trap || a >= (uintptr_t)g_base + g_trap + g_trap_size) return;
+    // anywhere on the range's host pages: only the first write after arming faults, and a copy that starts
+    // lower on the page faults there and then writes the range unseen
+    const uintptr_t ps = (uintptr_t)1 << g_shift, lo = ((uintptr_t)g_base + g_trap) & ~(ps - 1),
+                    hi = ((uintptr_t)g_base + g_trap + g_trap_size + ps - 1) & ~(ps - 1);
+    if (!g_trap || a < lo || a >= hi) return;
     if (g_trap_logs.fetch_add(1) >= 400) return;
     uintptr_t pc = 0;
 #if defined(__APPLE__) && defined(__aarch64__)
