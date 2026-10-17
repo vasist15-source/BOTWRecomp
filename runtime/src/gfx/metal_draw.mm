@@ -985,6 +985,7 @@ void set_ao_mode(int m) { g_ao_mode = m % 3; LOG("[gfx] ambient occlusion mode %
 // its first render, black shadows for the session; the Picto Box colour-grading volume). Those draws
 // wait for their compile without the budget, like the Vulkan renderer does for every draw.
 static bool g_building_ahead = false;
+static bool g_log_uniforms = false;  // [arraydraw]: this draw's uniforms are logged too
 static bool g_draw_must_run = false;  // the current draw writes a target that isn't redrawn every frame
 // render target address -> its draw history. Every draw in a target's first frame waits (upstream
 // 26c9114: a later draw of that frame may be the only one of its result).
@@ -1668,17 +1669,18 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             // for a 640x360 grid; the pass draws 960x540, so tile the 4x4 noise per output pixel instead
             if (vertex && ao_mode() == 2 && sh->kind == gfx::ProgramKind::OcclusionVertex)
                 ((float*)dst)[3] *= 1.5f;
-            // F12 capture: the uniforms of vertex shaders that fetch textures (grass, terrain)
-            if (capturing() && vertex && dec->textureUnitListCount > 0) {
+            // F12 capture: the uniforms of vertex shaders that fetch textures (grass, terrain); [arraydraw] draws
+            if ((capturing() && vertex && dec->textureUnitListCount > 0) || g_log_uniforms) {
                 const size_t n = std::min<size_t>((buf.size() - dec->uniform.loc_remapped) / 16, 32);
-                std::string l = "[draw]   VS remapped:";
+                std::string l = vertex ? "[draw]   VS remapped:" : "[draw]   PS remapped:";
                 char t[96];
                 for (size_t i = 0; i < n; i++) {
                     const float* v = (const float*)(dst + i * 16);
                     snprintf(t, sizeof t, " [%zu]%.4g,%.4g,%.4g,%.4g", i, v[0], v[1], v[2], v[3]);
                     l += t;
                 }
-                DLOG("%s", l.c_str());
+                if (g_log_uniforms) LOG("%s", l.c_str());
+                else DLOG("%s", l.c_str());
             }
         }
         if (dec->uniform.loc_uniformRegister >= 0)
@@ -2610,6 +2612,7 @@ void report_skips() {
 
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
           uint32_t instances) {
+    g_log_uniforms = false;
     static bool cacheLoaded = (cache_load(), true);
     (void)cacheLoaded;
     R.drawCount++;
@@ -2736,6 +2739,14 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                      gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YOFFSET]) - gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YSCALE]),
                      2 * gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XSCALE]), 2 * gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YSCALE]));
             l += t;
+            {  // the first four vertices (two floats each) and the target/shader masks
+                const uint32_t vb = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START];
+                const uint32_t stride = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + 2] >> 11) & 0xFFFF;
+                snprintf(t, sizeof t, " smask %08X v %.3f,%.3f %.3f,%.3f %.3f,%.3f %.3f,%.3f", regs[mmCB_SHADER_MASK], bitsf_(ld32(vb)),
+                         bitsf_(ld32(vb + 4)), bitsf_(ld32(vb + stride)), bitsf_(ld32(vb + stride + 4)), bitsf_(ld32(vb + 2 * stride)),
+                         bitsf_(ld32(vb + 2 * stride + 4)), bitsf_(ld32(vb + 3 * stride)), bitsf_(ld32(vb + 3 * stride + 4)));
+                l += t;
+            }
             for (int k = 0; k < 8; k++)
                 if (colors[k]) {
                     snprintf(t, sizeof t, " | CB%d %08X %ux%u x%u f%X slice %u mip %u", k, colors[k]->addr, colors[k]->width, colors[k]->height,
@@ -2757,6 +2768,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                 }
             }
             LOG("%s", l.c_str());
+            g_log_uniforms = true;
             break;
         }
     // the game's target size (viewport registers refer to it)
