@@ -653,6 +653,11 @@ void swap() {
                 char b[32];
                 for (int i = 0; i < 56; i++) { snprintf(b, sizeof b, " [%d]%g", i, v[i]); line += b; }
                 LOG("[dbgvals]%s", line.c_str());
+                if (v[1023] == 12345.0f) {  // a second block written by a vertex shader: floats 64..1022
+                    line.clear();
+                    for (int i = 64; i < 1023; i++) { snprintf(b, sizeof b, " [%d]%g", i, v[i]); line += b; }
+                    LOG("[dbgvals2]%s", line.c_str());
+                }
             }
         }
     }

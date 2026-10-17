@@ -477,6 +477,24 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
                 snapped = patched;
             }
     }
+    if (const char* dir = getenv("WWHD_MSL_PATCH_DIR")) {
+        // debug: <dir>/<first 12 hex digits of the shader hash>.metal replaces that shader (vertex or pixel; the
+        // capture's own translation differs in the last digits); the live source is kept as <prefix>.live
+        size_t at = snapped.find("// shader ");
+        if (at != std::string::npos && snapped.size() >= at + 22) {
+            const std::string prefix = snapped.substr(at + 10, 12), base = std::string(dir) + "/" + prefix;
+            if (FILE* f = fopen((base + ".metal").c_str(), "rb")) {
+                std::string patched;
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, f)) > 0) patched.append(buf, n);
+                fclose(f);
+                if (FILE* lf = fopen((base + ".live").c_str(), "w")) { fputs(snapped.c_str(), lf); fclose(lf); }
+                LOG("[gfx] shader %016llx: compiled from %s.metal", (unsigned long long)key, base.c_str());
+                snapped = patched;
+            }
+        }
+    }
     const char* src = snapped.c_str();
     NSString* source = [NSString stringWithUTF8String:src];
     // test aid: WWHD_MSL_NONCE=<text> changes every source so the system Metal cache misses (fresh install).
@@ -3006,11 +3024,12 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             }
         }
         // debug (WWHD_MSL_PATCH): a patched shader can write values to buffer 30; logged at each swap
-        static const bool debugValues = getenv("WWHD_MSL_PATCH") != nullptr;
-        if (debugValues) {
+        static const bool debugValues = getenv("WWHD_MSL_PATCH") != nullptr || getenv("WWHD_MSL_PATCH_DIR") != nullptr;
+        if (debugValues) {  // pixel shaders: buffer 30; vertex shaders: buffer 20 (30 and down are vertex streams)
             extern id<MTLBuffer> g_debug_values;
             if (!g_debug_values) g_debug_values = [R.device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
             bc_buffer(enc, false, g_debug_values, 0, 30);
+            bc_buffer(enc, true, g_debug_values, 0, 20);
         }
         R.binding = true;
         bind_stage(enc, regs, vs, true, colors);
