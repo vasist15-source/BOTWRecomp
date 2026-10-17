@@ -20,7 +20,12 @@
 #include <cstdio>
 #include <thread>
 
-#include "runtime.h"
+namespace wwatch {
+namespace {
+bool (*g_guest_regs)(uint32_t* lr, uint32_t* r) = nullptr;  // set_guest_regs_hook
+}
+void set_guest_regs_hook(bool (*f)(uint32_t* lr, uint32_t* r)) { g_guest_regs = f; }
+}  // namespace wwatch
 
 namespace wwatch {
 namespace {
@@ -107,11 +112,11 @@ void trap_log(uintptr_t a, void* uc) {
     const char* fn = pc && dladdr((void*)pc, &di) && di.dli_sname ? di.dli_sname : "?";
     char tn[32] = {};
     host::get_thread_name(tn, sizeof tn);
-    Cpu* c = threads::current();
-    if (c)
+    uint32_t lr = 0, r[6] = {};
+    if (g_guest_regs && g_guest_regs(&lr, r))
         fprintf(stderr, "[wtrap] %08X by %s img+%lX thread '%s' lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r30=%08X r31=%08X\n",
-                (uint32_t)(a - (uintptr_t)g_base), fn, (unsigned long)(pc - (uintptr_t)di.dli_fbase), tn, c->lr, c->r[3], c->r[4],
-                c->r[5], c->r[6], c->r[30], c->r[31]);
+                (uint32_t)(a - (uintptr_t)g_base), fn, (unsigned long)(pc - (uintptr_t)di.dli_fbase), tn, lr, r[0], r[1], r[2], r[3],
+                r[4], r[5]);
     else
         fprintf(stderr, "[wtrap] %08X by %s thread '%s' (host)\n", (uint32_t)(a - (uintptr_t)g_base), fn, tn);
 }

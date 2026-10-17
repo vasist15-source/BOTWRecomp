@@ -1,3 +1,4 @@
+#include "write_watch.h"
 #include "game_clock.h"
 #include "mods/fast_forward.h"
 // Guest threads run on host pthreads. OS synchronization objects live in guest
@@ -104,6 +105,7 @@ struct HostThread {
     uint32_t held_core = 0;   // core actually held (affinity may change while holding)
     int irq_off = 0;          // OSDisableInterrupts: no preemption
     std::chrono::steady_clock::time_point ready_since;  // when it started waiting for its core
+    std::condition_variable core_cv;  // waiting for its core (with CoreSched::m): woken only when it is next
     bool service = false;
     // statistics
     std::chrono::steady_clock::time_point acquired;
@@ -154,7 +156,6 @@ static const bool g_sched_on = getenv("WWHD_NO_SCHED") == nullptr;
 
 struct CoreSched {
     std::mutex m;
-    std::condition_variable cv;
     HostThread* owner = nullptr;
     std::deque<HostThread*> ready;  // FIFO among equal priorities
 };
@@ -170,6 +171,16 @@ static HostThread* best_ready(CoreSched& k) {  // k.m held
 
 static void sched_tick_thread();
 static void mem_watch_thread();
+
+// write_watch.cpp's debug trap (WWHD_WRITE_TRAP): the registers of the guest thread that faulted
+static bool wwatch_guest_regs(uint32_t* lr, uint32_t* r) {
+    Cpu* c = threads::current();
+    if (!c) return false;
+    *lr = c->lr;
+    const int regs[6] = {3, 4, 5, 6, 30, 31};
+    for (int i = 0; i < 6; i++) r[i] = c->r[regs[i]];
+    return true;
+}
 
 static void core_acquire(HostThread* t) {
     if (!g_sched_on || t->holds_core) return;
@@ -194,9 +205,9 @@ static void core_acquire(HostThread* t) {
 #ifdef __APPLE__
         // relative timeout: no wall/steady clock reads per wait (wait_for converts through both)
         const timespec rel{2, 0};
-        pthread_cond_timedwait_relative_np(k.cv.native_handle(), lk.mutex()->native_handle(), &rel);
+        pthread_cond_timedwait_relative_np(t->core_cv.native_handle(), lk.mutex()->native_handle(), &rel);
 #else
-        k.cv.wait_for(lk, std::chrono::seconds(2));
+        t->core_cv.wait_for(lk, std::chrono::seconds(2));
 #endif
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(10)) {
             warned = true;
@@ -230,8 +241,11 @@ static void core_release(HostThread* t) {
         t->holds_core = false;
         t->held_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t->acquired).count();
         g_core_preempt[t->held_core] = 0;
+        // wake only the thread that runs next (under the lock: it is still waiting in core_acquire then):
+        // waking every waiter cost the low-priority threads of a busy core a fifth of a host core each,
+        // only to find they were not next. One that arrives first takes the core; the woken one waits again.
+        if (HostThread* next = best_ready(k)) next->core_cv.notify_one();
     }
-    k.cv.notify_all();
 }
 
 // Like Cafe OS (and Cemu): strict priority, and equal-priority threads round-robin every time slice
@@ -707,6 +721,7 @@ static HostThread* create_thread(uint32_t t, uint32_t entry, uint32_t argc, uint
 static void thread_dump_loop(int secs);
 namespace threads {
 void init(const LoadedModule& m) {
+    wwatch::set_guest_regs_hook(wwatch_guest_regs);
     g_sda_base = m.sda_base;
     g_sda2_base = m.sda2_base;
     // debug: WWHD_THREAD_DUMP=s logs every guest thread's state (running/parked, wait object, lr) every s seconds

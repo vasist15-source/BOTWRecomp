@@ -72,6 +72,9 @@ struct HostWrite {
     ~HostWrite() { host_write_end(addr, size); }
 };
 
+// debug (WWHD_WRITE_TRAP): how the trap reads the faulting guest thread's lr and r3..r6, r30, r31 (threads.cpp)
+void set_guest_regs_hook(bool (*f)(uint32_t* lr, uint32_t* r));
+
 // statistics for the renderers' periodic report: write faults and pages protected since the last call
 void take_stats(uint64_t& faults, uint64_t& protectedPages);
 // hints since the last call: calls and bytes covered
