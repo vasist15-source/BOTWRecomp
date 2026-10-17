@@ -1668,6 +1668,18 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             // for a 640x360 grid; the pass draws 960x540, so tile the 4x4 noise per output pixel instead
             if (vertex && ao_mode() == 2 && sh->kind == gfx::ProgramKind::OcclusionVertex)
                 ((float*)dst)[3] *= 1.5f;
+            // F12 capture: the uniforms of vertex shaders that fetch textures (grass, terrain)
+            if (capturing() && vertex && dec->textureUnitListCount > 0) {
+                const size_t n = std::min<size_t>((buf.size() - dec->uniform.loc_remapped) / 16, 32);
+                std::string l = "[draw]   VS remapped:";
+                char t[96];
+                for (size_t i = 0; i < n; i++) {
+                    const float* v = (const float*)(dst + i * 16);
+                    snprintf(t, sizeof t, " [%zu]%.4g,%.4g,%.4g,%.4g", i, v[0], v[1], v[2], v[3]);
+                    l += t;
+                }
+                DLOG("%s", l.c_str());
+            }
         }
         if (dec->uniform.loc_uniformRegister >= 0)
             memcpy(at(dec->uniform.loc_uniformRegister), &regs[aluBase], dec->uniform.count_uniformRegister * 16);
