@@ -2720,9 +2720,11 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (arrayLog)
         for (int i = 0; i < 8; i++) {
             if (!colors[i] || colors[i]->slices <= 1) continue;
-            static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seen;
+            static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> seen;
             static int logged = 0;
-            if (logged >= 400 || !seen.insert({regs[mmSQ_PGM_START_PS] << 8, colors[i]->addr, colorMips[i]}).second) break;
+            TexView* src0 = ps->dec->textureUnitListCount ? g_unit_tex[1][ps->dec->textureUnitList[0]] : nullptr;
+            const uint32_t srcKey = src0 ? src0->tex->addr ^ (src0->tex->width << 20) ^ src0->tex->format : 0;
+            if (logged >= 600 || !seen.insert({regs[mmSQ_PGM_START_PS] << 8, colors[i]->addr, colorMips[i], srcKey}).second) break;
             logged++;
             std::string l;
             char t[200];
@@ -2730,6 +2732,10 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                      regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, prim, count, regs[REGADDR::CB_COLOR_CONTROL],
                      regs[REGADDR::CB_BLEND0_CONTROL], regs[REGADDR::CB_TARGET_MASK]);
             l = t;
+            snprintf(t, sizeof t, " vp %.2f,%.2f %.2fx%.2f", gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XOFFSET]) - gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XSCALE]),
+                     gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YOFFSET]) - gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YSCALE]),
+                     2 * gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XSCALE]), 2 * gx2::bitsf(regs[REGADDR::PA_CL_VPORT_YSCALE]));
+            l += t;
             for (int k = 0; k < 8; k++)
                 if (colors[k]) {
                     snprintf(t, sizeof t, " | CB%d %08X %ux%u x%u f%X slice %u mip %u", k, colors[k]->addr, colors[k]->width, colors[k]->height,
