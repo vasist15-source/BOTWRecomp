@@ -335,10 +335,8 @@ extern "C" void hook_025071FC(Cpu* c) {
 }
 
 // daPy_Execute: Link (left click mapping, traces)
-namespace mods { void link_executed(uint32_t link); }  // turbo.cpp: control traces
 extern "C" void hook_0240EBB0(Cpu* c) {
     uint32_t l = c->r[3];
     g_link.store(l, std::memory_order_relaxed);
     f_0240EBB0_orig(c);
-    link_executed(l);
 }

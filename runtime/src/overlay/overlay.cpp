@@ -44,7 +44,6 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #endif
 #include "../input.h"
 #include "../input_map.h"
-#include "../mods/climb.h"
 #include "../mods/mods.h"
 #include "../mods/manager.h"
 #include "../mods/packages.h"
