@@ -69,6 +69,32 @@ const Found& found() {
         std::error_code ec;
         const fs::path at = pack_dir(fs::path(config::game_dir));
         if (at.empty()) {
+            // BotW: content/Pack/Bootup_<region><language>.pack (USen, EUde, JPja, CNzh, KRko, TWzh ...)
+            const fs::path botw = fs::path(config::game_dir) / "content" / "Pack";
+            bool have[kLanguages] = {};
+            std::vector<std::string> regions;
+            for (auto& e : fs::directory_iterator(botw, ec)) {
+                const std::string n = e.path().filename().string();
+                if (n.size() != 16 || n.compare(0, 7, "Bootup_") || lower(n.substr(11)) != ".pack") continue;
+                const std::string r = n.substr(7, 2), l = lower(n.substr(9, 2));
+                static const std::pair<const char*, int> kCodes[] = {{"ja", 0}, {"en", 1}, {"fr", 2}, {"de", 3}, {"it", 4}, {"es", 5},
+                                                                     {"zh", 6}, {"ko", 7}, {"nl", 8}, {"pt", 9}, {"ru", 10}};
+                for (auto [code, id] : kCodes)
+                    if (l == code) have[r == "TW" && id == 6 ? 11 : id] = true;
+                const int region = region_from_code(r);
+                if (region != kNoRegion && std::find(regions.begin(), regions.end(), region_name(region)) == regions.end())
+                    regions.push_back(region_name(region));
+            }
+            for (int i = 0; i < kLanguages; i++)
+                if (have[i]) out.languages.push_back(i);
+            std::sort(regions.begin(), regions.end());
+            for (auto& r : regions) out.region += (out.region.empty() ? "" : " / ") + r;
+            if (!out.languages.empty()) {
+                std::string list;
+                for (int i : out.languages) list += std::string(list.empty() ? "" : ", ") + kNames[i];
+                LOG("[config] game languages (%s, content/Pack): %s", out.region.c_str(), list.c_str());
+                return out;
+            }
             LOG("[config] no content/Common/Pack in %s: the game's languages are unknown, all are offered",
                 config::game_dir.c_str());
             return out;

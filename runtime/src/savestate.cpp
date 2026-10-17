@@ -269,11 +269,8 @@ std::string stage_name() {
         uint32_t a = (uint32_t)strtoul(e, nullptr, 16);
         return std::string((const char*)mem::ptr(a), strnlen((const char*)mem::ptr(a), 8));
     }
-    const char* p = (const char*)mem::ptr(kStageName);
-    size_t n = strnlen(p, 8);
-    for (size_t i = 0; i < n; i++)
-        if (p[i] < 0x20 || p[i] > 0x7E) return "";
-    return std::string(p, n);
+    (void)kStageName;  // Wind Waker's stage name: BotW keeps other data there (slot labels showed stray bytes)
+    return "";
 }
 
 // ---------------------------------------------------------------- memory
@@ -1237,7 +1234,9 @@ void request_save(int slot, std::function<void(bool ok, const std::string& why)>
 
 void request_save(int slot) { request_save(slot, nullptr); }
 
-bool in_gameplay() { return quitprompt::gameplay_stage(stage_name()); }
+// BotW has no stage name to look at (the Wind Waker check read other data and never said "in game"):
+// a game is taken to be in progress once the title screen had time to pass, so Quit asks first
+bool in_gameplay() { return render::frame_count() > 30 * 40; }
 
 void request_load_portable_file(const std::string& path) {
     auto s = std::make_shared<pstate::State>();
