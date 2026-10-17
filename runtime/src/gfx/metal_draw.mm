@@ -450,6 +450,20 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     }
     opt.languageVersion = MTLLanguageVersion3_0;
     std::string snapped = snap_texcoords(rawSrc);
+    {  // WWHD_MSL_PATCH also here: shaders replayed from the shader cache are compiled without a translation
+        static const char* patchFile = getenv("WWHD_MSL_PATCH");
+        static const char* patchMatch = getenv("WWHD_MSL_PATCH_MATCH");
+        if (patchFile && patchMatch && snapped.find(patchMatch) != std::string::npos)
+            if (FILE* f = fopen(patchFile, "rb")) {
+                std::string patched;
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, f)) > 0) patched.append(buf, n);
+                fclose(f);
+                if (patched != snapped) LOG("[gfx] shader %016llx: compiled from %s", (unsigned long long)key, patchFile);
+                snapped = patched;
+            }
+    }
     const char* src = snapped.c_str();
     NSString* source = [NSString stringWithUTF8String:src];
     // test aid: WWHD_MSL_NONCE=<text> changes every source so the system Metal cache misses (fresh install).
