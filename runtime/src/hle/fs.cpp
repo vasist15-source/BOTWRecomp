@@ -230,6 +230,13 @@ HLE(coreinit, FSReadFile) {
     uint32_t dst = arg(c, 2), size = arg(c, 3), count = arg(c, 4);
     FILE* f = file(arg(c, 5));
     if (!f || size == 0) { ret(c, 0); return; }
+    // debug (WWHD_WRITE_TRAP, write_watch.cpp): reads into the trapped range
+    static const uint32_t trap = getenv("WWHD_WRITE_TRAP") ? (uint32_t)strtoul(getenv("WWHD_WRITE_TRAP"), nullptr, 16) : 0;
+    if (trap && dst <= trap + 0x300 && trap < dst + size * count) {
+        std::lock_guard<std::mutex> lk(g_fs_mutex);
+        auto it = g_files.find(arg(c, 5));
+        LOG("[wtrap] FSReadFile %08X+%X from %s at %ld", dst, size * count, it != g_files.end() ? it->second.path.c_str() : "?", ftell(f));
+    }
     size_t n;
     {
         BlockingScope b;  // the calling thread waits for the disc; others on its core run

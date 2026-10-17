@@ -1723,7 +1723,24 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         uint32_t size = std::min<uint32_t>(regs[blockBase + i * 7 + 1] + 1, 0x10000);
         uint32_t off = 0;
         id<MTLBuffer> gb = addr ? guest_buffer(addr, &off) : nil;
+        DLOG("[draw]   %s ub%d %08X size %X", vertex ? "VS" : "PS", i, addr, size);
         if (!gb) continue;
+        // capture: the contents of the blocks of one program (WWHD_UB_DUMP=<program address>, e.g. 3C599B00)
+        static const uint32_t dumpProg = getenv("WWHD_UB_DUMP") ? (uint32_t)strtoul(getenv("WWHD_UB_DUMP"), nullptr, 16) : 0;
+        if (dumpProg && log_this_frame() &&
+            (regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8) == dumpProg) {
+            const uint32_t* w = (const uint32_t*)mem::ptr(addr);
+            std::string line;
+            char b[48];
+            for (uint32_t k = 0; k < std::min<uint32_t>(size / 4, 1024); k++) {
+                uint32_t v = w[k];
+                float f;
+                memcpy(&f, &v, 4);
+                snprintf(b, sizeof b, "%s%g", k % 4 ? "," : (k ? " | " : ""), f);
+                line += b;
+            }
+            DLOG("[draw]     ub%d data: %s", i, line.c_str());
+        }
         if (g_snapshot) {
             Upload u = upload(mem::ptr(addr), size);
             bc_buffer(enc, vertex, u.buf, u.offset, binding);
@@ -2951,6 +2968,12 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                 id<MTLBuffer> gb = guest_buffer(addr, &off);
                 if (!g_so.buf) g_so.buf = gb, g_so.bufBase = addr - off;
                 g_so.base[b] = (sint32)(addr - g_so.bufBase);
+                // debug (WWHD_WRITE_TRAP): stream-out into the trapped range (GPU writes don't fault)
+                static const uint32_t trap = getenv("WWHD_WRITE_TRAP") ? (uint32_t)strtoul(getenv("WWHD_WRITE_TRAP"), nullptr, 16) : 0;
+                const uint32_t soSize = regs[mmVGT_STRMOUT_BUFFER_SIZE_0 + b * 4] << 2;
+                if (trap && addr <= trap + 0x300 && trap < addr + std::max<uint32_t>(soSize, 0x10000))
+                    LOG("[wtrap] stream-out VS %08X buffer %d %08X size %X count %u frame %llu", regs[mmSQ_PGM_START_VS] << 8, b, addr, soSize,
+                        count, (unsigned long long)R.frame);
             }
         }
         // debug (WWHD_MSL_PATCH): a patched shader can write values to buffer 30; logged at each swap

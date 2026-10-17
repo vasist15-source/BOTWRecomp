@@ -12,9 +12,15 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/ucontext.h>
 #endif
+#include <cstdio>
+#include <thread>
+
+#include "runtime.h"
 
 namespace wwatch {
 namespace {
@@ -86,7 +92,31 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* e) {
 bool install_handler() { return AddVectoredExceptionHandler(1, veh) != nullptr; }
 #else
 struct sigaction g_old_segv, g_old_bus;
+// debug: WWHD_WRITE_TRAP=addr[+size] (guest, size default 0x300) logs each guest store into the range
+// with the recompiled function doing it and the guest registers; the page is protected again every 2 ms
+uint32_t g_trap = 0, g_trap_size = 0x300;
+std::atomic<int> g_trap_logs{0};
+void trap_log(uintptr_t a, void* uc) {
+    if (!g_trap || a < (uintptr_t)g_base + g_trap || a >= (uintptr_t)g_base + g_trap + g_trap_size) return;
+    if (g_trap_logs.fetch_add(1) >= 400) return;
+    uintptr_t pc = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    pc = (uintptr_t)((ucontext_t*)uc)->uc_mcontext->__ss.__pc;
+#endif
+    Dl_info di{};
+    const char* fn = pc && dladdr((void*)pc, &di) && di.dli_sname ? di.dli_sname : "?";
+    char tn[32] = {};
+    host::get_thread_name(tn, sizeof tn);
+    Cpu* c = threads::current();
+    if (c)
+        fprintf(stderr, "[wtrap] %08X by %s img+%lX thread '%s' lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r30=%08X r31=%08X\n",
+                (uint32_t)(a - (uintptr_t)g_base), fn, (unsigned long)(pc - (uintptr_t)di.dli_fbase), tn, c->lr, c->r[3], c->r[4],
+                c->r[5], c->r[6], c->r[30], c->r[31]);
+    else
+        fprintf(stderr, "[wtrap] %08X by %s thread '%s' (host)\n", (uint32_t)(a - (uintptr_t)g_base), fn, tn);
+}
 void handler(int sig, siginfo_t* si, void* uc) {
+    trap_log((uintptr_t)si->si_addr, uc);
     // macOS reports a write to a read-only page as SIGBUS, Linux/Android as SIGSEGV
     if (on_write_fault((uintptr_t)si->si_addr)) return;
     // not ours: the crash handler (main.cpp) or whatever was installed before
@@ -137,6 +167,20 @@ bool init(uint8_t* base, uint64_t size) {
         g_flags = (std::atomic<uint8_t>*)calloc(g_pages, sizeof(std::atomic<uint8_t>));
         if (!g_stamp || !g_flags || !install_handler()) return;
         g_active.store(true, std::memory_order_release);
+#ifndef _WIN32
+        if (const char* e = getenv("WWHD_WRITE_TRAP")) {
+            char* p;
+            g_trap = (uint32_t)strtoul(e, &p, 16);
+            if (*p == '+') g_trap_size = (uint32_t)strtoul(p + 1, nullptr, 16);
+            fprintf(stderr, "[wtrap] watching %08X+%X\n", g_trap, g_trap_size);
+            std::thread([] {
+                for (;;) {
+                    arm(g_trap, g_trap_size);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }).detach();
+        }
+#endif
     });
     return active();
 }
@@ -189,6 +233,13 @@ bool written_since(uint32_t addr, uint32_t size, uint64_t stamp) {
 }
 
 void host_write_begin(uint32_t addr, uint32_t size) {
+#ifndef _WIN32
+    if (g_trap && addr <= g_trap + g_trap_size && g_trap < addr + size) {
+        char tn[32] = {};
+        host::get_thread_name(tn, sizeof tn);
+        fprintf(stderr, "[wtrap] host write %08X+%X thread '%s'\n", addr, size, tn);
+    }
+#endif
     uint64_t first, last;
     if (!page_range(addr, size, first, last)) return;
     std::lock_guard<std::mutex> lk(g_m);
