@@ -149,9 +149,9 @@ ImGuiKey imgui_key(int code) {
 }
 
 // ---------------------------------------------------------------- UI state (render thread)
-enum Tab { kSaves, kGraphics, kDisplay, kAudio, kMods, kControls, kAbout, kTabs };
-const char* const kTabNames[kTabs] = {"Saves", "Graphics", "Display", "Audio", "Mods", "Controls", "Language / About"};
-const char* const kTabIds[kTabs] = {"saves", "graphics", "display", "audio", "mods", "controls", "about"};
+enum Tab { kSaves, kGraphics, kDisplay, kAudio, kControls, kAbout, kTabs };  // no Mods: Wind Waker code mods and cheats
+const char* const kTabNames[kTabs] = {"Saves", "Graphics", "Display", "Audio", "Controls", "Language / About"};
+const char* const kTabIds[kTabs] = {"saves", "graphics", "display", "audio", "controls", "about"};
 
 struct Ui {
     bool init = false;
@@ -462,13 +462,8 @@ void tab_saves() {
     std::string msg = ss::last_message();
     if (!msg.empty()) note("%s", msg.c_str());
     heading("Save states");
-    const bool full = ss::full_states();
-    if (full)
-        note("Full save states: the whole running game (large, contain game data: never share them). Shift+F1..F5 save in "
-             "game, F2..F5 load (F1 opens this menu).");
-    else
-        note("A save state keeps your progress and where Link stands (a few KB, no game data). Loading enters that place "
-             "with that progress; enemies and cutscenes start fresh. Shift+F1..F5 save in game, F2..F5 load (F1 opens this menu).");
+    note("A save state is the whole running game (large, contains game data: never share it). Shift+F1..F5 save in "
+         "game, F2..F5 load (F1 opens this menu).");
     if (ImGui::BeginTable("slots", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed);
         ImGui::TableSetupColumn("Saved");
@@ -514,26 +509,7 @@ void tab_saves() {
         }
         ImGui::EndTable();
     }
-    // bug reports: the portable state and the save file, never a full state
-    static double copiedAt = -10;
-    if (ImGui::Button("Copy save for bug report")) {
-        std::string text = ss::bug_report_text();
-        hostui::post([text] { hostui::set_clipboard(text); });
-        copiedAt = ImGui::GetTime();
-    }
-    if (ImGui::GetTime() - copiedAt < 2.0) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Copied");
-    }
-    help("Copies the paths of your newest save state and of your save file (cking.sav): attach both files to the bug "
-         "report. Save a state at the place of the problem first.");
     note("States folder: %s", ss::states_dir().c_str());
-    bool fs;
-    if (check("Full save states (large, contain game data, don't share) - for debugging", full, &fs, !ss::full_states_forced()))
-        ss::set_full_states(fs);
-    help(ss::full_states_forced() ? "Set by WWHD_FULL_SAVE_STATES or a test variable for this start."
-                                  : "Saves the whole running game instead (about 300 MB per slot), exactly as it is. "
-                                    "These files contain game code and data: never attach them to a bug report.");
     heading("Screenshots");
     {
         // the Screenshot binding (Controls tab): its keys and controller input
@@ -546,10 +522,6 @@ void tab_saves() {
         if (keys.empty()) note("Screenshot is not bound: set a key in the Controls tab (Screenshot).");
         else note("%s in game saves the TV picture as a PNG at the internal resolution, without this menu (change the key in Controls).", keys.c_str());
     }
-    bool gp;
-    if (check("Also save the GamePad screen (while it is shown)", screenshot::gamepad_too(), &gp))
-        hostui::post([gp] { screenshot::set_gamepad_too(gp); });
-    help("A second file, ..._GamePad.png, while the GamePad picture is on screen (its window or the overlay in the TV picture).");
     if (hostui::can_open_folder()) {
         if (ImGui::Button("Open screenshots folder")) {
             std::string d = screenshot::dir();
@@ -647,22 +619,6 @@ void tab_graphics() {
     note("%s", gfxvk::drivers::message().c_str());
     help("Driver changes take effect on restart. An unfinished first 120-frame probe selects the system driver on the next start.");
 #endif
-    if (render::can_choose()) {
-        heading("Renderer (takes effect after a restart)");
-        for (render::Api a : {render::Api::Metal, render::Api::Vulkan}) {
-            std::string label = a == render::Api::Vulkan ? "Vulkan (MoltenVK)" : "Metal";
-            if (a == render::active()) label += "  - in use";
-            if (radio(label.c_str(), render::preferred() == a, render::compiled(a)))
-                post_changed([a] { render::set_preferred(a); });
-            ImGui::SameLine();
-        }
-        ImGui::NewLine();
-        if (!render::fallback_reason().empty()) note("This start: %s", render::fallback_reason().c_str());
-        if (render::restart_pending()) {
-            note("The game uses %s after a restart. Progress since your last save is lost.", render::api_name(render::preferred()));
-            if (ImGui::Button("Restart now")) hostui::post([] { render::restart(); });
-        }
-    }
     heading("Frame rate");
     {
         const int t = gx2::fps_target();
@@ -693,71 +649,13 @@ void tab_graphics() {
         if (radio(names[i], std::fabs(cur - s) < 0.01f)) post_changed([s] { hostui::set_res_scale(s); });
     }
 
-    heading("Aspect ratio");
-    int am = aspect::mode();
-    for (int i = aspect::kOriginal; i <= aspect::k32x9; i++) {
-        if (i) ImGui::SameLine();
-        if (radio(aspect::mode_name(i), am == i))
-            post_changed([i] { aspect::set_mode(i); hostui::set("aspectMode", std::to_string(i)); });
-    }
-
     heading("Effects");
     bool v;
-    float bloom = render::bloom_strength() * 100.0f;
-    ImGui::SetNextItemWidth(260);
-    if (ImGui::SliderFloat("Bloom strength", &bloom, 0.0f, 200.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp))
-        post_changed([bloom] { render::set_bloom_strength(bloom / 100.0f); });
-    ImGui::SameLine();
-    if (ImGui::Button("Off##bloom")) post_changed([] { render::set_bloom_strength(0.0f); });
-    ImGui::SameLine();
-    if (ImGui::Button("Default##bloom")) post_changed([] { render::set_bloom_strength(1.0f); });
-    help("Glow around bright areas. 100% matches the original game; 0% turns bloom off. Applies immediately.");
-    const bool ao_ok = render::feature_available(render::kFeatureAO);
-    static const char* const ao[] = {"AO: original", "AO: centre fix", "AO: centre + noise fix"};
-    for (int i = 0; i < 3; i++) {
-        if (i) ImGui::SameLine();
-        if (radio(ao[i], render::ao_mode() == i, ao_ok)) post_changed([i] { render::set_ao_mode(i); });
-    }
-    if (check("Full-size occlusion depth", render::ao_hires(), &v, render::feature_available(render::kFeatureAOHires)))
-        post_changed([v] { render::set_ao_hires(v); });
-    ImGui::SameLine(0, 30);
     if (check("16x anisotropic filtering", render::aniso(), &v, render::feature_available(render::kFeatureAniso)))
         post_changed([v] { render::set_aniso(v); });
     ImGui::SameLine(0, 30);
     if (check("Edge smoothing (FXAA)", render::fxaa(), &v, render::feature_available(render::kFeatureFXAA)))
         post_changed([v] { render::set_fxaa(v); });
-    heading("Presentation (Vulkan)");
-#ifdef WWHD_HAS_VULKAN
-    {
-        const bool vk = render::vulkan(), env = gfxvk::present_mode_from_env();
-        static const char* const names[] = {"Vsync (smooth)", "Low latency", "Off (may tear)"};
-        static const char* const tips[] = {"FIFO: every frame waits for the display's refresh; no tearing (default)",
-                                           "MAILBOX: the newest finished frame is shown at the next refresh; no tearing, less delay",
-                                           "IMMEDIATE: frames are shown at once; lowest delay, may tear"};
-        // the mode in use: the setting, or vsync when this driver does not offer it
-        const int in_use = gfxvk::present_mode_offered(gfxvk::present_mode()) ? gfxvk::present_mode() : gfxvk::kPresentFifo;
-        for (int i = 0; i < gfxvk::kPresentModes; i++) {
-            if (i) ImGui::SameLine();
-            const bool offered = gfxvk::present_mode_offered(i);
-            if (radio(names[i], in_use == i, vk && !env && offered)) post_changed([i] { gfxvk::set_present_mode(i); });
-            if (vk && !offered) help("not offered by this driver");
-            else help(tips[i]);
-        }
-        if (!vk) note("Used by the Vulkan renderer only (Metal always presents with vsync).");
-        else if (env) note("WWHD_VK_PRESENT_MODE=%s is set for this start and takes precedence.", getenv("WWHD_VK_PRESENT_MODE"));
-        else {
-            std::string missing;
-            for (int i = 1; i < gfxvk::kPresentModes; i++)
-                if (!gfxvk::present_mode_offered(i)) missing += std::string(missing.empty() ? "" : ", ") + names[i];
-            if (!missing.empty()) note("Not offered by this driver: %s.", missing.c_str());
-        }
-    }
-#else
-    ImGui::BeginDisabled();
-    radio("Vsync (smooth)", true);
-    ImGui::EndDisabled();
-    note("This build has no Vulkan renderer.");
-#endif
     heading("Overlay");
     if (check("Performance overlay (FPS, frame time)", perf_shown(), &v)) set_perf_shown(v);
     if (!render::vulkan()) {
@@ -806,57 +704,6 @@ void tab_display() {
     for (int i = 0; i < 3; i++) {
         if (i) ImGui::SameLine();
         if (radio(f[i], hostui::scale_filter() == i, fok)) hostui::post([i] { hostui::set_scale_filter(i); });
-    }
-    heading("GamePad screen");
-#ifdef __ANDROID__
-    if (check("Swap TV and GamePad displays", hostui::displays_swapped(), &v))
-        hostui::post([v] { hostui::set_displays_swapped(v); });
-#endif
-    // the modes of display_modes.h; a host offers those it can show (no "Separate window" without one,
-    // as on Android)
-    const int mode = hostui::drc_mode();
-    if (hostui::drc_modes() >= 4) {
-        static const char* const modes[] = {"Separate window", "Picture-in-picture", "Automatic picture-in-picture", "Off",
-                                            "GamePad only"};
-        bool first = true;
-        for (int i = 0; i < hostui::drc_modes() && i < 5; i++) {
-            if (!hostui::drc_mode_offered(i)) continue;
-            if (!first) ImGui::SameLine();
-            first = false;
-            if (radio(modes[i], mode == i)) hostui::post([i] { hostui::set_drc_mode(i); });
-        }
-        if (mode == 2) note("The overlay appears for a few seconds when the GamePad picture changes a lot (a menu opens).");
-        if (mode == 4) note("Only the GamePad picture. In the game, Minus switches to Off-TV Play (the game on the GamePad).");
-    }
-    if (check("Show GamePad screen", hostui::drc_shown(), &v,
-              hostui::drc_available() && !(hostui::drc_modes() >= 4 && (mode == 3 || mode == 4))))
-        hostui::post([v] { hostui::show_drc(v); });
-    if (hostui::drc_modes() >= 4 && (mode == 1 || mode == 2)) {
-        // the overlay's corner, size and opacity (also in the Display menu on macOS)
-        static const char* const corners[] = {"Top left", "Top right", "Bottom left", "Bottom right"};
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Picture-in-picture corner:");
-        for (int i = 0; i < 4; i++) {
-            ImGui::SameLine();
-            if (radio(corners[i], hostui::pip_corner() == i)) hostui::post([i] { hostui::set_pip_corner(i); });
-        }
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Size (of the TV picture's width):");
-        for (int s : {20, 25, 33, 40}) {
-            ImGui::SameLine();
-            char l[16];
-            snprintf(l, sizeof l, "%d%%##size", s);
-            if (radio(l, std::fabs(hostui::pip_size() * 100 - s) < 0.5f)) hostui::post([s] { hostui::set_pip_size(s / 100.0f); });
-        }
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Opacity:");
-        for (int o : {100, 85, 70, 50}) {
-            ImGui::SameLine();
-            char l[16];
-            snprintf(l, sizeof l, "%d%%##opacity", o);
-            if (radio(l, std::fabs(hostui::pip_opacity() * 100 - o) < 0.5f)) hostui::post([o] { hostui::set_pip_opacity(o / 100.0f); });
-        }
-        note("A click (or touch) on the GamePad picture touches the GamePad screen.");
     }
 }
 
@@ -1351,7 +1198,7 @@ void package_controls() {
     setup_confirmation_dialog(error);
 }
 
-void code_mod_dialog() {
+[[maybe_unused]] void code_mod_dialog() {
     auto status=mods::code::status();
     if(!status.requested)return;
     // Explicit test acceptance drives the same offer/rebuild path in an isolated,
@@ -1384,7 +1231,7 @@ void code_mod_dialog() {
     }
 }
 
-void tab_mods() {
+[[maybe_unused]] void tab_mods() {
     auto packages=mods::packages::list();
     if(std::any_of(packages.begin(),packages.end(),[](const auto& pack){return pack.pending_restart;})){
         note("Restart pending: saved pack choices will apply after restart. Active packs stay loaded until then.");
@@ -1652,10 +1499,9 @@ void gyro_window(bool& open) {
     motion::Settings g = motion::settings(), before = g;
     bool v;
     ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34);
-    note("On the Wii U you aim in first person (bow, hookshot, boomerang, telescope, Picto Box, grappling hook) by "
-         "moving the GamePad. This works with the GamePad and the Pro Controller choice alike. The game's own "
-         "Options > Gyro switch still decides whether it uses the motion, and it ignores the motion while the right "
-         "stick is pushed.");
+    note("On the Wii U you aim the bow and the Sheikah Slate's scope by moving the controller. This works with the "
+         "GamePad and the Pro Controller choice alike. The game's own Options > Motion Controls still decides "
+         "whether it uses the motion.");
     for (int i = 0; i < motion::kSourceCount; i++)
         if (radio(motion::source_label(i), g.source == i)) g.source = i;
     if (motion::env_override()) note("WWHD_GYRO=%s overrides the saved source.", getenv("WWHD_GYRO"));
@@ -1992,7 +1838,7 @@ void tab_about() {
              game_lang::name(U.language));
     }
     heading("About");
-    ImGui::Text("The Legend of Zelda: The Wind Waker HD - native port (%s host, %s renderer)", hostui::name(),
+    ImGui::Text("The Legend of Zelda: Breath of the Wild - native port (%s host, %s renderer)", hostui::name(),
                 render::api_name(render::active()));
 #ifdef __APPLE__
     note("Settings overlay: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in the app menu, or hold Select / "
@@ -2083,13 +1929,12 @@ void settings_window() {
         ImGui::SetNextWindowFocus();  // keyboard / controller navigation starts in the menu
         U.just_opened = false;
     }
-    if (ImGui::Begin("Wind Waker HD  -  Settings", &open, fl)) {
+    if (ImGui::Begin("Breath of the Wild  -  Settings", &open, fl)) {
         // L / R on a controller switch tabs
         if (U.cap_action < 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
             if (navigation_pressed(input_map::kPadLB)) U.select_tab = (U.tab + kTabs - 1) % kTabs;
             if (navigation_pressed(input_map::kPadRB)) U.select_tab = (U.tab + 1) % kTabs;
         }
-        if(!setup_run.rebuilding)code_mod_dialog();
         if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_FittingPolicyShrink)) {
             for (int i = 0; i < kTabs; i++) {
                 ImGuiTabItemFlags f = U.select_tab == i ? ImGuiTabItemFlags_SetSelected : 0;
@@ -2102,7 +1947,6 @@ void settings_window() {
                     case kGraphics: tab_graphics(); break;
                     case kDisplay: tab_display(); break;
                     case kAudio: tab_audio(); break;
-                    case kMods: tab_mods(); break;
                     case kControls: tab_controls(); break;
                     default: tab_about(); break;
                     }

@@ -147,7 +147,7 @@ static void save_options() {
     save_settings();
 }
 static void load_options() {
-    g_mode = find_name(kModeNames, kDrcModeCount, g_settings[@"drcMode"], kDrcWindow);
+    g_mode = kDrcOff;  // BotW: the GamePad picture is never shown (no menu offers it)
     if (!drc_mode_offered(g_mode)) g_mode = kDrcWindow;
     g_corner = find_name(kCornerNames, 4, g_settings[@"pipCorner"], 3);
     g_filter = find_name(kFilterNames, 3, g_settings[@"scaleFilter"], kSmooth);
@@ -1171,33 +1171,7 @@ void install_display_menu(NSMenu* bar) {
     add(m, @"    Sharp", @selector(setFilter:), kSharp).toolTip = @"Crisp pixel edges at any scale (sharp bilinear)";
     add(m, @"    Integer scale (pixel exact)", @selector(setFilter:), kInteger).toolTip =
         @"Whole-number scale with a border; falls back to Smooth when the picture is larger than the window";
-    [m addItem:[NSMenuItem separatorItem]];
-    header(m, @"GamePad screen");
-    add(m, @"    Separate window", @selector(setMode:), kDrcWindow);
-    add(m, @"    Picture-in-picture in the TV window", @selector(setMode:), kDrcPip).toolTip = @"Click the overlay to touch";
-    add(m, @"    Automatic picture-in-picture", @selector(setMode:), kDrcAuto).toolTip =
-        @"The overlay appears for a few seconds when the GamePad picture changes a lot (a menu opens); Cmd+G keeps it up";
-    add(m, @"    Off", @selector(setMode:), kDrcOff).toolTip = @"Not shown; the game keeps drawing it";
-    add(m, @"    GamePad only", @selector(setMode:), kDrcGamePad).toolTip =
-        @"Only the GamePad picture in the TV window (click it to touch); in the game, Minus switches to Off-TV Play";
-    add(m, @"Show GamePad screen", @selector(toggleDrc:), 0, @"g");
-    NSMenuItem* pipItem = [m addItemWithTitle:@"Picture-in-picture" action:nil keyEquivalent:@""];
-    NSMenu* pm = [[NSMenu alloc] initWithTitle:@"Picture-in-picture"];
-    header(pm, @"Corner");
-    add(pm, @"    Top left", @selector(setCorner:), 0);
-    add(pm, @"    Top right", @selector(setCorner:), 1);
-    add(pm, @"    Bottom left", @selector(setCorner:), 2);
-    add(pm, @"    Bottom right", @selector(setCorner:), 3);
-    header(pm, @"Size (of the TV picture's width)");
-    for (int s : {20, 25, 33, 40}) add(pm, [NSString stringWithFormat:@"    %d%%", s], @selector(setSize:), s);
-    header(pm, @"Opacity");
-    for (int o : {100, 85, 70, 50}) add(pm, [NSString stringWithFormat:@"    %d%%", o], @selector(setOpacity:), o);
-    pipItem.submenu = pm;
-    NSMenuItem* scrItem = [m addItemWithTitle:@"GamePad window on display" action:nil keyEquivalent:@""];
-    NSMenu* sm = [[NSMenu alloc] initWithTitle:@"GamePad window on display"];
-    sm.delegate = g_display_menu;
-    scrItem.submenu = sm;
-    add(m, @"GamePad window full screen", @selector(drcFullScreen:));
+    // no GamePad screen options: BotW draws nothing of its own there (its picture stays off)
     top.submenu = m;
 }
 

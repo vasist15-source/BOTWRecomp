@@ -1287,6 +1287,7 @@ void request_load(int slot) {
 bool full_states_forced() { return full_env() >= 0; }
 
 bool full_states() {
+    return true;  // BotW: the portable states read and call Wind Waker's game code
     if (full_env() >= 0) return full_env() == 1;
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_full_setting < 0) {
