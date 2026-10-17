@@ -10,8 +10,6 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 // resource binding and primitive submission. Binding conventions follow the
 // MSL the decompiler emits (as used by Cemu's Metal renderer).
 #include "Cafe/HW/Latte/Core/FetchShader.h"
-#include "gfx/area_sample.h"
-#include "gfx/shader_identity.h"
 #include "Cafe/HW/Latte/Core/LatteCachedFBO.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
@@ -304,7 +302,6 @@ static void compile_done(std::atomic<int>& st, int v) {
 
 struct Shader {
     uint64_t key = 0;
-    gfx::ProgramKind kind = gfx::ProgramKind::Other;
     LatteDecompilerShader* dec = nullptr;
     id<MTLFunction> fn = nil;                 // valid once state == CS_READY
     std::atomic<int> state{CS_PENDING};
@@ -831,7 +828,6 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
 
     auto* s = new Shader();
     s->noPosition = vertex && !((const LatteContextRegister*)regs)->IsRasterizationEnabled();
-    s->kind = gfx::program_kind(mem::ptr(addr), size, vertex);
     s->key = key;
     g_shaders[key] = s;
     // new shaders during play are translated on worker threads, so a burst (entering a new area: hundreds
@@ -867,7 +863,6 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
     double t0 = now_ms();
     LatteShader_UpdatePSInputs((uint32*)regs);
     LatteDecompilerOptions opt;
-    if (!vertex) opt.areaSampledTextures = gfx::area_sample::units_for_pixel_shader(mem::ptr(addr), size);
     // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: black letter in the Rito
     // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
     static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
@@ -889,15 +884,6 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
         for (int u = 0; u < s->dec->textureUnitListCount; u++) m |= 1u << s->dec->textureUnitList[u];
         std::lock_guard<std::mutex> lk(g_used_units_mu);
         g_used_units.emplace(base, m);  // the first translation's units (later ones don't replace them)
-    }
-    if (opt.areaSampledTextures) {
-        std::string src = s->dec->strBuf_shaderSource->c_str();
-        if (gfx::area_sample::rewrite(src, opt.areaSampledTextures, true) > 0) {
-            s->dec->strBuf_shaderSource->reset();
-            s->dec->strBuf_shaderSource->add(std::string_view(src));
-        } else {
-            LOG("[gfx] pixel shader %08X: area-sampled taps not applied", addr);
-        }
     }
     if (!async) cache_record_shader(regs, vertex);
     double t1 = now_ms();
@@ -1007,17 +993,9 @@ void compile_counters(size_t* shaders, size_t* pipelines, double* decompileMs, d
     *mslMs = g_t_msl;
 }
 
-// Ambient-occlusion quirks, switchable in game (Graphics menu, O cycles; WWHD_AO_MODE=0..2 sets the start):
-//   0 = as the hardware renders it
-//   1 = centre depth sampled bilinear (removes the every-third-row lines)
-//   2 = 1 + noise tiled per 960x540 pixel instead of per 640x360 pixel (removes the remaining
-//       uneven noise bands the game's blur can't average out)
-static std::atomic<int> g_ao_mode{[] {
-    if (const char* e = getenv("WWHD_AO_MODE")) return atoi(e) % 3;
-    return getenv("WWHD_NO_AO_QUIRK") ? 0 : 2;
-}()};
-int ao_mode() { return g_ao_mode.load(std::memory_order_relaxed); }
-void set_ao_mode(int m) { g_ao_mode = m % 3; LOG("[gfx] ambient occlusion mode %d", m % 3); }
+// Wind Waker ambient-occlusion fixes: no BotW pass to apply them to (the renderer API keeps the entries)
+int ao_mode() { return 0; }
+void set_ao_mode(int) {}
 
 // Draws whose shaders or pipeline are still compiling used to be skipped, which makes objects blink
 // for a few frames after entering a new area. Instead wait for the compile, up to a per-frame budget
@@ -1456,71 +1434,12 @@ static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t wo
 static const bool g_snapshot = getenv("WWHD_SNAPSHOT") != nullptr;
 
 // ---------------------------------------------------------------- per-stage resources
-// enhancement, toggled in game (Graphics menu or M; WWHD_AO_HIRES=0 starts with it off): the game
-// downsamples depth to 640x360 (PS 3BB9DE00) and computes ambient occlusion from it at 960x540
-// (PS 44BDFD00). The size mismatch is what leaves lines in shadowed grass. With this on, the
-// downsample is drawn a second time into a private 960x540 copy and the occlusion pass reads that
-// copy, one depth texel per pixel. Every other reader keeps the game's 640x360 buffer.
-static std::atomic<bool> g_ao_hires{[] { const char* e = getenv("WWHD_AO_HIRES"); return !e || atoi(e) != 0; }()};
-bool ao_hires_enabled() { return g_ao_hires.load(std::memory_order_relaxed); }
-void set_ao_hires(bool v) { g_ao_hires = v; LOG("[gfx] full-size occlusion depth %s", v ? "on" : "off"); }
-static bool g_hires_redraw = false;          // inside the second draw of the downsample
-static uint32_t g_hires_src = 0;             // guest address of the game's 640x360 buffer
-static uint64_t g_hires_frame = ~0ull;       // frame the private copy was last drawn
-static Surface g_hires_color, g_hires_depth;
+bool ao_hires_enabled() { return false; }  // Wind Waker full-size occlusion depth: no BotW pass
+void set_ao_hires(bool) {}
 
 MTLTextureUsage format_view_usage();
 void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTexture> tex, uint32_t slice, uint32_t level);
 
-static Surface* hires_surface(Surface& dst, const Surface* like) {
-    uint32_t w = like->width * 3 / 2, h = like->height * 3 / 2;
-    // texture: 1.5x the game's buffer as allocated (which may already be scaled for the internal resolution)
-    uint32_t pw = (uint32_t)like->tex.width * 3 / 2, ph = (uint32_t)like->tex.height * 3 / 2;
-    if (!dst.tex || dst.width != w || dst.height != h || dst.tex.width != pw || dst.tex.height != ph ||
-        dst.fmt.pixel != like->fmt.pixel) {
-        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:like->fmt.pixel width:pw height:ph
-                                                                                 mipmapped:NO];
-        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | format_view_usage();
-        d.storageMode = MTLStorageModePrivate;
-        dst = *like;
-        dst.sm.clear();
-        dst.relations.clear();
-        dst.views.clear();
-        dst.baseView = nullptr;
-        dst.tex = [R.device newTextureWithDescriptor:d];
-        dst.addr = 0;  // private: never found by address lookups
-        dst.width = w;
-        dst.height = h;
-        dst.slices = 1;
-        dst.mips = 1;
-        dst.sx = (float)pw / w;
-        dst.sy = (float)ph / h;
-        // private textures start with undefined contents and every pass on them loads: clear once
-        // (colour 0, depth 1) so nothing the redraw doesn't cover reads leftover GPU memory
-        end_encoder();
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        if (dst.fmt.depth) {
-            rp.depthAttachment.texture = dst.tex;
-            rp.depthAttachment.loadAction = MTLLoadActionClear;
-            rp.depthAttachment.clearDepth = 1.0;
-            rp.depthAttachment.storeAction = MTLStoreActionStore;
-            if (dst.fmt.stencil) {
-                rp.stencilAttachment.texture = dst.tex;
-                rp.stencilAttachment.loadAction = MTLLoadActionClear;
-                rp.stencilAttachment.clearStencil = 0;
-                rp.stencilAttachment.storeAction = MTLStoreActionStore;
-            }
-        } else {
-            rp.colorAttachments[0].texture = dst.tex;
-            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        }
-        time_render_pass(rp, __FILE_NAME__, __LINE__);
-        [[command_buffer() renderCommandEncoderWithDescriptor:rp] endEncoding];
-    }
-    return &dst;
-}
 
 // pixels of the current render target per guest pixel (viewport/scissor/fragment-coordinate scale)
 static float g_target_kx = 1.0f, g_target_ky = 1.0f;
@@ -1634,13 +1553,6 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         // the draw's texture preflight looked this unit up already (same registers, same draw)
         TexView* tv = unit < 18 && g_unit_tex_valid[vertex ? 0 : 1][unit] ? g_unit_tex[vertex ? 0 : 1][unit]
                                                                          : sampled_texture(tw, dec->textureUsesDepthCompare[unit]);
-        if (!vertex && tv && g_hires_src && tv->tex->addr == g_hires_src && g_hires_frame == R.frame && ao_hires_enabled() &&
-            sh->kind == gfx::ProgramKind::OcclusionPixel) {
-            static TexView hiresView;
-            hiresView.tex = &g_hires_color;
-            hiresView.format = g_hires_color.format;
-            tv = &hiresView;
-        }
         Surface* s = tv ? tv->tex : nullptr;
         id<MTLTexture> tex = s && s->tex ? texture_view(tv, type, tw[4]) : nil;
         if (s && unit < 18) { texScale[unit][0] = s->sx; texScale[unit][1] = s->sy; }
@@ -1655,15 +1567,6 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 2]);
         if (!tex) tex = null_texture(type);
         const uint32_t* sw = &regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3];
-        // quirk: the ambient-occlusion pass (PS 44BDFD00) point-samples its centre depth from a 640x360
-        // buffer while drawing 960x540; every third row lands half a texel off and shows as screen-fixed
-        // lines on sloped ground in shadow. Bilinear for that one fetch matches its neighbour fetches.
-        uint32_t patched[3];
-        if (ao_mode() >= 1 && !vertex && unit == 0 && sh->kind == gfx::ProgramKind::OcclusionPixel) {
-            memcpy(patched, sw, sizeof patched);
-            patched[0] = (patched[0] & ~0x7E00u) | (1u << 9) | (1u << 12);  // XY mag/min filter: bilinear
-            sw = patched;
-        }
         id<MTLSamplerState> smp = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
         if (binding >= MAX_MTL_SAMPLERS) {  // past Metal's 16 sampler slots: the shader reads it from a table
             if (binding - MAX_MTL_SAMPLERS < LATTE_NUM_MAX_TEX_UNITS) extraSamplers[binding - MAX_MTL_SAMPLERS] = smp.gpuResourceID;
@@ -1707,12 +1610,6 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
                 if (!addr) continue;
                 for (auto& e : g.entries) memcpy(dst + e.mappedIndexOffset, mem::ptr(addr + e.indexOffset), 16);
             }
-            // Apply once before the Gaussian/mip chain, preserving the game's threshold and haze.
-            // (no Wind Waker bloom-strength hook: its shader address is another program in BotW)
-            // AO mode 2: the occlusion pass's VS (44BDF900) scales its noise coordinates by remapped[0].w
-            // for a 640x360 grid; the pass draws 960x540, so tile the 4x4 noise per output pixel instead
-            if (vertex && ao_mode() == 2 && sh->kind == gfx::ProgramKind::OcclusionVertex)
-                ((float*)dst)[3] *= 1.5f;
             // F12 capture: the uniforms of vertex shaders that fetch textures (grass, terrain); [arraydraw] draws
             if ((capturing() && vertex && dec->textureUnitListCount > 0) || g_log_uniforms) {
                 const size_t n = std::min<size_t>((buf.size() - dec->uniform.loc_remapped) / 16, 32);
@@ -2847,15 +2744,6 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             }
             break;
         }
-    // the game's target size (viewport registers refer to it)
-    uint32_t guestW = colors[0] ? std::max(colors[0]->width >> colorMips[0], 1u) : 0;
-    uint32_t guestH = colors[0] ? std::max(colors[0]->height >> colorMips[0], 1u) : 0;
-    if (g_hires_redraw && colors[0]) {
-        g_hires_src = colors[0]->addr;
-        colors[0] = hires_surface(g_hires_color, colors[0]);
-        colorSlices[0] = colorMips[0] = 0;
-        if (depth) { depth = hires_surface(g_hires_depth, depth); depthSlice = depthMip = 0; }
-    }
     // Metal requires matching attachment sizes; drop mismatching ones. Sizes here are the textures'
     // (internal resolution) at the attached level; kx/ky = texture pixels per guest pixel of the target.
     auto levelW = [](Surface* t, uint32_t mip) { return (uint32_t)std::max<NSUInteger>(t->tex.width >> mip, 1); };
@@ -2883,10 +2771,6 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     const bool noAttachments = !w && streamout && (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22));
     if (noAttachments) { w = h = 1; g_streamout_notarget++; }
     else if (!w) { g_skip[SK_NO_TARGET]++; return; }
-    if (g_hires_redraw && guestW) {  // the viewport registers describe the game's smaller buffer
-        kx = (float)colors[0]->tex.width / guestW;
-        ky = (float)colors[0]->tex.height / guestH;  // differs from kx at other aspect ratios
-    }
     g_target_kx = kx;
     g_target_ky = ky;
     if (g_occl_open) g_occl_area = kx * ky;
@@ -3305,12 +3189,6 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             snprintf(name, sizeof name, "draw_%llu_%llu_depth.png", (unsigned long long)R.frame, (unsigned long long)thisDraw);
             dump_texture(depth->tex, name, false, false);
         }
-    }
-    if (g_hires_redraw) { g_hires_frame = R.frame; return; }  // the private copy is ready for the occlusion pass
-    if (ao_hires_enabled() && colors[0] && ps->kind == gfx::ProgramKind::DepthDownsample) {
-        g_hires_redraw = true;
-        draw(regs, prim, count, indexType, indexAddr, baseVertex, instances);
-        g_hires_redraw = false;
     }
 }
 
