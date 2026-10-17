@@ -986,7 +986,42 @@ void set_ao_mode(int m) { g_ao_mode = m % 3; LOG("[gfx] ambient occlusion mode %
 // wait for their compile without the budget, like the Vulkan renderer does for every draw.
 static bool g_building_ahead = false;
 static bool g_draw_must_run = false;  // the current draw writes a target that isn't redrawn every frame
-static std::unordered_map<uint32_t, uint64_t> g_target_drawn;  // render target address -> frame of its last draw
+// render target address -> its draw history. Every draw in a target's first frame waits (upstream
+// 26c9114: a later draw of that frame may be the only one of its result).
+struct TargetDrawHistory {
+    bool valid = false, firstFrame = false;
+    uint64_t lastFrame = 0;
+    bool must_wait(uint64_t frame) const {
+        if (!valid) return true;
+        if (frame == lastFrame) return firstFrame;
+        return frame < lastFrame || frame - lastFrame != 1;
+    }
+    void drawn(uint64_t frame) {
+        firstFrame = must_wait(frame);
+        lastFrame = frame;
+        valid = true;
+    }
+};
+static std::unordered_map<uint32_t, TargetDrawHistory> g_target_drawn;
+// BotW: only the screen-shaped targets (the view and its reductions) are redrawn whole every frame.
+// Data targets (grass and terrain maps updated a few tiles a frame, shadow maps, lookup tables) keep
+// what a draw wrote for as long as the game uses it: a skipped tile stays wrong (flat grass). Their
+// draws always wait. WWHD_SKIP_DATA_DRAWS=1: the old rule (skippable when drawn the frame before).
+static bool target_must_run(uint32_t addr, uint32_t w, uint32_t h) {
+    static const bool old = getenv("WWHD_SKIP_DATA_DRAWS") != nullptr;
+    const float r = h ? (float)w * 9.0f / ((float)h * 16.0f) : 0.0f;
+    const bool screen = w >= 160 && r > 0.97f && r < 1.03f;
+    if (!screen && !old) return true;
+    auto it = g_target_drawn.find(addr);
+    return it == g_target_drawn.end() || it->second.must_wait(R.frame);
+}
+static bool color_must_run(const uint32_t* regs, int i) {
+    return target_must_run(regs[mmCB_COLOR0_BASE + i], regs[mmCB_COLOR0_TILE + i] & 0xFFFF, regs[mmCB_COLOR0_FRAG + i]);
+}
+static bool depth_must_run(const uint32_t* regs) {
+    const uint32_t wh = regs[mmDB_HTILE_DATA_BASE];  // our convention: width << 16 | height
+    return target_must_run(regs[mmDB_DEPTH_BASE], wh >> 16, wh & 0xFFFF);
+}
 static uint64_t g_must_run_waits = 0;
 static double g_must_run_wait_ms = 0;
 std::atomic<double> g_compile_wait_ms{0};  // render thread time spent waiting for compiles (hitch log)
@@ -2601,14 +2636,9 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         // colour: outputs the shader exports (CB_SHADER_MASK) that the target mask lets through
         const uint32_t written = regs[REGADDR::CB_TARGET_MASK] & regs[mmCB_SHADER_MASK];
         for (int i = 0; i < 8 && !must; i++)
-            if (((written >> (4 * i)) & 0xF) && regs[mmCB_COLOR0_BASE + i]) {
-                auto it = g_target_drawn.find(regs[mmCB_COLOR0_BASE + i]);
-                must = it == g_target_drawn.end() || it->second + 1 < R.frame;
-            }
-        if (!must && LatteMRT::GetActiveDepthBufferMask(*(const LatteContextRegister*)regs) && regs[mmDB_DEPTH_BASE]) {
-            auto it = g_target_drawn.find(regs[mmDB_DEPTH_BASE]);
-            must = it == g_target_drawn.end() || it->second + 1 < R.frame;
-        }
+            if (((written >> (4 * i)) & 0xF) && regs[mmCB_COLOR0_BASE + i]) must = color_must_run(regs, i);
+        if (!must && LatteMRT::GetActiveDepthBufferMask(*(const LatteContextRegister*)regs) && regs[mmDB_DEPTH_BASE])
+            must = depth_must_run(regs);
         g_draw_must_run = must;
         const bool ready = wait_compiled(vs->tstate) && wait_compiled(ps->tstate);
         g_draw_must_run = false;
@@ -2619,14 +2649,10 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     const LatteContextRegister& lcr = *(const LatteContextRegister*)regs;
     uint8_t mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
     {
-        auto notRedrawn = [](uint32_t addr) {
-            auto it = g_target_drawn.find(addr);
-            return it == g_target_drawn.end() || it->second + 1 < R.frame;
-        };
         bool must = false;
         for (int i = 0; i < 8 && !must; i++)
-            if ((mask & (1 << i)) && regs[mmCB_COLOR0_BASE + i]) must = notRedrawn(regs[mmCB_COLOR0_BASE + i]);
-        if (!must && LatteMRT::GetActiveDepthBufferMask(lcr) && regs[mmDB_DEPTH_BASE]) must = notRedrawn(regs[mmDB_DEPTH_BASE]);
+            if ((mask & (1 << i)) && regs[mmCB_COLOR0_BASE + i]) must = color_must_run(regs, i);
+        if (!must && LatteMRT::GetActiveDepthBufferMask(lcr) && regs[mmDB_DEPTH_BASE]) must = depth_must_run(regs);
         g_draw_must_run = must;
     }
     struct MustRunReset { ~MustRunReset() { g_draw_must_run = false; } } mustRunReset;
@@ -2909,8 +2935,8 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         g_so = {};
     }
     for (int i = 0; i < 8; i++)
-        if (colors[i] && regs[mmCB_COLOR0_BASE + i]) g_target_drawn[regs[mmCB_COLOR0_BASE + i]] = R.frame;
-    if (depth && regs[mmDB_DEPTH_BASE]) g_target_drawn[regs[mmDB_DEPTH_BASE]] = R.frame;
+        if (colors[i] && regs[mmCB_COLOR0_BASE + i]) g_target_drawn[regs[mmCB_COLOR0_BASE + i]].drawn(R.frame);
+    if (depth && regs[mmDB_DEPTH_BASE]) g_target_drawn[regs[mmDB_DEPTH_BASE]].drawn(R.frame);
     // debug: WWHD_DUMP_DRAWS=frame:i,j,k dumps color target 0 after those draws
     static uint64_t dumpFrame = ~0ull;
     static std::set<uint64_t> dumpDraws = [] {
