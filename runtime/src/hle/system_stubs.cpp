@@ -42,6 +42,9 @@ HLE(nn_boss, Initialize__Q3_2nn4boss4TaskFPCcUi) { ret(c, kResultFail); }
 HLE(nn_boss, IsRegistered__Q3_2nn4boss4TaskCFv) { ret(c, 0); }
 HLE(nn_boss, Register__Q3_2nn4boss4TaskFRQ3_2nn4boss11TaskSetting) { ret(c, kResultFail); }
 HLE(nn_boss, StartScheduling__Q3_2nn4boss4TaskFb) { ret(c, kResultFail); }
+// a task's outcome: the constructor keeps the Result and returns the object (was 0: the caller's pointer)
+HLE(nn_boss, __ct__Q3_2nn4boss10TaskResultFQ2_2nn6Result) { st32(arg(c, 0), arg(c, 1)); ret(c, arg(c, 0)); }
+HLE(nn_boss, ErrorCode__Q3_2nn4boss10TaskResultCFv) { ret(c, 0); }
 
 // ---- nn_olv (Miiverse)
 HLE(nn_olv, Initialize__Q2_2nn3olvFPCQ3_2nn3olv15InitializeParam) { ret(c, kResultFail); }
@@ -207,3 +210,14 @@ HLE(vpadbase, VPADBASEGetHeadphoneStatus) { ret(c, 0); }
 // ---- sysapp
 HLE(sysapp, SYSLaunchSettings) { ret(c, 0); }
 HLE(sysapp, SYSLaunchAccount) { ret(c, 0); }
+
+// ---- calls with nothing to do here (were logged as unimplemented)
+HLE(coreinit, OSGetShutdownReason) { ret(c, 0); }  // a normal boot
+HLE(coreinit, OSCoherencyBarrier) {}
+HLE(gx2, GX2SetVerifyLevel) {}
+// gyro tuning: the virtual GamePad (motion/) reports finished values
+HLE(vpad, VPADSetGyroZeroDriftMode) {}
+HLE(vpad, VPADSetGyroDirection) {}
+HLE(vpad, VPADSetGyroAccReviseParam) {}
+HLE(vpad, VPADEnableGyroAccRevise) {}
+HLE(vpad, VPADDisableGyroDirRevise) {}
