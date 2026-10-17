@@ -2649,6 +2649,9 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
          prim, count, indexType, indexAddr, regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, regs[mmCB_COLOR0_BASE],
          regs[mmCB_COLOR0_INFO], regs[mmDB_DEPTH_BASE], regs[REGADDR::DB_DEPTH_CONTROL], regs[REGADDR::CB_COLOR_CONTROL],
          regs[REGADDR::CB_TARGET_MASK]);
+    for (int i = 1; i < 8; i++)  // the other colour targets the mask writes
+        if ((regs[REGADDR::CB_TARGET_MASK] >> (i * 4)) & 0xF)
+            DLOG("[draw]   CB%d %08X info %08X", i, regs[mmCB_COLOR0_BASE + i], regs[mmCB_COLOR0_INFO + i]);
     if (!count || !instances) return;
     ((uint32_t*)regs)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
     if (regs[REGADDR::VGT_GS_MODE] & 3) { g_skip[SK_GS]++; return; }  // geometry shaders: not supported yet
@@ -2850,7 +2853,16 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (depth && w && (levelW(depth, depthMip) < w || levelH(depth, depthMip) < h)) { depth = nullptr; g_skip[SK_DROPPED_DEPTH]++; }
     if (!w && depth) { w = levelW(depth, depthMip); h = levelH(depth, depthMip); kx = depth->sx; ky = depth->sy; }
     for (int i = 0; i < 8; i++)
-        if (colors[i] && (levelW(colors[i], colorMips[i]) != w || levelH(colors[i], colorMips[i]) != h)) { colors[i] = nullptr; g_skip[SK_DROPPED_COLOR]++; }
+        if (colors[i] && (levelW(colors[i], colorMips[i]) != w || levelH(colors[i], colorMips[i]) != h)) {
+            DLOG("[draw]   CB%d %08X dropped: %ux%u, the pass is %ux%u", i, colors[i]->addr, levelW(colors[i], colorMips[i]),
+                 levelH(colors[i], colorMips[i]), w, h);
+            colors[i] = nullptr;
+            g_skip[SK_DROPPED_COLOR]++;
+        }
+    for (int i = 1; i < 8; i++)
+        if (colors[i])
+            DLOG("[draw]   -> CB%d %08X %ux%u (texture %lux%lu, mip %u slice %u)", i, colors[i]->addr, colors[i]->width, colors[i]->height,
+                 (unsigned long)colors[i]->tex.width, (unsigned long)colors[i]->tex.height, colorMips[i], colorSlices[i]);
     const bool noAttachments = !w && streamout && (regs[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22));
     if (noAttachments) { w = h = 1; g_streamout_notarget++; }
     else if (!w) { g_skip[SK_NO_TARGET]++; return; }
