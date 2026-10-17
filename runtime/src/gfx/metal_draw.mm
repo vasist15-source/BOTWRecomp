@@ -61,6 +61,48 @@ static FILE* g_capture_log = nullptr;
 void request_capture() { g_capture_requested = true; }
 static bool capturing() { return R.frame == g_capture_frame; }
 bool log_this_frame() { return capturing() || (R.frame >= g_log_frame && R.frame <= g_log_frame_end); }
+// colour probe (F12 capture): raw texel of one surface at one point after each event that writes it
+uint32_t probe_addr() {
+    static const uint32_t a = getenv("WWHD_PROBE_ADDR") ? (uint32_t)strtoul(getenv("WWHD_PROBE_ADDR"), nullptr, 16) : 0xF45C6000u;
+    return a;
+}
+bool probe_capturing() { return capturing(); }
+void probe_surface(Surface* s, uint32_t slice, uint32_t mip, const char* what);
+struct ProbeRead { Surface* s; uint32_t slice, mip; std::string what; };
+static std::vector<ProbeRead> g_probe_reads;  // textures read by the current draw (probed after it)
+void probe_surface(Surface* s, uint32_t slice, uint32_t mip, const char* what) {
+    if (!capturing() || !s || !s->tex || s->tex.isFramebufferOnly || s->fmt.compressed || s->fmt.depth) return;
+    static float fx = 0.5f, fy = 0.5f;
+    static const bool parsed = [] { if (const char* e = getenv("WWHD_PROBE_XY")) sscanf(e, "%f,%f", &fx, &fy); return true; }();
+    (void)parsed;
+    static id<MTLBuffer> buf = nil;
+    static uint32_t slot = 0;
+    static uint64_t frame = ~0ull;
+    if (!buf) buf = [R.device newBufferWithLength:4096 * 16 options:MTLResourceStorageModeShared];
+    if (frame != R.frame) { frame = R.frame; slot = 0; }
+    if (slot >= 4096) return;
+    const NSUInteger w = std::max<NSUInteger>(s->tex.width >> mip, 1), h = std::max<NSUInteger>(s->tex.height >> mip, 1);
+    const NSUInteger x = std::min<NSUInteger>((NSUInteger)(fx * w), w - 1), y = std::min<NSUInteger>((NSUInteger)(fy * h), h - 1);
+    const uint32_t bpp = s->fmt.hostBytesPerBlock, off = slot++ * 16;
+    if (bpp > 16) return;
+    end_encoder();
+    id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
+    const bool s3 = s->tex.textureType == MTLTextureType3D;
+    [b copyFromTexture:s->tex sourceSlice:s3 ? 0 : slice sourceLevel:mip sourceOrigin:MTLOriginMake(x, y, s3 ? slice : 0)
+            sourceSize:MTLSizeMake(1, 1, 1) toBuffer:buf destinationOffset:off destinationBytesPerRow:16 destinationBytesPerImage:16];
+    [b endEncoding];
+    char meta[300];
+    snprintf(meta, sizeof meta, "%s | %08X %ux%u f%X pixel %lu (tex %lux%lu) at %lu,%lu", what, s->addr, s->width, s->height, s->format,
+             (unsigned long)s->tex.pixelFormat, (unsigned long)s->tex.width, (unsigned long)s->tex.height, (unsigned long)x, (unsigned long)y);
+    std::string m = meta, file = g_capture_dir + "/colorprobe.log";
+    id<MTLBuffer> pb = buf;
+    [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+        const uint8_t* p = (const uint8_t*)pb.contents + off;
+        char hex[40] = {};
+        for (uint32_t i = 0; i < bpp; i++) snprintf(hex + i * 2, 3, "%02X", p[i]);
+        if (FILE* f = fopen(file.c_str(), "a")) { fprintf(f, "%s = %s\n", m.c_str(), hex); fclose(f); }
+    }];
+}
 static void dlog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dlog(const char* fmt, ...) {
     char line[4096];
@@ -1565,6 +1607,11 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3],
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 1],
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 2]);
+        if (capturing() && s && s->addr == probe_addr()) {  // probed after the draw (the encoder is in use here)
+            char what[120];
+            snprintf(what, sizeof what, "read by %s %08X tex%u", vertex ? "VS" : "PS", regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8, unit);
+            g_probe_reads.push_back({s, tv->firstSlice, tv->firstMip, what});
+        }
         if (!tex) tex = null_texture(type);
         const uint32_t* sw = &regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3];
         id<MTLSamplerState> smp = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
@@ -3107,6 +3154,20 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             }
         }
     }
+    // F12 capture: colour probe (WWHD_PROBE_ADDR, default F45C6000, at WWHD_PROBE_XY, default 0.5,0.5): the
+    // surface's raw texel after every draw that renders into it (captures/<time>/colorprobe.log)
+    if (!g_probe_reads.empty()) {
+        for (auto& r : g_probe_reads) probe_surface(r.s, r.slice, r.mip, (r.what + " (draw " + std::to_string(thisDraw) + ")").c_str());
+        g_probe_reads.clear();
+    }
+    if (capturing())
+        for (int i = 0; i < 8; i++)
+            if (colors[i] && colors[i]->addr == probe_addr()) {
+                char what[160];
+                snprintf(what, sizeof what, "draw %llu VS %08X PS %08X count %u as CB%d", (unsigned long long)thisDraw,
+                         regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, count, i);
+                probe_surface(colors[i], colorSlices[i], colorMips[i], what);
+            }
     if (capturing() && count <= 6 && colors[0]) {  // full-screen pass
         void dump_texture(id<MTLTexture>, const char*, bool, bool);
         char name[160];

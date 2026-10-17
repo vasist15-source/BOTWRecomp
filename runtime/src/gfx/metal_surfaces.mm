@@ -756,8 +756,24 @@ static void convert_copy(Surface* src, uint32_t srcSlice, uint32_t srcMip, Surfa
 
 // src (slice, mip) region at (sx, sy) into dst (slice, mip) at (dx, dy), w x h texture pixels, raw texels
 // (Cemu: texture_copyImageSubData). Different host formats: same texel size through a buffer, else drawn.
+uint32_t probe_addr();
+bool probe_capturing();
+void probe_surface(Surface* s, uint32_t slice, uint32_t mip, const char* what);
+static void gpu_copy_impl(Surface* src, uint32_t srcSlice, uint32_t srcMip, uint32_t sx, uint32_t sy, Surface* dst, uint32_t dstSlice,
+                          uint32_t dstMip, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
+// F12 capture: copies into the probed surface are recorded (colorprobe.log), like the draws that write it
 static void gpu_copy(Surface* src, uint32_t srcSlice, uint32_t srcMip, uint32_t sx, uint32_t sy, Surface* dst, uint32_t dstSlice, uint32_t dstMip,
                      uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
+    gpu_copy_impl(src, srcSlice, srcMip, sx, sy, dst, dstSlice, dstMip, dx, dy, w, h);
+    if (probe_capturing() && dst && dst->addr == probe_addr()) {
+        char what[200];
+        snprintf(what, sizeof what, "copy from %08X %ux%u f%X (slice %u mip %u) region %u,%u %ux%u", src->addr, src->width, src->height,
+                 src->format, srcSlice, srcMip, dx, dy, w, h);
+        probe_surface(dst, dstSlice, dstMip, what);
+    }
+}
+static void gpu_copy_impl(Surface* src, uint32_t srcSlice, uint32_t srcMip, uint32_t sx, uint32_t sy, Surface* dst, uint32_t dstSlice,
+                          uint32_t dstMip, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
     if (!src->tex || !dst->tex || !w || !h) return;
     if (src->fmt.depth != dst->fmt.depth) { convert_copy(src, srcSlice, srcMip, dst, dstSlice, dstMip, w, h); return; }
     const NSUInteger sw = std::max<NSUInteger>(src->tex.width >> srcMip, 1), shh = std::max<NSUInteger>(src->tex.height >> srcMip, 1);
