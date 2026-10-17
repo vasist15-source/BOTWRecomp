@@ -55,6 +55,7 @@ static std::atomic<float> g_res_requested{parse_scale(getenv("WWHD_RES_SCALE"))}
 static float g_res_frame = g_res_requested.load();
 static void latch_aspect();  // render thread: the factor for this frame
 static void rescale_all_surfaces();
+static void clear_surface_to_zero(Surface* t);
 static float g_aspect_kx_latched();
 static float g_aspect_ky_latched();
 float res_scale() { return g_res_frame; }
@@ -268,10 +269,27 @@ static Surface* rescale(Surface* s) {
     id<MTLTexture> t = make_texture(s, old.textureType, want, ax, ay);
     if (!t) { s->sx = osx; s->sy = osy; s->scale = oscale; s->ax = oax; s->ay = oay; return s; }
     end_encoder();
-    g_resample_why = "rescale";
-    resample(old, t, s->fmt, old.textureType == MTLTextureType3D ? 1 : (uint32_t)layer_count(old));
-    g_resample_why = nullptr;
+    // every level: a new texture's memory is undefined (NaN in float formats), and later passes that
+    // blend into a level keep a NaN forever (the bloom mip chain: black lower screen after a switch)
     s->tex = t;
+    clear_surface_to_zero(s);
+    g_resample_why = "rescale";
+    const uint32_t layers = old.textureType == MTLTextureType3D ? 1 : (uint32_t)layer_count(old);
+    const NSUInteger levels = std::min(old.mipmapLevelCount, t.mipmapLevelCount);
+    if (levels <= 1 || s->fmt.compressed) {
+        resample(old, t, s->fmt, layers);
+    } else {
+        const MTLTextureType vt = old.textureType == MTLTextureTypeCube || old.textureType == MTLTextureTypeCubeArray ? MTLTextureType2DArray
+                                                                                                                 : old.textureType;
+        for (NSUInteger m = 0; m < levels; m++) {
+            id<MTLTexture> a = [old newTextureViewWithPixelFormat:old.pixelFormat textureType:vt levels:NSMakeRange(m, 1)
+                                                          slices:NSMakeRange(0, layers)];
+            id<MTLTexture> b = [t newTextureViewWithPixelFormat:t.pixelFormat textureType:vt levels:NSMakeRange(m, 1)
+                                                        slices:NSMakeRange(0, layers)];
+            if (a && b) resample(a, b, s->fmt, layers);
+        }
+    }
+    g_resample_why = nullptr;
     forget_texture_views();
     if (getenv("WWHD_LOG_RESCALE"))
         LOG("[gfx] rescaled %08X %ux%u fmt %X to %lux%lu", s->addr, s->width, s->height, s->format, (unsigned long)t.width,
