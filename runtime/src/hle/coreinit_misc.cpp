@@ -368,3 +368,20 @@ HLE(coreinit, UCReadSysConfig) {
     }
     ret(c, 0);
 }
+
+// MCP (system settings service): the console and game region (Cemu: coreinit_MCP.cpp). The game reads
+// its product settings once at start; returning success without filling them left the regions 0.
+extern "C" const char g_guest_build_title_id[];
+HLE(coreinit, MCP_Open) { ret(c, 1); }  // a handle; nothing is opened
+HLE(coreinit, MCP_Close) { ret(c, 0); }
+HLE(coreinit, MCP_GetSysProdSettings) {  // (handle, SysProdSettings* 0x46 bytes)
+    const uint32_t out = arg(c, 1);
+    if (!out) { ret(c, 0xFFFFFFFF); return; }
+    memset(mem::ptr(out), 0, 0x46);
+    // Wii U region bits from the title ID's region digits (BotW: 101C9300 Japan, 101C9400 USA, 101C9500 Europe)
+    const std::string id = g_guest_build_title_id;
+    const uint8_t region = id.size() == 16 && id[13] == '3' ? 1 : id.size() == 16 && id[13] == '5' ? 4 : 2;
+    st8(out + 0x03, region);  // platform region
+    st8(out + 0x0B, region);  // game region
+    ret(c, 0);
+}

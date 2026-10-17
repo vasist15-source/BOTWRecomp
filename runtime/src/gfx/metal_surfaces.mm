@@ -789,6 +789,44 @@ static void gpu_copy(Surface* src, uint32_t srcSlice, uint32_t srcMip, uint32_t 
             [b copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:MTLSizeMake(w, h, 1)
                     toTexture:dst->tex destinationSlice:d3 ? 0 : dstSlice destinationLevel:dstMip destinationOrigin:dorig];
         }
+    } else if (src->fmt.compressed != dst->fmt.compressed && !src->fmt.depth && !dst->fmt.depth &&
+               src->fmt.convert == Convert::NONE && dst->fmt.convert == Convert::NONE &&
+               src->fmt.hostBytesPerBlock == dst->fmt.hostBytesPerBlock) {
+        // one texel of the uncompressed surface is one 4x4 block of the compressed one (the game encodes
+        // BC textures on the GPU into a render target of the block size, e.g. RGBA16 -> BC4): raw bytes
+        // through a buffer (Cemu: texture_copyImageSubData between compatible formats)
+        const NSUInteger bpb = dst->fmt.hostBytesPerBlock;
+        NSUInteger bw, bh;  // blocks (= texels of the uncompressed side)
+        MTLSize srcSize, dstSize;
+        MTLOrigin so2 = so, do2 = dorig;
+        if (dst->fmt.compressed) {
+            bw = w, bh = h;
+            srcSize = MTLSizeMake(bw, bh, 1);
+            do2.x = dx * 4 < dw ? dx * 4 : dx, do2.y = dy * 4 < dh ? dy * 4 : dy;  // block or pixel coordinates
+            if (do2.x >= dw || do2.y >= dh) { [b endEncoding]; return; }
+            dstSize = MTLSizeMake(std::min<NSUInteger>(bw * 4, dw - do2.x), std::min<NSUInteger>(bh * 4, dh - do2.y), 1);
+            bw = (dstSize.width + 3) / 4, bh = (dstSize.height + 3) / 4;
+            srcSize = MTLSizeMake(std::min<NSUInteger>(bw, sw - sx), std::min<NSUInteger>(bh, shh - sy), 1);
+        } else {
+            so2.x = sx & ~3u, so2.y = sy & ~3u;
+            if (do2.x >= dw || do2.y >= dh) { [b endEncoding]; return; }
+            bw = std::min<NSUInteger>((std::min<NSUInteger>(w, sw - so2.x) + 3) / 4, dw - do2.x);
+            bh = std::min<NSUInteger>((std::min<NSUInteger>(h, shh - so2.y) + 3) / 4, dh - do2.y);
+            srcSize = MTLSizeMake(std::min<NSUInteger>(bw * 4, sw - so2.x), std::min<NSUInteger>(bh * 4, shh - so2.y), 1);
+            dstSize = MTLSizeMake(bw, bh, 1);
+        }
+        const NSUInteger row = bw * bpb, image = row * bh;
+        id<MTLBuffer> tmp = [R.device newBufferWithLength:image options:MTLResourceStorageModePrivate];
+        if (tmp) {
+            [b copyFromTexture:src->tex sourceSlice:s3 ? 0 : srcSlice sourceLevel:srcMip sourceOrigin:so2 sourceSize:srcSize
+                      toBuffer:tmp destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:image];
+            [b copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:dstSize
+                    toTexture:dst->tex destinationSlice:d3 ? 0 : dstSlice destinationLevel:dstMip destinationOrigin:do2];
+        }
+        static int logged = 0;
+        if (logged++ < 5)
+            LOG("[tc] block copy %08X f%X -> %08X f%X: %lux%lu blocks (slice %u mip %u)", src->addr, src->format, dst->addr, dst->format,
+                (unsigned long)bw, (unsigned long)bh, dstSlice, dstMip);
     } else {
         static int logged = 0;
         if (logged++ < 10)
