@@ -2769,6 +2769,29 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
             }
             LOG("%s", l.c_str());
             g_log_uniforms = true;
+            // the programs' MSL, once each (build/arraydraw_ps_<addr>.metal), translated again when released
+            for (int stage = 0; stage < 2; stage++) {
+                static std::set<uint32_t> written;
+                const bool vert = stage == 0;
+                const uint32_t reg = vert ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS;
+                const uint32_t addr = regs[reg] << 8, size = regs[reg + 1] << 3;
+                if (!written.insert(addr).second) continue;
+                Shader* sh = vert ? vs : ps;
+                std::string src;
+                if (sh->dec && sh->dec->strBuf_shaderSource) src = sh->dec->strBuf_shaderSource->c_str();
+                else {
+                    Shader probe;
+                    const bool wasDefer = g_defer_compiles;
+                    g_defer_compiles = true;
+                    translate_shader(&probe, regs, vert, vert ? fs : nullptr, program_hash(addr, size) ^ 0x4444, addr, size, false);
+                    g_defer_compiles = wasDefer;
+                    if (!g_deferred_shaders.empty() && g_deferred_shaders.back() == &probe) g_deferred_shaders.pop_back();
+                    if (probe.dec && probe.dec->strBuf_shaderSource) src = probe.dec->strBuf_shaderSource->c_str();
+                }
+                char name[96];
+                snprintf(name, sizeof name, "build/arraydraw_%s_%08X.metal", vert ? "vs" : "ps", addr);
+                if (FILE* f = fopen(name, "w")) { fputs(src.c_str(), f); fclose(f); }
+            }
             break;
         }
     // the game's target size (viewport registers refer to it)
