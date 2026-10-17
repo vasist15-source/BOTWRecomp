@@ -453,6 +453,15 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     {  // WWHD_MSL_PATCH also here: shaders replayed from the shader cache are compiled without a translation
         static const char* patchFile = getenv("WWHD_MSL_PATCH");
         static const char* patchMatch = getenv("WWHD_MSL_PATCH_MATCH");
+        static const bool logged = [] {
+            if (patchFile) LOG("[gfx] WWHD_MSL_PATCH=%s match \"%s\"", patchFile, patchMatch ? patchMatch : "(none)");
+            return true;
+        }();
+        (void)logged;
+        if (patchFile && snapped.find("col0") != std::string::npos) {  // which shaders read a render target
+            size_t at = snapped.find("// shader ");
+            LOG("[gfx] patch candidate: %s", at == std::string::npos ? "(no hash line)" : snapped.substr(at, 27).c_str());
+        }
         if (patchFile && patchMatch && snapped.find(patchMatch) != std::string::npos)
             if (FILE* f = fopen(patchFile, "rb")) {
                 std::string patched;
