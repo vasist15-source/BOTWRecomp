@@ -2714,6 +2714,45 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     Surface* depth = depthView ? depthView->tex : nullptr;
     if (depthView) { depthSlice = depthView->firstSlice; depthMip = depthView->firstMip; }
     if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
+    // terrain build passes: draws into array targets, logged once per program and target (how the game
+    // builds its terrain and grass layers when an area loads; WWHD_NO_ARRAY_LOG=1 turns it off)
+    static const bool arrayLog = getenv("WWHD_NO_ARRAY_LOG") == nullptr;
+    if (arrayLog)
+        for (int i = 0; i < 8; i++) {
+            if (!colors[i] || colors[i]->slices <= 1) continue;
+            static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seen;
+            static int logged = 0;
+            if (logged >= 400 || !seen.insert({regs[mmSQ_PGM_START_PS] << 8, colors[i]->addr, colorMips[i]}).second) break;
+            logged++;
+            std::string l;
+            char t[200];
+            snprintf(t, sizeof t, "[arraydraw] f%llu VS %08X PS %08X prim %u count %u blend %08X/%08X mask %08X", (unsigned long long)R.frame,
+                     regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, prim, count, regs[REGADDR::CB_COLOR_CONTROL],
+                     regs[REGADDR::CB_BLEND0_CONTROL], regs[REGADDR::CB_TARGET_MASK]);
+            l = t;
+            for (int k = 0; k < 8; k++)
+                if (colors[k]) {
+                    snprintf(t, sizeof t, " | CB%d %08X %ux%u x%u f%X slice %u mip %u", k, colors[k]->addr, colors[k]->width, colors[k]->height,
+                             colors[k]->slices, colors[k]->format, colorSlices[k], colorMips[k]);
+                    l += t;
+                }
+            for (int st = 0; st < 2; st++) {
+                Shader* sh = st ? ps : vs;
+                const uint32_t samplerBase = st ? SAMPLER_BASE_INDEX_PIXEL : SAMPLER_BASE_INDEX_VERTEX;
+                for (int u = 0; u < sh->dec->textureUnitListCount; u++) {
+                    const uint8_t unit = sh->dec->textureUnitList[u];
+                    TexView* v = unit < 18 ? g_unit_tex[st][unit] : nullptr;
+                    if (!v) continue;
+                    const uint32_t si = sh->dec->textureUnitSamplerAssignment[unit] + samplerBase;
+                    snprintf(t, sizeof t, " | %s t%u %08X %ux%u x%u f%X gpu%d mips %u+%u sl %u+%u smp %08X %08X", st ? "PS" : "VS", unit, v->tex->addr,
+                             v->tex->width, v->tex->height, v->tex->slices, v->tex->format, v->tex->gpuWritten, v->firstMip, v->numMip, v->firstSlice,
+                             v->numSlice, regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + si * 3], regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + si * 3 + 1]);
+                    l += t;
+                }
+            }
+            LOG("%s", l.c_str());
+            break;
+        }
     // the game's target size (viewport registers refer to it)
     uint32_t guestW = colors[0] ? std::max(colors[0]->width >> colorMips[0], 1u) : 0;
     uint32_t guestH = colors[0] ? std::max(colors[0]->height >> colorMips[0], 1u) : 0;
