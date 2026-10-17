@@ -1600,7 +1600,7 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         id<MTLTexture> tex = s && s->tex ? texture_view(tv, type, tw[4]) : nil;
         if (s && unit < 18) { texScale[unit][0] = s->sx; texScale[unit][1] = s->sy; }
         uint32_t samplerIdx = dec->textureUnitSamplerAssignment[unit];
-        if (capturing() && s && s->gpuWritten && (vertex || s->slices > 1)) capture_full(s);
+        if (capturing() && s && (vertex || (s->gpuWritten && s->slices > 1))) capture_full(s);
         DLOG("[draw]   %s tex%u %08X %ux%u fmt %X gpu=%d view=%d [mips %u+%u of %u, slices %u+%u of %u, dim %u] smp %08X %08X %08X",
              vertex ? "VS" : "PS", unit, tw[2] << 8, s ? s->width : 0, s ? s->height : 0, s ? s->format : 0, s ? s->gpuWritten : -1, tex != nil,
              tv ? tv->firstMip : 0, tv ? tv->numMip : 0, s ? s->mips : 0, tv ? tv->firstSlice : 0, tv ? tv->numSlice : 0, s ? s->slices : 0,
