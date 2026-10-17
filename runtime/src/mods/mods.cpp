@@ -4,8 +4,6 @@
 //   WWHD_MOD_DIRECT_CAMERA=1   direct right-stick camera (WWHD_MOD_CAMERA_SPEED=1.5 multiplier)
 //   WWHD_MOD_MOUSE_CAMERA=1    mouse camera (WWHD_MOD_MOUSE_SENS=0.15 degrees per point)
 //   WWHD_MOD_FIRST_PERSON=1    first person on R3 / mouse wheel
-//   WWHD_MOD_QUICK_DOORS=1     quick doors
-//   WWHD_MOD_FAST_SCENES=1     fast scene changes
 //   WWHD_MODS_TRACE=path       log of mod decisions and timing events (door events, scene changes,
 //                              Link's control), one line per event with the logic step
 #include "mods.h"
@@ -36,12 +34,10 @@ std::atomic<float> g_speed{env_f("WWHD_MOD_CAMERA_SPEED", 1.0f)};
 std::atomic<bool> g_mouse{env_on("WWHD_MOD_MOUSE_CAMERA")};
 std::atomic<float> g_sens{env_f("WWHD_MOD_MOUSE_SENS", 0.15f)};
 std::atomic<bool> g_fp{env_on("WWHD_MOD_FIRST_PERSON")};
-std::atomic<bool> g_doors{env_on("WWHD_MOD_QUICK_DOORS")};
 std::atomic<bool> g_move{env_on("WWHD_MOD_MOVE_SPEED")};
 std::atomic<float> g_move_factor{clamp_move_speed(env_f("WWHD_MOD_MOVE_FACTOR", 1.5f))};
 std::atomic<uint32_t> g_move_button{input::kStickL};
 std::atomic<uint32_t> g_move_buttons{0};
-std::atomic<bool> g_scenes{env_on("WWHD_MOD_FAST_SCENES")};
 
 void note(const char* what, bool on) { LOG("[mods] %s %s", what, on ? "on" : "off"); }
 }  // namespace
@@ -66,10 +62,6 @@ void set_mouse_sensitivity(float s) {
 }
 bool first_person_wheel() { return g_fp.load(std::memory_order_relaxed); }
 void set_first_person_wheel(bool on) { g_fp = on; note("first person on R3 / mouse wheel", on); }
-bool quick_doors() { return g_doors.load(std::memory_order_relaxed); }
-void set_quick_doors(bool on) { g_doors = on; note("quick doors", on); }
-bool fast_scenes() { return g_scenes.load(std::memory_order_relaxed); }
-void set_fast_scenes(bool on) { g_scenes = on; note("fast scene changes", on); }
 
 bool move_speed() { return g_move.load(std::memory_order_relaxed); }
 void set_move_speed(bool on) { g_move = on; note("run/swim speed", on); }

@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
         assert(save_setup_run("acceptance",false,error)&&pending_setup_runs().empty());
         assert(setup_steps("acceptance")[0].satisfied&&setup_steps("acceptance")[1].satisfied);
         // Declarative packages also bind approval to the exact manifest, even at the same version.
-        manifest["id"]="settings-acceptance";manifest["kind"]="settings";manifest["settings"]["wall-climb"]=true;
+        manifest["id"]="settings-acceptance";manifest["kind"]="settings";manifest["settings"]["move-speed"]=true;
         manifest["setup"].array.pop_back();
         std::ofstream(root/"source/manifest.json")<<mods::json::dump(manifest);
         assert(install((root/"source").string(),error));
@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
         fs::create_directories(root/"source");
         env("WWHD_NO_HOST_INPUT","1");env("WWHD_MOD_MANAGER_DIR",(root/"manager").string().c_str());
         initialize();std::string error;
-        std::ofstream(root/"source/manifest.json")<<R"({"format_version":1,"id":"gc-fixture","name":"GC fixture","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"wall-climb":true},"setup":[{"id":"game","type":"game_path","game":"gc_wind_waker","title":"GameCube game"}]})";
+        std::ofstream(root/"source/manifest.json")<<R"({"format_version":1,"id":"gc-fixture","name":"GC fixture","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"move-speed":true},"setup":[{"id":"game","type":"game_path","game":"gc_wind_waker","title":"GameCube game"}]})";
         assert(install((root/"source").string(),error));
         assert(game_source().path.empty()&&!game_source().valid);
         assert(!setup_steps("gc-fixture")[0].satisfied);
@@ -117,10 +117,11 @@ int main(int argc, char** argv) {
         assert(!view("gc-fixture").enabled&&select_profile("Copy",error)&&!view("gc-fixture").enabled);
         assert(enable("gc-fixture",true,error));
         fs::create_directories(root/"second");
-        std::ofstream(root/"second/manifest.json")<<R"({"format_version":1,"id":"gc-second","name":"GC second","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"direct-camera":true},"setup":[{"id":"game","type":"game_path","game":"gc_wind_waker","title":"GameCube game"}]})";
+        std::ofstream(root/"second/manifest.json")<<R"({"format_version":1,"id":"gc-second","name":"GC second","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"fast-forward":true},"setup":[{"id":"game","type":"game_path","game":"gc_wind_waker","title":"GameCube game"}]})";
         assert(install((root/"second").string(),error)&&enable("gc-second",true,error));
+        assert(enable("gc-second",false,error));  // frees fast-forward for gc-dependent (two settings mods remain)
         fs::create_directories(root/"dependent");
-        std::ofstream(root/"dependent/manifest.json")<<R"({"format_version":1,"id":"gc-dependent","name":"GC dependent","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"quick-doors":true},"dependencies":[{"id":"gc-fixture"}]})";
+        std::ofstream(root/"dependent/manifest.json")<<R"({"format_version":1,"id":"gc-dependent","name":"GC dependent","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"fast-forward":true},"dependencies":[{"id":"gc-fixture"}]})";
         assert(install((root/"dependent").string(),error)&&enable("gc-dependent",true,error));
         assert(view("gc-dependent").game_source_warning.empty());
         fs::remove(other);assert(!game_source().valid&&!view("gc-fixture").game_source_warning.empty());
@@ -131,8 +132,7 @@ int main(int argc, char** argv) {
         assert(enable("gc-dependent",false,error));
         // Losing a shared copy must not trap multiple enabled mods in their on state.
         assert(enable("gc-fixture",false,error));
-        assert(!view("gc-fixture").enabled&&view("gc-second").enabled);
-        assert(enable("gc-second",false,error)&&!view("gc-second").enabled);
+        assert(!view("gc-fixture").enabled&&!view("gc-second").enabled);  // gc-second was turned off above
         assert(set_game_source("gc_wind_waker","",error)&&game_source().path.empty());
         assert(!setup_steps("gc-fixture")[0].satisfied&&!view("gc-fixture").enabled);
         {std::ifstream in(root/"manager/profiles.json");auto saved=mods::json::parse(std::string{std::istreambuf_iterator<char>(in),{}});
@@ -514,25 +514,25 @@ int main(int argc, char** argv) {
     env("WWHD_MOD_MANAGER_DIR",(root/"storage").string().c_str());
     initialize();
     std::string error;
-    auto package=[&](const char* id, const char* extra, const char* setting="wall-climb") {
+    auto package=[&](const char* id, const char* extra, const char* setting="move-speed") {
         auto path=root/id;fs::create_directories(path);
         std::ofstream(path/"manifest.json") << "{\"format_version\":1,\"id\":\"" << id
           << "\",\"name\":\"" << id << "\",\"version\":\"1.0.0\",\"game_id\":\"wwhd-usa\","
           << "\"kind\":\"settings\",\"settings\":{\"" << setting << "\":true}" << extra << "}";
         return path.string();
     };
-    assert(install(package("climb-preset",""),error));
-    assert(list().size()==1 && list()[0].id=="climb-preset");
-    assert(list()[0].native_confirmed && unconfirmed_native("climb-preset").empty()); // settings presets never ask
-    assert(enable("climb-preset",true,error));frame(1);assert(state[3] && list()[0].active);
-    assert(!remove("climb-preset",error));
-    assert(enable("climb-preset",false,error));frame(2);assert(!state[3]);
+    assert(install(package("speed-preset",""),error));
+    assert(list().size()==1 && list()[0].id=="speed-preset");
+    assert(list()[0].native_confirmed && unconfirmed_native("speed-preset").empty()); // settings presets never ask
+    assert(enable("speed-preset",true,error));frame(1);assert(state[3] && list()[0].active);
+    assert(!remove("speed-preset",error));
+    assert(enable("speed-preset",false,error));frame(2);assert(!state[3]);
     mods::set_fast_forward_rate(3); mods::set_fast_forward_button(0x20); mods::set_fast_forward_mute(false);
     remember_option("fast-forward.rate", 3); remember_option("fast-forward.button", 0x20); remember_option("fast-forward.mute", 0);
     assert(create_profile("Adventure",error));
     mods::set_fast_forward_rate(4); mods::set_fast_forward_button(0x80); mods::set_fast_forward_mute(true);
     remember_option("fast-forward.rate", 4); remember_option("fast-forward.button", 0x80); remember_option("fast-forward.mute", 1);
-    assert(enable("climb-preset",true,error));frame(20);assert(state[3]);
+    assert(enable("speed-preset",true,error));frame(20);assert(state[3]);
     assert(select_profile("Adventure",error));frame(21);assert(!state[3]);
     assert(mods::fast_forward_rate()==3 && mods::fast_forward_button()==0x20 && !mods::fast_forward_mute());
     assert(current_profile()=="Adventure");assert(!delete_profile("Adventure",error));
@@ -541,12 +541,12 @@ int main(int argc, char** argv) {
     assert(!enable("missing-dep",true,error));
     assert(remove("missing-dep",error));
     assert(install(package("cycle-a",",\"dependencies\":[{\"id\":\"cycle-b\"}]"),error));
-    assert(install(package("cycle-b",",\"dependencies\":[{\"id\":\"cycle-a\"}]","quick-doors"),error));
+    assert(install(package("cycle-b",",\"dependencies\":[{\"id\":\"cycle-a\"}]","fast-forward"),error));
     assert(!enable("cycle-a",true,error));assert(error.find("cycle")!=std::string::npos);
     assert(remove("cycle-a",error));assert(remove("cycle-b",error));
-    assert(install(package("conflicting",",\"conflicts\":[\"climb-preset\"]","quick-doors"),error));
+    assert(install(package("conflicting",",\"conflicts\":[\"speed-preset\"]","fast-forward"),error));
     assert(!enable("conflicting",true,error));assert(remove("conflicting",error));
-    assert(install(package("typed",R"(,"options":[{"id":"toggle","name":"Toggle","type":"bool","default":false},{"id":"rate","name":"Rate","type":"number","min":1,"max":10,"default":2},{"id":"mode","name":"Mode","type":"enum","choices":["a","b"],"default":"a"}])","quick-doors"),error));
+    assert(install(package("typed",R"(,"options":[{"id":"toggle","name":"Toggle","type":"bool","default":false},{"id":"rate","name":"Rate","type":"number","min":1,"max":10,"default":2},{"id":"mode","name":"Mode","type":"enum","choices":["a","b"],"default":"a"}])","fast-forward"),error));
     assert(configure("typed","toggle",true,error));assert(!configure("typed","toggle",1,error));
     assert(configure("typed","rate",5,error));assert(!configure("typed","rate",11,error));
     assert(configure("typed","mode","b",error));assert(!configure("typed","mode","c",error));
@@ -567,7 +567,7 @@ int main(int argc, char** argv) {
     assert(!enable("fixture",true,error));assert(error.find("native code")!=std::string::npos);
     frame(3);assert(!find().active && !find().enabled);
     // A settings preset that requires the native package names it in the confirmation.
-    assert(install(package("needs-native",",\"dependencies\":[{\"id\":\"fixture\"}]","fast-scenes"),error));
+    assert(install(package("needs-native",",\"dependencies\":[{\"id\":\"fixture\"}]","fast-forward"),error));
     pending=unconfirmed_native("needs-native");assert(pending.size()==1 && pending[0].first=="fixture");
     assert(!enable("needs-native",true,error));assert(remove("needs-native",error));
     // Test aid: pre-confirmed only in isolated test runs, and never written to profiles.json.
@@ -575,7 +575,7 @@ int main(int argc, char** argv) {
     env("WWHD_TEST_TRUST_NATIVE_MODS",nullptr);assert(!find().native_confirmed && trusted().empty());
     assert(confirm_native("fixture",error));assert(trusted().size()==64);
     assert(find().native_confirmed && unconfirmed_native("fixture").empty());
-    assert(!confirm_native("climb-preset",error));
+    assert(!confirm_native("speed-preset",error));
     assert(enable("fixture",true,error));frame(6);
     assert(find().active && find().status=="initial");
     assert(configure("fixture","label","changed",error));frame(4);assert(find().status=="changed");
@@ -606,12 +606,12 @@ int main(int argc, char** argv) {
     // Removing forgets the confirmation; reinstalling asks again.
     assert(remove("fixture",error));assert(trusted().empty());
     assert(install(native.string(),error));assert(!find().native_confirmed);
-    assert(remove("fixture",error));assert(enable("climb-preset",false,error));frame(30);assert(remove("climb-preset",error));
+    assert(remove("fixture",error));assert(enable("speed-preset",false,error));frame(30);assert(remove("speed-preset",error));
     assert(list().empty());
     // A settings/content package can ship a preparation tool: the same confirmation
     // covers the whole package, so changed imported helpers also invalidate trust.
     auto toolpkg=root/"SetupFixture";fs::create_directories(toolpkg/"tools");
-    std::ofstream(toolpkg/"manifest.json")<<R"({"format_version":1,"id":"setup-fixture","name":"Setup fixture","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"wall-climb":true},"setup":[{"id":"prepare","type":"run_tool","title":"Prepare fixture","tool":"tools/prepare.py","arguments":["{data}","{game:gc_usa}"],"outputs":["result.bin"]}]})";
+    std::ofstream(toolpkg/"manifest.json")<<R"({"format_version":1,"id":"setup-fixture","name":"Setup fixture","version":"1.0.0","game_id":"wwhd-usa","kind":"settings","settings":{"move-speed":true},"setup":[{"id":"prepare","type":"run_tool","title":"Prepare fixture","tool":"tools/prepare.py","arguments":["{data}","{game:gc_usa}"],"outputs":["result.bin"]}]})";
     std::ofstream(toolpkg/"tools"/"prepare.py")<<"# synthetic preparation tool\n";
     std::ofstream(toolpkg/"tools"/"helper.py")<<"# synthetic helper\n";
     assert(install(toolpkg.string(),error));assert(!view("setup-fixture").native_confirmed);

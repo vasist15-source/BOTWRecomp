@@ -1,7 +1,6 @@
 #include "manager.h"
 #include "packages.h"
 #include "mods.h"
-#include "climb.h"
 #include "../overlay/hostui.h"
 #include <cstdlib>
 #include <cmath>
@@ -10,30 +9,12 @@
 namespace mods::manager {
 namespace {
 const Entry catalogue[] = {
-    {"direct-camera", "Direct right-stick camera", "Camera",
-     "Turn the camera immediately with the right stick, without the original easing.",
-     "WWHD_MOD_DIRECT_CAMERA", direct_camera, set_direct_camera},
-    {"mouse-camera", "Mouse camera", "Camera",
-     "Click the game picture to capture the mouse. Move it to look around; Esc releases it.",
-     "WWHD_MOD_MOUSE_CAMERA", mouse_camera, set_mouse_camera},
-    {"first-person", "First-person shortcut", "Camera",
-     "Enter first person with R3 or the mouse wheel.",
-     "WWHD_MOD_FIRST_PERSON", first_person_wheel, set_first_person_wheel},
-    {"wall-climb", "Climb any wall", "Gameplay",
-     "Grab and climb walls using a stamina wheel. A or B lets go.",
-     "WWHD_CLIMB", climb_enabled, set_climb_enabled},
-    {"quick-doors", "Quick doors", "Gameplay",
-     "Run door-opening and closing events at four times their normal speed.",
-     "WWHD_MOD_QUICK_DOORS", quick_doors, set_quick_doors},
     {"move-speed", "Run/swim speed", "Gameplay",
      "Hold the selected button to run or swim faster. Default: L3 (rebind it in Controls).",
      "WWHD_MOD_MOVE_SPEED", move_speed, set_move_speed},
     {"fast-forward", "Fast forward cutscenes and dialogue", "Gameplay",
      "Hold the selected button during events to play faster. Choices still wait for input.",
      "WWHD_MOD_FAST_FORWARD", fast_forward, set_fast_forward},
-    {"fast-scenes", "Fast scene changes", "Gameplay",
-     "Speed up fades and scene transitions while keeping ordinary gameplay at normal speed.",
-     "WWHD_MOD_FAST_SCENES", fast_scenes, set_fast_scenes},
 };
 std::string key(const Entry& entry) { return std::string("mod.")+entry.id+".enabled"; }
 bool player_preferences() { return !std::getenv("WWHD_NO_HOST_INPUT"); }
