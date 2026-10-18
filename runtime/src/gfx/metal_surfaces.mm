@@ -1691,7 +1691,16 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out
     const uint32_t pitch = info.pitch, height = info.height;
     const auto tm = (Latte::E_HWTILEMODE)info.hwTileMode;
     const uint32_t bpp = f.bytesPerBlock * 8;
-    const uint32_t pipeSwizzle = (s->swizzle >> 8) & 1, bankSwizzle = (s->swizzle >> 9) & 3;
+    // levels 1 on come from the mip pointer, which carries its own swizzle in bits 8-10 (as the base pointer
+    // does); GX2 normally gives both the same one
+    const uint32_t swz = level > 0 && s->mipAddr ? (s->mipAddr & 0x700) : s->swizzle;
+    if (swz != s->swizzle && Latte::TM_IsMacroTiled((Latte::E_HWTILEMODE)s->tileMode)) {
+        static int logged = 0;
+        if (logged++ < 10)
+            LOG("[tc] %08X %ux%u f%X: mip chain swizzle %X differs from the base level's %X", s->addr, s->width, s->height, s->format, swz,
+                s->swizzle);
+    }
+    const uint32_t pipeSwizzle = (swz >> 8) & 1, bankSwizzle = (swz >> 9) & 3;
     // small mips of macro-tiled surfaces drop the swizzle
     const uint8_t* src = mem::ptr(base);
     const uint32_t eb = f.bytesPerBlock;
