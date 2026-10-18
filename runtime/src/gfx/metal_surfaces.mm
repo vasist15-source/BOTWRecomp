@@ -1576,9 +1576,10 @@ static const std::vector<std::pair<uint32_t, uint32_t>>& level_ranges(Surface* s
         uint32_t base;
         if (level == 0) base = s->addr;
         else if (!s->mipAddr) break;
-        else if (level == 1) base = s->mipAddr;
         else {
-            // mip offsets relative to the mip chain start
+            // mip offsets relative to the mip chain start; for level 1 too: a macro-tiled mip chain keeps its
+            // swizzle in the mip pointer's bits 8-10, which the address library strips (taken raw, level 1 was
+            // read up to 0x700 bytes off: zeros or neighbouring data, the black cards on Kakariko's roofs)
             uint32_t sliceOffset = 0, sliceSize = 0;
             sint32 sub = 0;
             LatteAddrLib::CalculateMipAndSliceAddr(s->addr, s->mipAddr, (Latte::E_GX2SURFFMT)s->format, s->width, s->height,
