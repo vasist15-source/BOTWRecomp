@@ -2639,10 +2639,10 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     R.drawCount++;
     extern uint32_t g_draws_since_commit;
     g_draws_since_commit++;
-    DLOG("[draw] prim %X count %u idx %u@%08X VS %08X PS %08X CB0 %08X info %08X DB %08X depthctl %08X blend %08X mask %08X",
+    DLOG("[draw] prim %X count %u idx %u@%08X VS %08X PS %08X CB0 %08X info %08X DB %08X depthctl %08X blend %08X mask %08X clip %08X cull %08X",
          prim, count, indexType, indexAddr, regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, regs[mmCB_COLOR0_BASE],
          regs[mmCB_COLOR0_INFO], regs[mmDB_DEPTH_BASE], regs[REGADDR::DB_DEPTH_CONTROL], regs[REGADDR::CB_COLOR_CONTROL],
-         regs[REGADDR::CB_TARGET_MASK]);
+         regs[REGADDR::CB_TARGET_MASK], regs[REGADDR::PA_CL_CLIP_CNTL], regs[REGADDR::PA_SU_SC_MODE_CNTL]);
     for (int i = 1; i < 8; i++)  // the other colour targets the mask writes
         if ((regs[REGADDR::CB_TARGET_MASK] >> (i * 4)) & 0xF)
             DLOG("[draw]   CB%d %08X info %08X", i, regs[mmCB_COLOR0_BASE + i], regs[mmCB_COLOR0_INFO + i]);
@@ -3128,6 +3128,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     static uint32_t dumpPS = getenv("WWHD_DUMP_PS") ? (uint32_t)strtoul(getenv("WWHD_DUMP_PS"), nullptr, 16) : 0;
     bool psMatch = dumpPS && log_this_frame() && (regs[mmSQ_PGM_START_PS] << 8) == dumpPS;
     if (psMatch) {
+        g_log_uniforms = true;  // both stages' remapped uniforms in draws.log (bind_stage)
         uint32_t vb = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START];
         uint32_t stride = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + 2] >> 11) & 0xFFFF;
         LOG("[dbg] vb %08X stride %u: (%f %f %f) (%f %f %f) (%f %f %f)", vb, stride, bitsf_(ld32(vb)), bitsf_(ld32(vb + 4)),
@@ -3153,10 +3154,11 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         snprintf(name, sizeof name, "ps_%08X_%llu.png", dumpPS, (unsigned long long)thisDraw);
         for (auto* c : colors) if (c) { dump_texture(c->tex, name, false, false); break; }
     }
-    // F12 capture: the main depth buffer's value at the screen centre after every draw that has it bound
+    // F12 capture: the main depth buffer's (and the probed address's) value at the screen centre after every draw that has it bound
     // (captures/<time>/depthprobe.log: draw, shaders, value), to find which draw writes a surface there.
     // Ends the pass after each such draw in the captured frame only.
-    if (capturing() && depth && depth->tex && depth->width == 1280 && depth->height == 720 && !depth->tex.isFramebufferOnly) {
+    if (capturing() && depth && depth->tex && ((depth->width == 1280 && depth->height == 720) || depth->addr == probe_addr()) &&
+        !depth->tex.isFramebufferOnly) {
         static id<MTLBuffer> probe = nil;
         static uint32_t slot = 0;
         static uint64_t probeFrame = ~0ull;
@@ -3175,6 +3177,26 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                           toBuffer:probe destinationOffset:off destinationBytesPerRow:16 destinationBytesPerImage:16
                            options:pf == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone];
                 [b endEncoding];
+                // the probed depth attachment, whole, once per capture at its first draw (raw floats, row-major)
+                static std::string dumpedDir;
+                if (depth->addr == probe_addr() && dumpedDir != g_capture_dir) {
+                    dumpedDir = g_capture_dir;
+                    const NSUInteger dw = depth->tex.width, dh = depth->tex.height;
+                    id<MTLBuffer> full = [R.device newBufferWithLength:dw * dh * 4 options:MTLResourceStorageModeShared];
+                    id<MTLBlitCommandEncoder> fb = [command_buffer() blitCommandEncoder];
+                    [fb copyFromTexture:depth->tex sourceSlice:depthSlice sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                             sourceSize:MTLSizeMake(dw, dh, 1) toBuffer:full destinationOffset:0 destinationBytesPerRow:dw * 4
+                  destinationBytesPerImage:dw * dh * 4
+                                options:pf == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone];
+                    [fb endEncoding];
+                    char fn[300];
+                    snprintf(fn, sizeof fn, "%s/depthattach_%08X_draw%llu_%lux%lu.raw", g_capture_dir.c_str(), depth->addr,
+                             (unsigned long long)thisDraw, (unsigned long)dw, (unsigned long)dh);
+                    std::string fns = fn;
+                    [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+                        if (FILE* f = fopen(fns.c_str(), "wb")) { fwrite(full.contents, 1, dw * dh * 4, f); fclose(f); }
+                    }];
+                }
                 std::string file = g_capture_dir + "/depthprobe.log";
                 char meta[200];
                 snprintf(meta, sizeof meta, "draw %llu VS %08X PS %08X count %u DB %08X tex %lux%lu depthctl %08X CB0 %08X",
