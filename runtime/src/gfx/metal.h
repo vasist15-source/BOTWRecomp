@@ -163,6 +163,40 @@ void time_render_pass(MTLRenderPassDescriptor* rp, const char* file, int line);
 #define TIMED_BLIT() timed_blit_encoder(__FILE_NAME__, __LINE__)
 void end_encoder();
 
+// Encoding thread (metal_main.mm). The render thread prepares draws and queues their encoder calls
+// (q_*); a second thread makes the Metal calls. R.enc and R.cmd belong to the encoding thread while
+// work is queued: render-thread code that touches them (command_buffer(), end_encoder(), flush(),
+// wait_idle()) waits for the queue to drain first (enc_sync), so blits, uploads, readbacks and
+// presentation run as before. Direct mode (WWHD_ENCODE_THREAD=0, F12 captures, pass timing) makes
+// every q_* call at once on the render thread.
+void enc_sync();
+void enc_set_direct(bool direct);  // per draw: captures and pass timing need direct mode
+bool enc_pass_open();              // the render thread's view: a render pass is open (queued or real)
+struct RasterState {
+    uint32_t stencilFront, stencilBack;
+    float blend[4];
+    uint8_t cull, winding, clip, viewport;  // viewport: set the viewport (draws with attachments)
+    float bias[3];                          // depth bias: offset, slope scale, clamp
+    MTLViewport vp;
+    MTLScissorRect scissor;
+};
+void q_begin_pass(MTLRenderPassDescriptor* rp);
+void q_end_pass();  // ends the open pass; may commit the command buffer (chunked submission)
+void q_pipeline(id<MTLRenderPipelineState> p);
+void q_depth_state(id<MTLDepthStencilState> d);
+void q_raster(const RasterState& r);
+void q_texture(bool vertex, id<MTLTexture> t, uint32_t i);
+void q_sampler(bool vertex, id<MTLSamplerState> s, uint32_t i);
+void q_buffer(bool vertex, id<MTLBuffer> b, NSUInteger off, uint32_t i);
+void q_buffer_offset(bool vertex, NSUInteger off, uint32_t i);
+void q_bytes(bool vertex, const void* data, uint32_t n, uint32_t i);
+void q_draw(MTLPrimitiveType t, uint32_t start, uint32_t count, uint32_t instances);
+void q_draw_indexed(MTLPrimitiveType t, uint32_t count, MTLIndexType it, id<MTLBuffer> ib, NSUInteger off, uint32_t instances,
+                    int32_t baseVertex, uint32_t baseInstance);
+void q_vertex_barrier();  // stream out: buffer writes of the vertex stage visible to later draws
+void q_visibility(MTLVisibilityResultMode mode, NSUInteger offset);
+void q_command_buffer(void (^block)(id<MTLCommandBuffer>));  // runs on the encoding thread with the current command buffer
+
 // guest memory -> (buffer, offset); returns nil if the address is not GPU-visible
 id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset);
 

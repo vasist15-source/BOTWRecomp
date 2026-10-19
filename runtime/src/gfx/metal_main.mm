@@ -1,5 +1,7 @@
 #include <map>
 #include <deque>
+#include <thread>
+#include <pthread.h>
 #include <chrono>
 #include "perf_metrics.h"
 #include "gfx/capture_schedule.h"
@@ -160,15 +162,18 @@ static void read_gpu_times() {
         g_gpu_fifo.pop_front();
     }
 }
-static id<MTLCommandBuffer> raw_command_buffer() {
+static thread_local bool t_encoder_thread = false;  // the encoding thread (see "encoding thread" below)
+// the render thread's view of the command buffer being filled: it has work (queued or encoded) since
+// g_cmd_created_ns; chunked commits are decided from these, on the render thread
+static bool g_cmd_pending = false;
+static id<MTLCommandBuffer> raw_command_buffer(uint64_t frame = R.frame) {
     if (!R.cmd) {
         read_gpu_times();
         R.cmd = [R.queue commandBuffer];
-        g_cmd_created_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        commandFrame = R.frame;
+        commandFrame = frame;
         static const bool ftrace = getenv("WWHD_FRAME_TRACE") != nullptr;
         if (ftrace) {
-            const uint64_t swapNo = R.frame + 1;  // the swap this command buffer's work belongs to
+            const uint64_t swapNo = frame + 1;  // the swap this command buffer's work belongs to
             [R.cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
                                 // GPUStartTime counts mach_absolute_time (no sleep), steady_clock counts sleep too: shift by now's difference
                 const int64_t off = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() -
@@ -181,6 +186,15 @@ static id<MTLCommandBuffer> raw_command_buffer() {
         }
     }
     return R.cmd;
+}
+static int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void note_cmd_work() {  // render thread: the command buffer being filled gets work
+    if (!g_cmd_pending) {
+        g_cmd_pending = true;
+        g_cmd_created_ns = now_ns();
+    }
 }
 
 // ---------------------------------------------------------------- deferred clears
@@ -260,40 +274,51 @@ void take_pending_clear(MTLRenderPassDescriptor* rp, int colorIndex, id<MTLTextu
 }
 
 id<MTLCommandBuffer> command_buffer() {
+    if (t_encoder_thread) return raw_command_buffer();
+    enc_sync();
     flush_pending_clears();
+    note_cmd_work();
     return raw_command_buffer();
 }
 
 uint32_t g_draws_since_commit = 0;
 static void track_gpu_time(id<MTLCommandBuffer> cb) { g_gpu_fifo.push_back({cb, commandFrame}); }
+void pool_retire(id<MTLCommandBuffer> cmd);
+std::vector<id<MTLBuffer>>* pool_take_used();
+void pool_attach(id<MTLCommandBuffer> cmd, std::vector<id<MTLBuffer>>* used);
+static bool g_pass_open = false;  // render thread: a pass is open (queued or real)
+bool enc_pass_open() { return g_pass_open; }
+
+// submit work in chunks so the GPU starts while the frame is still being built (like the hardware
+// command processor), instead of all at once on swap
+// WWHD_COMMIT_DRAWS (default 16) and WWHD_COMMIT_US (default 500) set how much is held: committing
+// early lets the GPU start on a frame while the rest is still encoded (the GPU idled ~5 ms a frame)
+static bool chunk_commit_due() {
+    static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
+    static const uint32_t commitDraws = getenv("WWHD_COMMIT_DRAWS") ? (uint32_t)atoi(getenv("WWHD_COMMIT_DRAWS")) : 16;
+    static const int64_t commitNs = getenv("WWHD_COMMIT_US") ? atoll(getenv("WWHD_COMMIT_US")) * 1000 : 500000;
+    return chunked && g_cmd_pending && g_draws_since_commit > 0 &&
+           (g_draws_since_commit >= commitDraws || (commitNs && now_ns() - g_cmd_created_ns >= commitNs));
+}
 
 void end_encoder() {
+    enc_sync();
     if (R.enc) {
         [R.enc endEncoding];
         R.enc = nil;
-        // submit work in chunks so the GPU starts while the frame is still being built (like the
-        // hardware command processor), instead of all at once on swap
-        // WWHD_COMMIT_DRAWS (default 16) and WWHD_COMMIT_US (default 500) set how much is held: committing
-        // early lets the GPU start on a frame while the rest is still encoded (the GPU idled ~5 ms a frame)
-        static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
-        static const uint32_t commitDraws = getenv("WWHD_COMMIT_DRAWS") ? (uint32_t)atoi(getenv("WWHD_COMMIT_DRAWS")) : 16;
-        static const int64_t commitNs = getenv("WWHD_COMMIT_US") ? atoll(getenv("WWHD_COMMIT_US")) * 1000 : 500000;
-        const int64_t nowNs = commitNs ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
-        if (chunked && R.cmd && g_draws_since_commit > 0 &&
-            (g_draws_since_commit >= commitDraws || (commitNs && nowNs - g_cmd_created_ns >= commitNs))) {
-            void pool_retire(id<MTLCommandBuffer> cmd);
+        if (R.cmd && chunk_commit_due()) {
             pool_retire(R.cmd);
             track_gpu_time(R.cmd);
             [R.cmd commit];
             R.cmd = nil;
+            g_cmd_pending = false;
             g_draws_since_commit = 0;
         }
     }
+    g_pass_open = false;
     for (auto& c : R.passColor) c = nullptr;
     R.passDepth = nullptr;
 }
-
-void pool_retire(id<MTLCommandBuffer> cmd);
 
 void flush() {
     end_encoder();
@@ -304,6 +329,7 @@ void flush() {
         [R.cmd commit];
         R.cmd = nil;
     }
+    g_cmd_pending = false;
 }
 
 void wait_idle() {
@@ -316,6 +342,359 @@ void wait_idle() {
         R.cmd = nil;
         [c waitUntilCompleted];
     }
+    g_cmd_pending = false;
+}
+
+// ---------------------------------------------------------------- encoding thread
+// Draws are prepared on the render thread (shader, pipeline and texture lookups, uniform snapshots,
+// register state) and their encoder calls are queued here as compact records; this thread makes the
+// Metal calls (pass creation, state, draws, chunked commits), which were a third of the render
+// thread's time. The two run in parallel, so the game's GX2DrawDone waits less.
+// Ownership: while records are queued, R.enc and R.cmd belong to the encoding thread. Render-thread
+// code that touches them goes through command_buffer() / end_encoder() / flush() / wait_idle(),
+// which drain the queue first (enc_sync), so every rarer path (uploads, blits, copies, readbacks,
+// presentation, captures) runs unchanged. The upload pool is retired on the render thread when it
+// queues a commit, so buffers are recycled in submission order.
+// Objects in records are retained when queued and released when executed (nothing is freed under
+// a queued draw, and the bind cache's pointer comparisons stay valid).
+// WWHD_ENCODE_THREAD=0: every call is made at once on the render thread, as before.
+namespace {
+enum : uint16_t { EQ_WRAP = 1, EQ_BEGIN, EQ_END, EQ_PIPE, EQ_DSS, EQ_RASTER, EQ_TEX, EQ_SMP, EQ_BUF, EQ_BUFOFF, EQ_BYTES, EQ_DRAW,
+                  EQ_DRAWIDX, EQ_BARRIER, EQ_VIS, EQ_BLOCK };
+struct EqHdr { uint16_t type, pad; uint32_t size; };  // size: header + payload, a multiple of 16
+struct EqBegin { void* rp; uint64_t frame; };
+struct EqEnd { uint8_t commit; std::vector<id<MTLBuffer>>* used; };
+struct EqObj { void* obj; };
+struct EqBind { uint8_t vertex; uint32_t index; void* obj; NSUInteger off; };
+struct EqBytes { uint8_t vertex; uint32_t index, n; };  // followed by n bytes
+struct EqDraw { MTLPrimitiveType type; uint32_t start, count, instances; };
+struct EqDrawIdx { MTLPrimitiveType type; uint32_t count; MTLIndexType itype; void* ib; NSUInteger off; uint32_t instances; int32_t baseVertex; uint32_t baseInstance; };
+struct EqVis { MTLVisibilityResultMode mode; NSUInteger off; };
+
+constexpr uint64_t kEqRing = 16ull << 20;
+uint8_t* g_eq_ring = nullptr;
+std::atomic<uint64_t> g_eq_wpos{0};  // published by the render thread
+std::atomic<uint64_t> g_eq_rpos{0};  // executed by the encoding thread
+uint64_t g_eq_wlocal = 0;            // render thread: written, maybe not yet published
+bool g_eq_direct_draw = false;       // render thread: this draw needs direct mode (capture, pass timing)
+std::atomic<uint64_t> g_eq_syncs{0}, g_eq_records{0}, g_eq_enc_cpu_ns{0}, g_eq_sync_ns{0};
+uint64_t g_eq_frame = 0;             // encoding thread: frame of the latest pass (new command buffers)
+
+// encoding thread: last rasterizer state set on R.enc (sets are skipped when unchanged)
+RasterState g_eq_raster;
+bool g_eq_raster_valid = false;
+
+bool eq_enabled() {
+    static const bool on = !getenv("WWHD_ENCODE_THREAD") || atoi(getenv("WWHD_ENCODE_THREAD")) != 0;
+    return on;
+}
+bool eq_direct() { return !eq_enabled() || g_eq_direct_draw; }
+
+void eq_apply_raster(const RasterState& r) {
+    id<MTLRenderCommandEncoder> e = R.enc;
+    if (!e) return;
+    const RasterState l = g_eq_raster;
+    const bool v = g_eq_raster_valid;
+    if (!v || l.stencilFront != r.stencilFront || l.stencilBack != r.stencilBack)
+        [e setStencilFrontReferenceValue:r.stencilFront backReferenceValue:r.stencilBack];
+    if (!v || memcmp(l.blend, r.blend, sizeof r.blend)) [e setBlendColorRed:r.blend[0] green:r.blend[1] blue:r.blend[2] alpha:r.blend[3]];
+    if (!v || l.cull != r.cull) [e setCullMode:(MTLCullMode)r.cull];
+    if (!v || l.winding != r.winding) [e setFrontFacingWinding:(MTLWinding)r.winding];
+    if (!v || memcmp(l.bias, r.bias, sizeof r.bias)) [e setDepthBias:r.bias[0] slopeScale:r.bias[1] clamp:r.bias[2]];
+    if (!v || l.clip != r.clip) [e setDepthClipMode:(MTLDepthClipMode)r.clip];
+    if (r.viewport && (!v || !l.viewport || memcmp(&l.vp, &r.vp, sizeof r.vp))) [e setViewport:r.vp];
+    if (!v || memcmp(&l.scissor, &r.scissor, sizeof r.scissor)) [e setScissorRect:r.scissor];
+    g_eq_raster = r;
+    if (!r.viewport) {  // the viewport was not set: keep what is set
+        g_eq_raster.viewport = v && l.viewport;
+        g_eq_raster.vp = l.vp;
+    }
+    g_eq_raster_valid = true;
+}
+
+// makes one record's Metal call (encoding thread, or the render thread in direct mode)
+void eq_exec(uint16_t type, const uint8_t* p) {
+    switch (type) {
+    case EQ_BEGIN: {
+        auto& b = *(const EqBegin*)p;
+        MTLRenderPassDescriptor* rp = (__bridge_transfer MTLRenderPassDescriptor*)b.rp;
+        g_eq_frame = b.frame;
+        R.enc = [raw_command_buffer(b.frame) renderCommandEncoderWithDescriptor:rp];
+        g_eq_raster_valid = false;
+        break;
+    }
+    case EQ_END: {
+        auto& e = *(const EqEnd*)p;
+        if (R.enc) {
+            [R.enc endEncoding];
+            R.enc = nil;
+        }
+        if (e.commit) {
+            if (R.cmd) {
+                pool_attach(R.cmd, e.used);
+                track_gpu_time(R.cmd);
+                [R.cmd commit];
+                R.cmd = nil;
+            } else pool_attach(nil, e.used);
+        }
+        break;
+    }
+    case EQ_PIPE: [R.enc setRenderPipelineState:(__bridge_transfer id<MTLRenderPipelineState>)((const EqObj*)p)->obj]; break;
+    case EQ_DSS: [R.enc setDepthStencilState:(__bridge_transfer id<MTLDepthStencilState>)((const EqObj*)p)->obj]; break;
+    case EQ_RASTER: eq_apply_raster(*(const RasterState*)p); break;
+    case EQ_TEX: {
+        auto& b = *(const EqBind*)p;
+        id<MTLTexture> t = (__bridge_transfer id<MTLTexture>)b.obj;
+        if (b.vertex) [R.enc setVertexTexture:t atIndex:b.index];
+        else [R.enc setFragmentTexture:t atIndex:b.index];
+        break;
+    }
+    case EQ_SMP: {
+        auto& b = *(const EqBind*)p;
+        id<MTLSamplerState> s = (__bridge_transfer id<MTLSamplerState>)b.obj;
+        if (b.vertex) [R.enc setVertexSamplerState:s atIndex:b.index];
+        else [R.enc setFragmentSamplerState:s atIndex:b.index];
+        break;
+    }
+    case EQ_BUF: {
+        auto& b = *(const EqBind*)p;
+        id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)b.obj;
+        if (b.vertex) [R.enc setVertexBuffer:buf offset:b.off atIndex:b.index];
+        else [R.enc setFragmentBuffer:buf offset:b.off atIndex:b.index];
+        break;
+    }
+    case EQ_BUFOFF: {
+        auto& b = *(const EqBind*)p;
+        if (b.vertex) [R.enc setVertexBufferOffset:b.off atIndex:b.index];
+        else [R.enc setFragmentBufferOffset:b.off atIndex:b.index];
+        break;
+    }
+    case EQ_BYTES: {
+        auto& b = *(const EqBytes*)p;
+        const uint8_t* data = p + sizeof(EqBytes);
+        if (b.vertex) [R.enc setVertexBytes:data length:b.n atIndex:b.index];
+        else [R.enc setFragmentBytes:data length:b.n atIndex:b.index];
+        break;
+    }
+    case EQ_DRAW: {
+        auto& d = *(const EqDraw*)p;
+        [R.enc drawPrimitives:d.type vertexStart:d.start vertexCount:d.count instanceCount:d.instances];
+        break;
+    }
+    case EQ_DRAWIDX: {
+        auto& d = *(const EqDrawIdx*)p;
+        id<MTLBuffer> ib = (__bridge_transfer id<MTLBuffer>)d.ib;
+        [R.enc drawIndexedPrimitives:d.type indexCount:d.count indexType:d.itype indexBuffer:ib indexBufferOffset:d.off
+                       instanceCount:d.instances baseVertex:d.baseVertex baseInstance:d.baseInstance];
+        break;
+    }
+    case EQ_BARRIER:
+        [R.enc memoryBarrierWithScope:MTLBarrierScopeBuffers afterStages:MTLRenderStageVertex
+                         beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        break;
+    case EQ_VIS: {
+        auto& v = *(const EqVis*)p;
+        [R.enc setVisibilityResultMode:v.mode offset:v.off];
+        break;
+    }
+    case EQ_BLOCK: {
+        void (^block)(id<MTLCommandBuffer>) = (__bridge_transfer void (^)(id<MTLCommandBuffer>))((const EqObj*)p)->obj;
+        block(raw_command_buffer(g_eq_frame));
+        break;
+    }
+    }
+}
+
+uint64_t thread_cpu_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+void eq_thread_main() {
+    t_encoder_thread = true;
+    pthread_setname_np("GX2 encode");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    uint64_t r = g_eq_rpos.load(std::memory_order_relaxed);
+    for (;;) {
+        uint64_t w = g_eq_wpos.load(std::memory_order_acquire);
+        if (r == w) {
+            // caught up: spin briefly (the next record usually follows within microseconds), then sleep
+            for (int i = 0; i < 2000 && (w = g_eq_wpos.load(std::memory_order_acquire)) == r; i++) __builtin_arm_yield();
+            if (w == r) {
+                g_eq_wpos.wait(r, std::memory_order_acquire);
+                continue;
+            }
+        }
+        const uint64_t c0 = thread_cpu_ns();
+        @autoreleasepool {
+            while (r < w) {
+                const uint64_t off = r % kEqRing;
+                const EqHdr* h = (const EqHdr*)(g_eq_ring + off);
+                if (h->type == EQ_WRAP) {
+                    r += kEqRing - off;
+                    continue;
+                }
+                eq_exec(h->type, (const uint8_t*)(h + 1));
+                r += h->size;
+                // published per record: the render thread's sync and space checks see progress at once
+                g_eq_rpos.store(r, std::memory_order_release);
+                g_eq_rpos.notify_one();
+            }
+        }
+        g_eq_enc_cpu_ns += thread_cpu_ns() - c0;
+    }
+}
+
+// render thread: room for a record of `size` bytes (header included); returns where to write it
+uint8_t* eq_reserve(uint32_t size) {
+    static std::once_flag started;
+    std::call_once(started, [] {
+        g_eq_ring = (uint8_t*)aligned_alloc(64, kEqRing);
+        std::thread(eq_thread_main).detach();
+        LOG("[gfx] encoding thread started");
+    });
+    uint64_t off = g_eq_wlocal % kEqRing;
+    if (off + size > kEqRing) {  // records never wrap: skip the rest of the ring
+        auto wait_room = [](uint64_t need) {
+            uint64_t rp;
+            while (need - (rp = g_eq_rpos.load(std::memory_order_acquire)) > kEqRing) g_eq_rpos.wait(rp, std::memory_order_acquire);
+        };
+        wait_room(g_eq_wlocal + sizeof(EqHdr));
+        ((EqHdr*)(g_eq_ring + off))->type = EQ_WRAP;
+        g_eq_wlocal += kEqRing - off;
+        off = 0;
+    }
+    uint64_t rp;
+    while (g_eq_wlocal + size - (rp = g_eq_rpos.load(std::memory_order_acquire)) > kEqRing) {
+        g_eq_wpos.store(g_eq_wlocal, std::memory_order_release);  // let it run to free space
+        g_eq_wpos.notify_one();
+        g_eq_rpos.wait(rp, std::memory_order_acquire);
+    }
+    return g_eq_ring + off;
+}
+void eq_publish() {
+    g_eq_wpos.store(g_eq_wlocal, std::memory_order_release);
+    g_eq_wpos.notify_one();
+    g_eq_records++;
+}
+// queues a record, or makes the call now (direct mode, after the queue drained)
+void eq_submit(uint16_t type, const void* payload, uint32_t n, const void* extra = nullptr, uint32_t extraN = 0) {
+    if (eq_direct()) {
+        enc_sync();
+        if (!extraN) {
+            eq_exec(type, (const uint8_t*)payload);
+        } else {
+            std::vector<uint8_t> tmp(n + extraN);
+            memcpy(tmp.data(), payload, n);
+            memcpy(tmp.data() + n, extra, extraN);
+            eq_exec(type, tmp.data());
+        }
+        return;
+    }
+    const uint32_t size = (uint32_t)((sizeof(EqHdr) + n + extraN + 15) & ~15ull);
+    uint8_t* at = eq_reserve(size);
+    EqHdr* h = (EqHdr*)at;
+    h->type = type;
+    h->size = size;
+    memcpy(at + sizeof(EqHdr), payload, n);
+    if (extraN) memcpy(at + sizeof(EqHdr) + n, extra, extraN);
+    g_eq_wlocal += size;
+    eq_publish();
+}
+}  // namespace
+
+void enc_sync() {
+    if (t_encoder_thread || !g_eq_ring) return;
+    const uint64_t w = g_eq_wlocal;
+    uint64_t r = g_eq_rpos.load(std::memory_order_acquire);
+    if (r >= w) return;
+    const int64_t t0 = now_ns();
+    g_eq_wpos.store(w, std::memory_order_release);
+    g_eq_wpos.notify_one();
+    for (int i = 0; i < 4000 && (r = g_eq_rpos.load(std::memory_order_acquire)) < w; i++) __builtin_arm_yield();
+    while ((r = g_eq_rpos.load(std::memory_order_acquire)) < w) g_eq_rpos.wait(r, std::memory_order_acquire);
+    g_eq_syncs++;
+    g_eq_sync_ns += now_ns() - t0;
+}
+void enc_set_direct(bool direct) {
+    if (direct && !g_eq_direct_draw) enc_sync();
+    g_eq_direct_draw = direct;
+}
+
+void q_begin_pass(MTLRenderPassDescriptor* rp) {
+    if (eq_direct()) {
+        R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+        g_pass_open = R.enc != nil;
+        g_eq_raster_valid = false;
+        return;
+    }
+    if (!g_pending_clears.empty()) {  // clears not folded into this pass are encoded before it, in order
+        enc_sync();
+        flush_pending_clears();
+    }
+    note_cmd_work();
+    g_pass_open = true;
+    EqBegin b{(__bridge_retained void*)rp, R.frame};
+    eq_submit(EQ_BEGIN, &b, sizeof b);
+}
+void q_end_pass() {
+    if (eq_direct()) {
+        end_encoder();
+        return;
+    }
+    if (g_pass_open) {
+        g_pass_open = false;
+        EqEnd e{0, nullptr};
+        if (chunk_commit_due()) {
+            e.commit = 1;
+            e.used = pool_take_used();
+            g_cmd_pending = false;
+            g_draws_since_commit = 0;
+        }
+        eq_submit(EQ_END, &e, sizeof e);
+    }
+    for (auto& c : R.passColor) c = nullptr;
+    R.passDepth = nullptr;
+}
+void q_pipeline(id<MTLRenderPipelineState> p) { EqObj o{(__bridge_retained void*)p}; eq_submit(EQ_PIPE, &o, sizeof o); }
+void q_depth_state(id<MTLDepthStencilState> d) { EqObj o{(__bridge_retained void*)d}; eq_submit(EQ_DSS, &o, sizeof o); }
+void q_raster(const RasterState& r) { eq_submit(EQ_RASTER, &r, sizeof r); }
+void q_texture(bool vertex, id<MTLTexture> t, uint32_t i) { EqBind b{vertex, i, (__bridge_retained void*)t, 0}; eq_submit(EQ_TEX, &b, sizeof b); }
+void q_sampler(bool vertex, id<MTLSamplerState> s, uint32_t i) { EqBind b{vertex, i, (__bridge_retained void*)s, 0}; eq_submit(EQ_SMP, &b, sizeof b); }
+void q_buffer(bool vertex, id<MTLBuffer> buf, NSUInteger off, uint32_t i) {
+    EqBind b{vertex, i, (__bridge_retained void*)buf, off};
+    eq_submit(EQ_BUF, &b, sizeof b);
+}
+void q_buffer_offset(bool vertex, NSUInteger off, uint32_t i) { EqBind b{vertex, i, nullptr, off}; eq_submit(EQ_BUFOFF, &b, sizeof b); }
+void q_bytes(bool vertex, const void* data, uint32_t n, uint32_t i) { EqBytes b{vertex, i, n}; eq_submit(EQ_BYTES, &b, sizeof b, data, n); }
+void q_draw(MTLPrimitiveType t, uint32_t start, uint32_t count, uint32_t instances) {
+    EqDraw d{t, start, count, instances};
+    eq_submit(EQ_DRAW, &d, sizeof d);
+}
+void q_draw_indexed(MTLPrimitiveType t, uint32_t count, MTLIndexType it, id<MTLBuffer> ib, NSUInteger off, uint32_t instances,
+                    int32_t baseVertex, uint32_t baseInstance) {
+    EqDrawIdx d{t, count, it, (__bridge_retained void*)ib, off, instances, baseVertex, baseInstance};
+    eq_submit(EQ_DRAWIDX, &d, sizeof d);
+}
+void q_vertex_barrier() { uint8_t z = 0; eq_submit(EQ_BARRIER, &z, 1); }
+void q_visibility(MTLVisibilityResultMode mode, NSUInteger offset) { EqVis v{mode, offset}; eq_submit(EQ_VIS, &v, sizeof v); }
+void q_command_buffer(void (^block)(id<MTLCommandBuffer>)) {
+    if (eq_direct()) {
+        block(command_buffer());
+        return;
+    }
+    note_cmd_work();
+    EqObj o{(__bridge_retained void*)[block copy]};
+    eq_submit(EQ_BLOCK, &o, sizeof o);
+}
+// periodic report (every 300 frames): the encoding thread's load and the render thread's waits for it
+void enc_report();
+void enc_report() {
+    if (!g_eq_ring) return;
+    LOG("[gfx] last 300 frames: encoding thread CPU %.2f ms/frame, %.0f records/frame; render thread waited for it %.1f times/frame, "
+        "%.2f ms/frame", g_eq_enc_cpu_ns.exchange(0) / 1e6 / 300.0, g_eq_records.exchange(0) / 300.0, g_eq_syncs.exchange(0) / 300.0,
+        g_eq_sync_ns.exchange(0) / 1e6 / 300.0);
 }
 
 // ---------------------------------------------------------------- init
@@ -793,6 +1172,7 @@ void swap() {
                 busy, busyMax, span, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
         }
         lastCpu = cpu;
+        enc_report();
         LOG("[inval] texture invalidates %llu, with candidates %llu, surfaces examined %llu",
             (unsigned long long)g_inval_texture, (unsigned long long)g_inval_passed, (unsigned long long)g_pages_marked);
         void report_skips();

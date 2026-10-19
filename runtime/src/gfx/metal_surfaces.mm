@@ -1845,7 +1845,7 @@ void upload_surface(Surface* s) {
     s->writeSeq = next_write_seq();  // fresh CPU data is now the newest version of this memory
     g_stat_uploads++;
 
-    if (R.enc) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
+    if (enc_pass_open()) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
     end_encoder();
     const double t1 = ms_now();
     // a texture at the internal resolution (its size matched a scaling rule): the guest-size picture is

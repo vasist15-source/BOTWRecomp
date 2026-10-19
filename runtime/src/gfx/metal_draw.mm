@@ -286,24 +286,36 @@ id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr) {
     return u.buf;
 }
 
-// called before a command buffer commits: buffers used so far are recycled when it completes
-void pool_retire(id<MTLCommandBuffer> cmd) {
-    std::vector<id<MTLBuffer>> used;
-    {
-        std::lock_guard<std::mutex> lk(g_pool_mutex);
-        if (g_pool_cur) {
-            g_pool_used.push_back(g_pool_cur);
-            g_pool_cur = nil;
-        }
-        used.swap(g_pool_used);
+// Buffers used so far, taken at a commit in submission order (render thread): they are recycled when
+// the committed command buffer completes (pool_attach, on whichever thread commits it)
+std::vector<id<MTLBuffer>>* pool_take_used() {
+    auto* used = new std::vector<id<MTLBuffer>>();
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    if (g_pool_cur) {
+        g_pool_used.push_back(g_pool_cur);
+        g_pool_cur = nil;
     }
-    if (used.empty()) return;
-    __block std::vector<id<MTLBuffer>> blockUsed = std::move(used);
+    used->swap(g_pool_used);
+    return used;
+}
+// cmd nil: nothing that reads them was encoded, they are free now
+void pool_attach(id<MTLCommandBuffer> cmd, std::vector<id<MTLBuffer>>* used) {
+    if (!used) return;
+    if (used->empty()) { delete used; return; }
+    if (!cmd) {
+        std::lock_guard<std::mutex> lk(g_pool_mutex);
+        for (auto& b : *used) g_pool_free.push_back(b);
+        delete used;
+        return;
+    }
     [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
         std::lock_guard<std::mutex> lk(g_pool_mutex);
-        for (auto& b : blockUsed) g_pool_free.push_back(b);
+        for (auto& b : *used) g_pool_free.push_back(b);
+        delete used;
     }];
 }
+// called before a command buffer commits: buffers used so far are recycled when it completes
+void pool_retire(id<MTLCommandBuffer> cmd) { pool_attach(cmd, pool_take_used()); }
 
 // ---------------------------------------------------------------- fetch shaders
 struct FetchShaderEntry {
@@ -1551,8 +1563,7 @@ static inline void bc_texture(id<MTLRenderCommandEncoder> enc, bool vertex, id<M
         if (g_bc.tex[!vertex][i] == p) return;
         g_bc.tex[!vertex][i] = p;
     }
-    if (vertex) [enc setVertexTexture:tex atIndex:i];
-    else [enc setFragmentTexture:tex atIndex:i];
+    q_texture(vertex, tex, i);
 }
 static inline void bc_sampler(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLSamplerState> smp, uint32_t i) {
     if (i < 16) {
@@ -1560,8 +1571,7 @@ static inline void bc_sampler(id<MTLRenderCommandEncoder> enc, bool vertex, id<M
         if (g_bc.smp[!vertex][i] == p) return;
         g_bc.smp[!vertex][i] = p;
     }
-    if (vertex) [enc setVertexSamplerState:smp atIndex:i];
-    else [enc setFragmentSamplerState:smp atIndex:i];
+    q_sampler(vertex, smp, i);
 }
 static inline void bc_buffer(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLBuffer> buf, NSUInteger off, uint32_t i) {
     if (i < BindCache::kSlots) {
@@ -1569,15 +1579,13 @@ static inline void bc_buffer(id<MTLRenderCommandEncoder> enc, bool vertex, id<MT
         if (g_bc.buf[!vertex][i] == p) {
             if (g_bc.off[!vertex][i] == off) return;
             g_bc.off[!vertex][i] = off;
-            if (vertex) [enc setVertexBufferOffset:off atIndex:i];
-            else [enc setFragmentBufferOffset:off atIndex:i];
+            q_buffer_offset(vertex, off, i);
             return;
         }
         g_bc.buf[!vertex][i] = p;
         g_bc.off[!vertex][i] = off;
     }
-    if (vertex) [enc setVertexBuffer:buf offset:off atIndex:i];
-    else [enc setFragmentBuffer:buf offset:off atIndex:i];
+    q_buffer(vertex, buf, off, i);
 }
 static inline void bc_bytes(id<MTLRenderCommandEncoder> enc, bool vertex, const void* data, size_t n, uint32_t i) {
     if (i < BindCache::kSlots) {
@@ -1586,8 +1594,7 @@ static inline void bc_bytes(id<MTLRenderCommandEncoder> enc, bool vertex, const 
         g_bc.buf[!vertex][i] = kBytes;
         last.assign((const uint8_t*)data, (const uint8_t*)data + n);
     }
-    if (vertex) [enc setVertexBytes:data length:n atIndex:i];
-    else [enc setFragmentBytes:data length:n atIndex:i];
+    q_bytes(vertex, data, (uint32_t)n, i);
 }
 
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
@@ -1961,7 +1968,7 @@ static void occl_new_encoder();
 static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, const uint32_t* colorMips, Surface* depth, uint32_t depthSlice,
                         uint32_t depthMip, bool noAttachments = false) {
     g_target_mask_clear = 0;
-    if (R.enc) {
+    if (enc_pass_open()) {
         bool same = R.passDepth == depth && (!depth || (R.passDepthSlice == depthSlice && R.passDepthMip == depthMip));
         for (int i = 0; i < 8 && same; i++)
             same = R.passColor[i] == colors[i] && (!colors[i] || (R.passColorSlice[i] == colorSlices[i] && R.passColorMip[i] == colorMips[i]));
@@ -2003,9 +2010,9 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, con
         g_pass_why[0]++;
         g_open_why = 0;
     }
-    if (R.enc && R.drawCount - g_pass_first_draw <= 1) g_pass_why[6]++;
+    if (enc_pass_open() && R.drawCount - g_pass_first_draw <= 1) g_pass_why[6]++;
     g_pass_first_draw = R.drawCount;
-    end_encoder();
+    q_end_pass();
     // stats: passes per frame, the attachment bytes each loads and stores, and how many reopen the
     // same targets as the pass before (it was ended by something else: an upload, a copy, a clear)
     {
@@ -2098,7 +2105,7 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, con
         if (!g_pt_shader.empty()) g_pt_shader.back() = g_pt_ps_shader;
     }
     occl_attach(rp);
-    R.enc = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    q_begin_pass(rp);
     g_enc_serial++;
     occl_new_encoder();
     for (int i = 0; i < 8; i++) {
@@ -2109,7 +2116,7 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, con
     R.passDepth = depth;
     R.passDepthSlice = depthSlice;
     R.passDepthMip = depthMip;
-    return R.enc != nil;
+    return enc_pass_open();
 }
 
 // ---------------------------------------------------------------- indices
@@ -2547,21 +2554,21 @@ uint32_t g_occl_next = 0;
 bool g_occl_open = false;
 uint32_t g_occl_addr = 0;
 std::vector<uint32_t> g_occl_slots;  // the open query's slots
-int64_t g_occl_enc_slot = -1;        // slot counting on R.enc (-1: none)
+int64_t g_occl_enc_slot = -1;        // slot counting on the open pass (-1: none)
 uint64_t g_occl_skips_at_begin = 0;
 float g_occl_area = 1.0f;            // target texels per guest pixel of the query's draws (internal resolution)
-id<MTLRenderCommandEncoder> g_occl_enc = nil;
+uint64_t g_occl_enc = 0;             // the pass (g_enc_serial) counting into g_occl_enc_slot
 uint64_t occl_lost_draws() {  // draws that should have counted samples but did not run
     return g_skip[SK_COMPILING] + g_skip[SK_PIPE_COMPILING] + g_skip[SK_NO_SHADER] + g_skip[SK_PASS] + g_skip[SK_NO_TARGET] +
            g_skip[SK_GS];
 }
 void occl_count_on_current() {
-    if (!R.enc || !g_occl_buf) return;
+    if (!enc_pass_open() || !g_occl_buf) return;
     uint32_t slot = g_occl_next++ % kOcclSlots;
     ((uint64_t*)g_occl_buf.contents)[slot] = 0;
-    [R.enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:slot * 8];
+    q_visibility(MTLVisibilityResultModeCounting, slot * 8);
     g_occl_enc_slot = slot;
-    g_occl_enc = R.enc;
+    g_occl_enc = g_enc_serial;
     g_occl_slots.push_back(slot);
 }
 }  // namespace
@@ -2574,44 +2581,44 @@ static void occl_attach(MTLRenderPassDescriptor* rp) {
 }
 static void occl_new_encoder() {
     g_occl_enc_slot = -1;
-    g_occl_enc = nil;
+    g_occl_enc = 0;
     if (g_occl_open) occl_count_on_current();
 }
 void query_begin(uint32_t addr) {
-    if (g_occl_open && g_occl_enc == R.enc && R.enc && g_occl_enc_slot >= 0)  // unbalanced: drop the open one
-        [R.enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+    if (g_occl_open && g_occl_enc == g_enc_serial && enc_pass_open() && g_occl_enc_slot >= 0)  // unbalanced: drop the open one
+        q_visibility(MTLVisibilityResultModeDisabled, 0);
     g_occl_open = true;
     g_occl_addr = addr;
     g_occl_slots.clear();
     g_occl_skips_at_begin = occl_lost_draws();
     g_occl_area = 1.0f;
     g_occl_enc_slot = -1;
-    g_occl_enc = nil;
+    g_occl_enc = 0;
     // the current pass may predate the buffer (it is attached to every pass, so only the first)
-    if (R.enc) occl_count_on_current();
+    if (enc_pass_open()) occl_count_on_current();
 }
 void query_end(uint32_t addr, uint32_t gen) {
     if (!g_occl_open || addr != g_occl_addr) {
         render::wwhd_query_result(addr, gen, 0, false);
         return;
     }
-    if (R.enc && g_occl_enc == R.enc && g_occl_enc_slot >= 0)
-        [R.enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+    if (enc_pass_open() && g_occl_enc == g_enc_serial && g_occl_enc_slot >= 0)
+        q_visibility(MTLVisibilityResultModeDisabled, 0);
     g_occl_open = false;
     g_occl_enc_slot = -1;
-    g_occl_enc = nil;
+    g_occl_enc = 0;
     const bool ok = occl_lost_draws() == g_occl_skips_at_begin;
     const float sc = g_occl_area;
     std::vector<uint32_t> slots;
     slots.swap(g_occl_slots);
     id<MTLBuffer> buf = g_occl_buf;
-    [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    q_command_buffer(^(id<MTLCommandBuffer> cmd) { [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
         uint64_t sum = 0;
         if (buf)
             for (uint32_t s : slots) sum += ((const uint64_t*)buf.contents)[s];
         if (sc > 0.0f && sc != 1.0f) sum = (uint64_t)((double)sum / sc + 0.5);
         render::wwhd_query_result(addr, gen, sum, ok && cb.status == MTLCommandBufferStatusCompleted);
-    }];
+    }]; });
 }
   // draws with DB_ALPHA_TO_MASK enabled (render thread)
 static const char* kSkipNames[SK_COUNT] = {"geometry-shader", "raster-kill", "no-fetch-shader", "shader-failed", "no-target",
@@ -2650,6 +2657,7 @@ void report_skips() {
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
           uint32_t instances) {
     g_log_uniforms = false;
+    enc_set_direct(capturing() || pass_timing_on());  // captures and pass timing read and time the encoder in place
     static bool cacheLoaded = (cache_load(), true);
     (void)cacheLoaded;
     R.drawCount++;
@@ -2901,25 +2909,27 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     id<MTLRenderPipelineState> pipe = get_pipeline(regs, vs, ps, fs, fsKey, tf);
     if (!pipe) { g_skip[SK_PIPE_COMPILING]++; return; }
     rprof::mark(rprof::kPipeline);
-    id<MTLRenderCommandEncoder> enc = R.enc;
+    id<MTLRenderCommandEncoder> enc = nil;  // calls go through the encoding thread's queue (q_*)
     bc_sync();
     if (g_bc.pipe != (__bridge const void*)pipe) {
         g_bc.pipe = (__bridge const void*)pipe;
-        [enc setRenderPipelineState:pipe];
+        q_pipeline(pipe);
     }
     id<MTLDepthStencilState> dss = get_depth_state(regs, depth != nullptr);
     if (g_bc.depthState != (__bridge const void*)dss) {
         g_bc.depthState = (__bridge const void*)dss;
-        [enc setDepthStencilState:dss];
+        q_depth_state(dss);
     }
+    // fixed-function state in one record; the encoding thread sets only what changed
+    RasterState rs;
     LATTE_DB_STENCILREFMASK sf;
     LATTE_DB_STENCILREFMASK_BF sb;
     uint32_t rf = regs[REGADDR::DB_STENCILREFMASK], rb = regs[REGADDR::DB_STENCILREFMASK_BF];
     memcpy(&sf, &rf, 4);
     memcpy(&sb, &rb, 4);
-    [enc setStencilFrontReferenceValue:sf.get_STENCILREF_F() backReferenceValue:sb.get_STENCILREF_B()];
-    const float* bc = (const float*)&regs[REGADDR::CB_BLEND_RED];
-    [enc setBlendColorRed:bc[0] green:bc[1] blue:bc[2] alpha:bc[3]];
+    rs.stencilFront = sf.get_STENCILREF_F();
+    rs.stencilBack = sb.get_STENCILREF_B();
+    memcpy(rs.blend, &regs[REGADDR::CB_BLEND_RED], sizeof rs.blend);
 
     // rasterizer
     LATTE_PA_SU_SC_MODE_CNTL pm;
@@ -2927,22 +2937,20 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     memcpy(&pm, &pmr, 4);
     bool cf = pm.get_CULL_FRONT(), cb = pm.get_CULL_BACK();
     if (cf && cb) { g_skip[SK_CULL]++; return; }
-    [enc setCullMode:cf ? MTLCullModeFront : cb ? MTLCullModeBack : MTLCullModeNone];
-    [enc setFrontFacingWinding:pm.get_FRONT_FACE() == LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW ? MTLWindingCounterClockwise
-                                                                                                  : MTLWindingClockwise];
+    rs.cull = (uint8_t)(cf ? MTLCullModeFront : cb ? MTLCullModeBack : MTLCullModeNone);
+    rs.winding = (uint8_t)(pm.get_FRONT_FACE() == LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW ? MTLWindingCounterClockwise : MTLWindingClockwise);
     if (pm.get_OFFSET_FRONT_ENABLED()) {
-        float scale = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE]) / 16.0f;
-        float offset = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET]);
-        float clampv = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_CLAMP]);
-        [enc setDepthBias:offset slopeScale:scale clamp:clampv];
+        rs.bias[0] = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET]);
+        rs.bias[1] = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE]) / 16.0f;
+        rs.bias[2] = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_CLAMP]);
     } else {
-        [enc setDepthBias:0 slopeScale:0 clamp:0];
+        rs.bias[0] = rs.bias[1] = rs.bias[2] = 0;
     }
     LATTE_PA_CL_CLIP_CNTL clipCntl;
     uint32_t clipRaw = regs[REGADDR::PA_CL_CLIP_CNTL];
     memcpy(&clipCntl, &clipRaw, 4);
     bool zclip = !clipCntl.get_ZCLIP_FAR_DISABLE();
-    [enc setDepthClipMode:zclip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
+    rs.clip = (uint8_t)(zclip ? MTLDepthClipModeClip : MTLDepthClipModeClamp);
 
     // viewport and scissor
     float xs = gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XSCALE]), xo = gx2::bitsf(regs[REGADDR::PA_CL_VPORT_XOFFSET]);
@@ -2951,7 +2959,8 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     bool halfZ = clipCntl.get_DX_CLIP_SPACE_DEF();
     MTLViewport vp{xo - xs, yo + ys, xs * 2.0f, ys * -2.0f, halfZ ? zo : zo - zs, zs + zo};
     vp.originX *= kx; vp.originY *= ky; vp.width *= kx; vp.height *= ky;
-    if (!noAttachments) [enc setViewport:vp];
+    rs.viewport = !noAttachments;
+    rs.vp = vp;
     uint32_t tl = regs[REGADDR::PA_SC_GENERIC_SCISSOR_TL], br = regs[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
     auto lo = [](uint32_t v, float k, uint32_t lim) { return std::min<uint32_t>((uint32_t)std::floor(v * k + 0.01f), lim); };
     auto hi = [](uint32_t v, float k, uint32_t lim) { return std::min<uint32_t>((uint32_t)std::ceil(v * k - 0.01f), lim); };
@@ -2961,11 +2970,12 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (aspect::content_clip() && target_aspect_factors(regs[mmCB_COLOR0_TILE] & 0xFFFF, regs[mmCB_COLOR0_FRAG], ax, ay))
         aspect::panes::clip(w, h, ax, ay, sx, sy, ex, ey);
     if (noAttachments) {
-        [enc setScissorRect:MTLScissorRect{0, 0, 1, 1}];
+        rs.scissor = MTLScissorRect{0, 0, 1, 1};
     } else {
         if (ex <= sx || ey <= sy) { g_skip[SK_SCISSOR]++; return; }
-        [enc setScissorRect:MTLScissorRect{sx, sy, ex - sx, ey - sy}];
+        rs.scissor = MTLScissorRect{sx, sy, ex - sx, ey - sy};
     }
+    q_raster(rs);
     rprof::mark(rprof::kRecord);
     rprof::UploadKind vertexUploads(rprof::kUpVertex);
 
@@ -3037,33 +3047,20 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         uint16_t* dst = (uint16_t*)((uint8_t*)idx16Buf.buf.contents + idx16Buf.offset);
         if (indexType == 0) memcpy(dst, src, (size_t)count * 2);
         else for (uint32_t i = 0; i < count; i++) dst[i] = __builtin_bswap16(src[i]);
-        [enc drawIndexedPrimitives:ptype
-                        indexCount:count
-                         indexType:MTLIndexTypeUInt16
-                       indexBuffer:idx16Buf.buf
-                 indexBufferOffset:idx16Buf.offset
-                     instanceCount:instances
-                        baseVertex:baseVertex
-                      baseInstance:render::g_base_instance];
+        q_draw_indexed(ptype, count, MTLIndexTypeUInt16, idx16Buf.buf, idx16Buf.offset, instances, (int32_t)baseVertex,
+                       render::g_base_instance);
     } else if (indices.empty()) {
-        [enc drawPrimitives:ptype vertexStart:baseVertex vertexCount:count instanceCount:instances];
+        q_draw(ptype, baseVertex, count, instances);
     } else {
         rprof::UploadKind uploads(rprof::kUpIndex);
         Upload u = upload(indices.data(), (uint32_t)(indices.size() * 4));
-        [enc drawIndexedPrimitives:ptype
-                        indexCount:indices.size()
-                         indexType:MTLIndexTypeUInt32
-                       indexBuffer:u.buf
-                 indexBufferOffset:u.offset
-                     instanceCount:instances
-                        baseVertex:baseVertex
-                      baseInstance:render::g_base_instance];  // [[instance_id]] includes it
+        q_draw_indexed(ptype, (uint32_t)indices.size(), MTLIndexTypeUInt32, u.buf, u.offset, instances, (int32_t)baseVertex,
+                       render::g_base_instance);  // [[instance_id]] includes it
     }
     if (g_so.active) {
         // later draws (and the CPU) read what was written; advance each buffer's write offset as the GPU
         // would: vertices x stride, bounded by the buffer (Cemu: LatteStreamout_FinishDrawcall)
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers afterStages:MTLRenderStageVertex
-                       beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        q_vertex_barrier();
         for (int b = 0; b < 4; b++) {
             if (!vs->dec->streamoutBufferWriteMask[b]) continue;
             uint32_t* r = (uint32_t*)regs;
