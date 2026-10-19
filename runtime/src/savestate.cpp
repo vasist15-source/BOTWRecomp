@@ -5,8 +5,9 @@
 // The recompiled game runs on host threads with native call stacks, so a snapshot can only be taken
 // (and restored) when every guest thread is at a point whose complete state is guest memory, its Cpu
 // registers and the HLE objects:
-//   - the game's main thread at the top of the per-frame function (0203593C; interp.cpp calls
-//     service() there), which requests the save/load;
+//   - the thread that submits frames, in GX2SwapScanBuffers (gx2_core.cpp calls service() there;
+//     Wind Waker used the top of its per-frame function 0203593C, interp.cpp), which requests the
+//     save/load;
 //   - every other guest thread parked in an HLE wait (OSReceiveMessage, OSWaitEvent, OSLockMutex,
 //     OSSleepThread, OSSleepTicks, GX2WaitForVsync, ...: park_wait in threads.cpp). A parked thread
 //     re-checks its condition after waking and only then consumes anything, so the HLE objects
@@ -111,18 +112,23 @@ enum : uint32_t {
     kSecDispatch = 'DSPT',
     kSecMemory = 'MEM ',
     kSecGuestMods = 'GMOD',
+    kSecGpuSurfaces = 'GPUS',  // GPU-made textures the game keeps (render::ss_save_surfaces)
 };
 
 using Region=MemoryRegion;
 
 std::vector<Region> regions() {
     uint32_t top = (mem::runtime_top() + kChunk - 1) & ~(kChunk - 1);
-    return {{mem::kMem2Start, mem::kMem2End - mem::kMem2Start},
-            {mem::kRuntimeStart, top - mem::kRuntimeStart},
-            {mem::kFixedStart, mem::kFixedSize},
-            {mem::kFgBucket, mem::kFgBucketSize},
-            {mem::kMem1, mem::kMem1Size},
-            {guestmods::kRegionStart,guestmods::kRegionSize}};
+    std::vector<Region> r = {{mem::kMem2Start, mem::kMem2End - mem::kMem2Start},
+                             {mem::kRuntimeStart, top - mem::kRuntimeStart},
+                             {mem::kFixedStart, mem::kFixedSize},
+                             {mem::kFgBucket, mem::kFgBucketSize},
+                             {mem::kMem1, mem::kMem1Size},
+                             {guestmods::kRegionStart,guestmods::kRegionSize}};
+    // the overlay arena BotW enables (OSEnableOverlayArena): game data lives there too (left out, a loaded
+    // state kept the arena's current contents: rocks and other physics objects fell and settled again)
+    if (::mem::overlay_arena_enabled()) r.push_back({0xA0000000u, 0x1C000000u});
+    return r;
 }
 
 // A snapshot in memory: header + payload (sections); memory chunks point into the payload.
@@ -500,6 +506,9 @@ bool do_save(int slot) {
     put_section(*payload, kSecDispatch, w);
     w=Writer();guestmods::save_mod_set(w,guestmods::enabled_mods());
     put_section(*payload,kSecGuestMods,w);
+    w = Writer();
+    render::ss_save_surfaces(w.b);
+    put_section(*payload, kSecGpuSurfaces, w);
     // memory last, written straight into the payload
     payload->u32(kSecMemory);
     size_t len_at = payload->b.size();
@@ -586,6 +595,8 @@ bool do_load(const std::shared_ptr<Snapshot>& s) {
     ax_ss_load(r);
     r = s->section(kSecGx2);
     gx2_ss_load(r);
+    r = s->section(kSecGpuSurfaces);  // after gx2_ss_load (its ss_reset): absent in older states
+    render::ss_load_surfaces(r.p, (size_t)(r.e - r.p));
     guestmods::state_loaded();
     interp::ss_reset();
     aspect::ss_reset();

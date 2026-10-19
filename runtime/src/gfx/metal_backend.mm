@@ -11,6 +11,8 @@ void request_tv_dump(const std::string& path, int frames_ahead);
 void run_appkit_loop();
 uint64_t frame_count();
 void ss_reset_surfaces();
+void ss_save_surfaces(std::vector<uint8_t>& out);
+void ss_load_surfaces(const uint8_t* p, size_t n);
 void request_capture();
 float res_scale();
 void set_res_scale(float f);
@@ -51,6 +53,8 @@ const Backend& metal_backend() {
         b.wait_idle = gfx::wait_idle;
         b.write_back = gfx::write_back_linear_targets;
         b.ss_reset = gfx::ss_reset_surfaces;
+        b.ss_save_surfaces = gfx::ss_save_surfaces;
+        b.ss_load_surfaces = gfx::ss_load_surfaces;
         b.query_begin = gfx::query_begin;
         b.query_end = gfx::query_end;
         b.frame_count = gfx::frame_count;

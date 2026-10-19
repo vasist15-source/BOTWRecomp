@@ -148,18 +148,22 @@ static void update_title() {
         return s.compatible ? d : [d stringByAppendingString:@" (incompatible)"];
     };
     for (int i = 1; i <= ss::kSlots; i++) {
-        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Save to slot %d  (%@)", i, label(i)] action:@selector(save:) keyEquivalent:@""];
+        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Save to slot %d  (%@)", i, label(i)] action:@selector(save:)
+                               keyEquivalent:[NSString stringWithFormat:@"%d", i]];
+        it.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
         it.target = self;
         it.tag = i;
-        it.toolTip = [NSString stringWithFormat:@"Shortcut in game: Shift+F%d", i];
+        it.toolTip = [NSString stringWithFormat:@"Also Shift+F%d in game", i];
     }
     [m addItem:[NSMenuItem separatorItem]];
     for (int i = 1; i <= ss::kSlots; i++) {
-        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Load slot %d  (%@)", i, label(i)] action:@selector(load:) keyEquivalent:@""];
+        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Load slot %d  (%@)", i, label(i)] action:@selector(load:)
+                               keyEquivalent:[NSString stringWithFormat:@"%d", i]];
+        it.keyEquivalentModifierMask = NSEventModifierFlagCommand;
         it.target = self;
         it.tag = i;
         it.enabled = info[i].used && info[i].compatible;
-        it.toolTip = i == 1 ? @"In game: F1 (or \u2318,) opens the settings overlay (Saves)" : [NSString stringWithFormat:@"Shortcut in game: F%d", i];
+        it.toolTip = i == 1 ? @"F1 in game opens the settings overlay (Saves) instead" : [NSString stringWithFormat:@"Also F%d in game", i];
     }
     // crash recovery (crashrec.cpp): automatic states every few minutes + recorded input
     [m addItem:[NSMenuItem separatorItem]];
@@ -313,7 +317,7 @@ void install_menu(NSWindow* tv) {
 
     mods::mouse_init((__bridge void*)tv);  // mouse input: gyro aiming with the mouse (mods/mouse.mm)
 
-    // Save States: 5 slots (savestate.cpp); Shift+F1..F5 save, F1..F5 load
+    // Save States: 5 slots (savestate.cpp); Cmd+Shift+1..5 / Shift+F1..F5 save, Cmd+1..5 / F2..F5 load
     NSMenuItem* ssItem = [bar addItemWithTitle:@"Save States" action:nil keyEquivalent:@""];
     NSMenu* sm = [[NSMenu alloc] initWithTitle:@"Save States"];
     sm.autoenablesItems = NO;
@@ -361,6 +365,18 @@ void menu_options_changed() { update_title(); }
 
 // single-key shortcuts from the game window; true if the key was used
 bool menu_hotkey(uint16_t code) {
+    // save states without the fn key (Mac keyboards send F1..F5 as media keys): Cmd+1..5 load, Cmd+Shift+1..5 save
+    const NSEventModifierFlags mods = [NSEvent modifierFlags];
+    if (mods & NSEventModifierFlagCommand) {
+        static const uint16_t digits[5] = {kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5};
+        for (int i = 0; i < 5; i++)
+            if (code == digits[i]) {
+                if (mods & NSEventModifierFlagShift) ss::request_save(i + 1);
+                else ss::request_load(i + 1);
+                return true;
+            }
+        return false;  // other Cmd shortcuts belong to the menus
+    }
     switch (code) {
     case kVK_ANSI_N: if (render::feature_available(render::kFeatureAniso)) render::set_aniso(!render::aniso()); break;
     case kVK_ANSI_6: gx2::set_fps_target(gx2::fps_target() == 60 ? 30 : 60); break;

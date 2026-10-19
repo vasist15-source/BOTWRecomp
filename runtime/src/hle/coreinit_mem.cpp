@@ -268,6 +268,7 @@ HLE(coreinit, OSEnableOverlayArena) {
     LOG("[mem] overlay arena enabled: A0000000 size 1C000000 lr=%08X", c->lr);
 }
 HLE(coreinit, OSDisableOverlayArena) { g_overlay_arena = false; }
+namespace mem { bool overlay_arena_enabled() { return g_overlay_arena; } }
 
 HLE(coreinit, MEMGetBaseHeapHandle) {
     // base heap slots: 0 = MEM1, 1 = MEM2 (default heap), 8 = foreground bucket

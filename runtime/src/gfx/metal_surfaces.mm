@@ -944,6 +944,7 @@ static void update_from_dynamic(Surface* t) {
 void mark_gpu_written(Surface* s, uint32_t slice, uint32_t mip) {
     const uint64_t ev = next_write_seq();
     s->gpuWritten = true;
+    s->lastWriteFrame = R.frame;
     s->writeSeq = ev;
     if (!s->sm.empty() && mip < s->mips && slice < s->mip_slices(mip)) s->slice_mip(slice, mip)->lastDynamicUpdate = ev;
     for (TexRelation* rel : s->relations) {
@@ -2209,6 +2210,139 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
 }  // namespace gfx
 
 namespace gfx {
+// Save states and GPU-made textures. On the console a render target is guest memory, so a state holds it;
+// here it lives only in a Metal texture. Render targets redrawn every frame need nothing, but BotW builds
+// some textures on the GPU once and keeps using them (terrain height maps, water and grass maps, GPU-encoded
+// arrays): without them a loaded state showed the textures of the moment before the load, and the world
+// popped in again. Saved: GPU-written colour textures not written in the last few frames, every level and
+// slice as the host stores it (at the internal resolution of the save). Called with the GPU idle and the
+// game frozen (savestate.cpp), on the game thread: own command buffers, waited for.
+namespace {
+struct SavedSurfaceDesc {
+    uint32_t addr, mipAddr, format, width, height, slices, pitch, mips, dim, tileMode, swizzle;
+    float sx, sy;
+    uint32_t texW, texH, texD, texLayers, texMips, pixelFormat, textureType;
+};
+// the regions of each level and slice (bytes per row and image in host blocks)
+template <class F>
+void for_each_region(id<MTLTexture> t, const FormatInfo& f, F fn) {
+    const bool is3D = t.textureType == MTLTextureType3D;
+    const NSUInteger layers = is3D ? 1 : layer_count(t);
+    for (NSUInteger m = 0; m < t.mipmapLevelCount; m++) {
+        const NSUInteger w = std::max<NSUInteger>(t.width >> m, 1), h = std::max<NSUInteger>(t.height >> m, 1);
+        const NSUInteger d = is3D ? std::max<NSUInteger>(t.depth >> m, 1) : 1;
+        const NSUInteger bw = f.compressed ? (w + 3) / 4 : w, bh = f.compressed ? (h + 3) / 4 : h;
+        const NSUInteger row = bw * f.hostBytesPerBlock, image = row * bh;
+        for (NSUInteger z = 0; z < layers; z++) fn(m, z, w, h, d, row, image);
+    }
+}
+}  // namespace
+
+void ss_save_surfaces(std::vector<uint8_t>& out) {
+    struct Item { Surface* s; id<MTLBuffer> buf; size_t size; };
+    std::vector<Item> items;
+    id<MTLCommandBuffer> cb = [R.queue commandBuffer];
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    size_t total = 0;
+    for (auto& [a, up] : R.surfaces) {
+        Surface* s = up.get();
+        if (s->deleted || !s->gpuWritten || !s->tex || s->fmt.depth || s->isDepth || s->tex.sampleCount > 1) continue;
+        if (R.frame - s->lastWriteFrame < 4) continue;  // redrawn every frame
+        size_t size = 0;
+        for_each_region(s->tex, s->fmt, [&](NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger d, NSUInteger, NSUInteger image) { size += image * d; });
+        if (!size) continue;
+        id<MTLBuffer> buf = [R.device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        if (!buf) continue;
+        size_t off = 0;
+        const bool is3D = s->tex.textureType == MTLTextureType3D;
+        for_each_region(s->tex, s->fmt, [&](NSUInteger m, NSUInteger z, NSUInteger w, NSUInteger h, NSUInteger d, NSUInteger row, NSUInteger image) {
+            [b copyFromTexture:s->tex sourceSlice:is3D ? 0 : z sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
+                      toBuffer:buf destinationOffset:off destinationBytesPerRow:row destinationBytesPerImage:image];
+            off += image * d;
+        });
+        items.push_back({s, buf, size});
+        total += size;
+    }
+    [b endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const uint8_t*)p, (const uint8_t*)p + n); };
+    const uint32_t n = (uint32_t)items.size();
+    put(&n, 4);
+    for (auto& it : items) {
+        Surface* s = it.s;
+        SavedSurfaceDesc d{s->addr, s->mipAddr, s->format, s->width, s->height, s->slices, s->pitch, s->mips, s->dim, s->tileMode, s->swizzle,
+                           s->sx, s->sy, (uint32_t)s->tex.width, (uint32_t)s->tex.height, (uint32_t)s->tex.depth,
+                           (uint32_t)s->tex.arrayLength, (uint32_t)s->tex.mipmapLevelCount, (uint32_t)s->tex.pixelFormat,
+                           (uint32_t)s->tex.textureType};
+        put(&d, sizeof d);
+        const uint64_t size = it.size;
+        put(&size, 8);
+        put(it.buf.contents, it.size);
+    }
+    LOG("[savestate] %u GPU-made textures saved (%.1f MiB)", n, total / 1048576.0);
+}
+
+void ss_load_surfaces(const uint8_t* p, size_t len) {
+    const uint8_t* e = p + len;
+    auto get = [&](void* dst, size_t n) { if ((size_t)(e - p) < n) { p = e; return false; } memcpy(dst, p, n); p += n; return true; };
+    uint32_t n = 0;
+    if (!p || !get(&n, 4)) return;
+    uint32_t restored = 0, skipped = 0;
+    id<MTLCommandBuffer> cb = [R.queue commandBuffer];
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    std::vector<id<MTLBuffer>> keep;
+    for (uint32_t i = 0; i < n; i++) {
+        SavedSurfaceDesc d{};
+        uint64_t size = 0;
+        if (!get(&d, sizeof d) || !get(&size, 8) || (uint64_t)(e - p) < size) break;
+        const uint8_t* data = p;
+        p += size;
+        // the surface this state had: the same one if it is still there, else a new one
+        Surface* s = nullptr;
+        auto range = R.surfaces.equal_range(d.addr);
+        for (auto it = range.first; it != range.second && !s; ++it) {
+            Surface* c = it->second.get();
+            if (!c->deleted && !c->isDepth && c->format == d.format && c->width == d.width && c->height == d.height && c->slices == d.slices &&
+                c->mips == d.mips && c->dim == d.dim && c->tex)
+                s = c;
+        }
+        if (!s) {
+            TexView* v = create_surface(d.dim, d.addr, d.mipAddr, d.format, d.width, d.height, d.slices, d.pitch, d.mips, d.swizzle, d.tileMode, false);
+            s = v ? v->tex : nullptr;
+        }
+        // the same host texture shape only (a state saved at another internal resolution is redrawn instead)
+        if (!s || !s->tex || s->tex.width != d.texW || s->tex.height != d.texH || s->tex.depth != d.texD || s->tex.arrayLength != d.texLayers ||
+            s->tex.mipmapLevelCount != d.texMips || (uint32_t)s->tex.pixelFormat != d.pixelFormat) {
+            skipped++;
+            continue;
+        }
+        id<MTLBuffer> buf = [R.device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+        if (!buf) { skipped++; continue; }
+        keep.push_back(buf);
+        size_t off = 0;
+        const bool is3D = s->tex.textureType == MTLTextureType3D;
+        for_each_region(s->tex, s->fmt, [&](NSUInteger m, NSUInteger z, NSUInteger w, NSUInteger h, NSUInteger dd, NSUInteger row, NSUInteger image) {
+            if (off + image * dd > size) return;
+            [b copyFromBuffer:buf sourceOffset:off sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:MTLSizeMake(w, h, dd)
+                    toTexture:s->tex destinationSlice:is3D ? 0 : z destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
+            off += image * dd;
+        });
+        // the newest version of its memory (related surfaces sync from it), never reloaded from guest memory
+        const uint64_t ev = next_write_seq();
+        s->gpuWritten = true;
+        s->writeSeq = ev;
+        s->lastWriteFrame = R.frame;
+        for (uint32_t m = 0; m < s->mips; m++)
+            for (uint32_t z = 0; z < s->mip_slices(m); z++) s->slice_mip(z, m)->lastDynamicUpdate = ev;
+        restored++;
+    }
+    [b endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    LOG("[savestate] %u GPU-made textures restored, %u skipped", restored, skipped);
+}
+
 // a save state replaced guest memory: every CPU-side texture gets a full check on next use (render
 // targets keep their GPU contents; the next frame redraws them)
 void ss_reset_surfaces() {

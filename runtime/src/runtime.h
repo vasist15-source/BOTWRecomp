@@ -34,6 +34,7 @@ uint32_t host_alloc(uint32_t size, uint32_t align = 16);
 enum FixedSlot : uint32_t { kFixInterpEye = 0, kFixInterpMtx, kFixFxMidPos, kFixLinkScratch, kFixCount };
 inline uint32_t fixed_slot(FixedSlot id) { return kFixedStart + 0x100 * id; }
 uint32_t runtime_top();
+bool overlay_arena_enabled();  // OSEnableOverlayArena was called (0xA0000000, 0x1C000000 bytes)
 void raise_runtime_top(uint32_t top);
 struct AllocRec { uint32_t addr, size; uint64_t tag; };
 std::vector<AllocRec> runtime_alloc_log();  // sorted by address

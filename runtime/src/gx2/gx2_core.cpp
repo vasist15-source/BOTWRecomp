@@ -2,6 +2,7 @@
 #include "../mods/fast_forward.h"
 #include "../perf_metrics.h"
 #include "../platform/host.h"
+#include "../savestate.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
@@ -1227,6 +1228,9 @@ HLE(gx2, GX2DrawDone) {
 }
 HLE(gx2, GX2SwapScanBuffers) {
     perf::game_frame();  // the overlay's Game CPU: this thread's CPU time per submitted frame
+    // save states are taken and loaded here: the thread that submits frames calls this once a frame from
+    // the same place (Wind Waker's per-frame hook, savestate.cpp's anchor, never runs in BotW)
+    ss::service(c);
     fps_frame();
     fps_limit();
     // debug: WWHD_TRACE_SWAP=n logs the guest call chain of the first n swaps

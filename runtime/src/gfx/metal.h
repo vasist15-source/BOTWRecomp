@@ -68,6 +68,7 @@ struct Surface {
     uint32_t lastRenderTargetSwizzle = 0;
     bool isDepth = false;
     bool gpuWritten = false;   // contents produced by the GPU; never reload from guest memory
+    uint64_t lastWriteFrame = 0;  // frame of the last GPU write (save states keep the ones not redrawn every frame)
     uint64_t writeSeq = 0;     // the latest GPU write event (next_write_seq) of any of its slices
     uint64_t writtenBackSeq = 0;  // writeSeq when last written back to guest memory (linear surfaces)
     uint64_t contentHash = 0;  // hash of all guest bytes (every level) at the last check

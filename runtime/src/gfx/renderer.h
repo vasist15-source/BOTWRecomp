@@ -13,6 +13,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace render {
 
@@ -46,6 +47,9 @@ struct Backend {
     void (*wait_idle)();           // GX2DrawDone
     void (*write_back)();          // GX2DrawDone: render results the CPU reads (linear targets) to guest memory
     void (*ss_reset)();            // a save state was loaded: forget surfaces and shader memos
+    // save states: the contents of GPU-made textures the game keeps (metal_surfaces.mm). Optional.
+    void (*ss_save_surfaces)(std::vector<uint8_t>& out);
+    void (*ss_load_surfaces)(const uint8_t* p, size_t n);
     // occlusion queries: count the samples that pass between begin and end; the result goes to
     // wwhd_query_result (gx2_core.cpp) once the GPU has it. Optional (null: no results).
     void (*query_begin)(uint32_t addr);
@@ -129,6 +133,8 @@ inline void guest_flush() { g_backend->guest_flush(); }
 inline void wait_idle() { g_backend->wait_idle(); }
 inline void write_back() { if (g_backend->write_back) g_backend->write_back(); }
 inline void ss_reset() { g_backend->ss_reset(); }
+inline void ss_save_surfaces(std::vector<uint8_t>& out) { if (g_backend->ss_save_surfaces) g_backend->ss_save_surfaces(out); }
+inline void ss_load_surfaces(const uint8_t* p, size_t n) { if (g_backend->ss_load_surfaces) g_backend->ss_load_surfaces(p, n); }
 extern "C" void wwhd_query_result(uint32_t addr, uint32_t gen, uint64_t samples, bool ok);
 inline void query_begin(uint32_t addr) { if (g_backend->query_begin) g_backend->query_begin(addr); }
 inline void query_end(uint32_t addr, uint32_t gen) {
