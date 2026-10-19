@@ -1,5 +1,6 @@
 #include "../game_clock.h"
 #include "../mods/fast_forward.h"
+#include "../perf_metrics.h"
 #include "../platform/host.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -758,6 +759,7 @@ using namespace gx2;
 // rounded to granules, so at 30/60 fps (granule 4) the timing is the 59.94 Hz one exactly.
 static uint64_t g_swap_count = 0, g_flip_count = 0;
 namespace gx2 { uint64_t flips_presented() { return __atomic_load_n(&g_flip_count, __ATOMIC_RELAXED); } }  // live fps in the title
+namespace gx2 { uint64_t game_frames() { return __atomic_load_n(&g_swap_count, __ATOMIC_RELAXED); } }  // frames the game submitted
 static uint32 g_swap_interval = 1;  // as set by the game (frame interpolation halves it)
 namespace interp { uint32_t effective_swap_interval(uint32_t game); uint64_t logic_steps(); int vsync_rate(); }
 static std::mutex g_flip_mutex;
@@ -1224,6 +1226,7 @@ HLE(gx2, GX2DrawDone) {
     ret(c, 1);
 }
 HLE(gx2, GX2SwapScanBuffers) {
+    perf::game_frame();  // the overlay's Game CPU: this thread's CPU time per submitted frame
     fps_frame();
     fps_limit();
     // debug: WWHD_TRACE_SWAP=n logs the guest call chain of the first n swaps

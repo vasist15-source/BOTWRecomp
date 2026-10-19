@@ -62,7 +62,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../build_info.h"
 #include "../report_header.h"
 
-namespace gx2 { uint64_t flips_presented(); bool uncapped(); void set_uncapped(bool on); int fps_target(); void set_fps_target(int fps); }
+namespace gx2 { uint64_t flips_presented(); uint64_t game_frames(); bool uncapped(); void set_uncapped(bool on); int fps_target(); void set_fps_target(int fps); }
 
 namespace overlay {
 namespace {
@@ -562,7 +562,7 @@ std::string performance_report() {
     float sum = 0, worst = 0;
     for (float f : U.frame_ms) { sum += f; worst = std::max(worst, f); }
     char frame[180];
-    snprintf(frame, sizeof frame, "FPS %.1f (average %.1f), frame %.2f ms (worst %.2f), average logic steps/s %.1f\n",
+    snprintf(frame, sizeof frame, "FPS %.1f (average %.1f), frame %.2f ms (worst %.2f), average game frames/s %.1f\n",
              U.fps, g_average.fps, sum / 120.0f, worst, g_average.logic);
     std::string report = std::string(frame) + perf::summary();
 #ifdef __ANDROID__
@@ -1212,7 +1212,7 @@ void perf_window(bool menu_open) {
                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
     if (ImGui::Begin("##perf", nullptr, fl)) {
         ImGui::Text("%.0f fps   %.1f ms (worst %.1f)", U.fps, sum / 120.0f, worst);
-        ImGui::Text("Average %.1f fps   %.1f logic steps/s", g_average.fps, g_average.logic);
+        ImGui::Text("Average %.1f fps   game %.1f frames/s", g_average.fps, g_average.logic);
         {
             // slow motion: frame interpolation without Keep game speed below its frame target
             static double t0 = 0; static uint64_t s0 = 0; static double rate = 30;
@@ -1451,7 +1451,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
     }
     U.last_present = t;
     g_last_frame = t;
-    g_average.sample(t, gx2::flips_presented(), interp::executed_steps(), int(render::active()),
+    g_average.sample(t, gx2::flips_presented(), gx2::game_frames(), int(render::active()),
                      interp::mode(), interp::fps(), hostui::res_scale());
     read_controller();
     // the game's text prompt shows unless the menu is open over it (the menu has the input then)
