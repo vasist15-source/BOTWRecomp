@@ -568,7 +568,7 @@ std::string performance_report() {
 #ifdef __ANDROID__
     report += android_telemetry() + "\n";
 #endif
-    report += "CPU time is thread running time per output frame. GPU submission intervals may include stalls; not GPU load.\n";
+    report += "CPU time is thread running time per output frame. GPU on Metal is busy time per frame (gaps and stalls left out); on Vulkan, submission intervals that may include stalls.\n";
     const std::string detailed = rprof::latest_report();
     report += detailed.empty() ? "No detailed report yet: play for a few seconds, then copy again.\n" : detailed;
     // which build, system, GPU and rendering-path switches (report_header.h)

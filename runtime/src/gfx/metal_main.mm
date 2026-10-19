@@ -1,4 +1,5 @@
 #include <map>
+#include <deque>
 #include <chrono>
 #include "perf_metrics.h"
 #include "gfx/capture_schedule.h"
@@ -106,37 +107,62 @@ id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset) {
 }
 
 // ---------------------------------------------------------------- command buffers
-static uint64_t commandFrame = 0, commandToken = 0;
+static uint64_t commandFrame = 0;
 static int64_t g_cmd_created_ns = 0;  // when R.cmd was started (time-based commits)
 static std::atomic<int64_t> g_frame_gpu_start[256];  // WWHD_FRAME_TRACE: first GPU start of each swap's work
-struct OverlayGpuTime {
-    id<MTLCommandBuffer> buffer = nil; // ARC retains it until a later frame can read the result.
-    uint64_t frame = 0, token = 0;
-};
-static std::array<OverlayGpuTime, 256> overlayGpuTimes;
-static bool overlayGpuPending = false;
-static void read_overlay_gpu_times() {
-    if (!perf::enabled()) {
-        if (overlayGpuPending) { overlayGpuTimes = {}; overlayGpuPending = false; }
-        return;
-    }
+// GPU busy time per frame. Committed command buffers are kept in commit order (the one queue runs them in
+// that order) and read once a frame after they complete, so timing costs no completion handler. A frame's
+// busy time is the union of its buffers' [GPUStartTime, GPUEndTime] (neighbours overlap at their edges):
+// queue gaps, the GPU waiting for the next commit and the render thread's own waits are not counted.
+// Always on: the periodic [gfx] report and the overlay's "GPU busy" line read it.
+struct GpuTimed { id<MTLCommandBuffer> buffer; uint64_t frame; };
+static std::deque<GpuTimed> g_gpu_fifo;
+struct GpuFrameSum { uint64_t frame = UINT64_MAX; double busy = 0, first = 0, end = 0; bool bad = false; };
+static GpuFrameSum g_gpu_sum;
+std::atomic<uint64_t> g_gpu_ns{0}, g_gpu_max_ns{0}, g_gpu_span_ns{0}, g_gpu_frames{0};  // for the periodic report
+static void finish_gpu_frame() {
+    const GpuFrameSum& f = g_gpu_sum;
+    if (f.frame == UINT64_MAX || f.bad) return;
+    const uint64_t ns = (uint64_t)(f.busy * 1e9);
+    g_gpu_ns += ns;
+    g_gpu_span_ns += (uint64_t)((f.end - f.first) * 1e9);
+    ++g_gpu_frames;
+    if (ns > g_gpu_max_ns) g_gpu_max_ns = ns;
+    perf::gpu_frame(f.busy * 1e3);
+    // WWHD_PROFILE=1: frames over 30 ms busy (or 40 ms first start to last end) are logged, to line up with [hitch]
+    static const bool diagnostic = [] { const char* p = getenv("WWHD_PROFILE"); return p && !strcmp(p, "1"); }();
+    if (diagnostic && (f.busy > 0.030 || f.end - f.first > 0.040))
+        LOG("[gpuslow] frame %llu: GPU busy %.1f ms, first start to last end %.1f ms", (unsigned long long)f.frame,
+            f.busy * 1e3, (f.end - f.first) * 1e3);
+}
+static void read_gpu_times() {
     static uint64_t lastPoll = UINT64_MAX;
     if (lastPoll == R.frame) return;
     lastPoll = R.frame;
-    for (auto& q : overlayGpuTimes) {
-        if (!q.buffer || q.frame >= R.frame) continue;
-        auto status = q.buffer.status;
-        if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) continue;
-        perf::timestamp_read(R.frame - q.frame);
-        double ns = status == MTLCommandBufferStatusCompleted
-            ? (q.buffer.GPUEndTime - q.buffer.GPUStartTime) * 1e9 : -1;
-        perf::gpu_complete(q.frame, q.token, ns);
-        q = {};
+    while (!g_gpu_fifo.empty()) {
+        const GpuTimed& q = g_gpu_fifo.front();
+        const auto status = q.buffer.status;
+        if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) break;
+        if (q.frame != g_gpu_sum.frame) {
+            finish_gpu_frame();
+            g_gpu_sum = {};
+            g_gpu_sum.frame = q.frame;
+        }
+        GpuFrameSum& f = g_gpu_sum;
+        const double s = q.buffer.GPUStartTime, e = q.buffer.GPUEndTime;
+        if (status == MTLCommandBufferStatusError) f.bad = true;
+        else if (e > 0 && s > 0) {
+            if (f.end == 0) f.first = s;
+            const double from = std::max(s, f.end);
+            if (e > from) f.busy += e - from;
+            f.end = std::max(f.end, e);
+        }
+        g_gpu_fifo.pop_front();
     }
 }
 static id<MTLCommandBuffer> raw_command_buffer() {
     if (!R.cmd) {
-        read_overlay_gpu_times();
+        read_gpu_times();
         R.cmd = [R.queue commandBuffer];
         g_cmd_created_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         commandFrame = R.frame;
@@ -153,7 +179,6 @@ static id<MTLCommandBuffer> raw_command_buffer() {
                 if (t > 0 && (cur == 0 || t < cur || cur < t - 1000000000)) slot = t;
             }];
         }
-        commandToken = perf::gpu_begin(commandFrame);
     }
     return R.cmd;
 }
@@ -240,41 +265,7 @@ id<MTLCommandBuffer> command_buffer() {
 }
 
 uint32_t g_draws_since_commit = 0;
-std::atomic<uint64_t> g_gpu_ns{0};  // GPU busy time, for the periodic report
-
-static void track_gpu_time(id<MTLCommandBuffer> cb) {
-    const uint64_t frame = commandFrame;
-    const uint64_t token = commandToken;
-    // Keep explicit profiler diagnostics, but add no timing completion handler while hidden.
-    static const bool diagnostic = [] {
-        const char* p = getenv("WWHD_PROFILE"); return p && !strcmp(p, "1");
-    }();
-    if (token) {
-        bool stored = false;
-        for (auto& q : overlayGpuTimes) if (!q.buffer) {
-            q = {cb, frame, token}; overlayGpuPending = true; stored = true; break;
-        }
-        if (!stored) perf::gpu_complete(frame, token, -1); // bounded storage; omit partial frames
-    }
-    if (!diagnostic) return;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-        double t = b.GPUEndTime - b.GPUStartTime;
-        if (t > 0) g_gpu_ns += (uint64_t)(t * 1e9);
-        // per-frame GPU busy time and span; frames over 30 ms are logged (to line up with [hitch])
-        static uint64_t curFrame = ~0ull;
-        static double busy = 0, first = 0, last = 0;
-        if (frame != curFrame) {
-            if (curFrame != ~0ull && (busy > 0.030 || last - first > 0.040))
-                LOG("[gpuslow] frame %llu: GPU busy %.1f ms, first start to last end %.1f ms", (unsigned long long)curFrame,
-                    busy * 1e3, (last - first) * 1e3);
-            curFrame = frame;
-            busy = 0;
-            first = b.GPUStartTime;
-        }
-        if (t > 0) busy += t;
-        last = b.GPUEndTime;
-    }];
-}
+static void track_gpu_time(id<MTLCommandBuffer> cb) { g_gpu_fifo.push_back({cb, commandFrame}); }
 
 void end_encoder() {
     if (R.enc) {
@@ -707,7 +698,6 @@ void swap() {
         }];
         flush();
     }
-    perf::gpu_advance(R.frame);
     {
         // Hitch log: a frame over 45 ms of wall time gets one line saying what the render thread did
         // in it (texture work, new shaders/pipelines, passes split), so stutters can be attributed.
@@ -794,8 +784,14 @@ void swap() {
             cond / 300.0);
         LOG("[gfx] last 300 frames: %.1f clears/frame folded into the next pass, %.1f encoded on their own",
             g_clears_folded.exchange(0) / 300.0, g_clears_flushed.exchange(0) / 300.0);
-        LOG("[gfx] frame %llu, %llu draws so far, GPU %.1f ms/frame, render thread CPU %.2f ms/frame", (unsigned long long)R.frame,
-            (unsigned long long)R.drawCount, g_gpu_ns.exchange(0) / 1e6 / 300.0, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
+        {
+            const uint64_t gf = g_gpu_frames.exchange(0);
+            const double busy = gf ? g_gpu_ns.exchange(0) / 1e6 / gf : 0, span = gf ? g_gpu_span_ns.exchange(0) / 1e6 / gf : 0;
+            const double busyMax = g_gpu_max_ns.exchange(0) / 1e6;
+            LOG("[gfx] frame %llu, %llu draws so far, GPU busy %.2f ms/frame (max %.2f, first start to last end %.2f), "
+                "render thread CPU %.2f ms/frame", (unsigned long long)R.frame, (unsigned long long)R.drawCount,
+                busy, busyMax, span, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
+        }
         lastCpu = cpu;
         LOG("[inval] texture invalidates %llu, with candidates %llu, surfaces examined %llu",
             (unsigned long long)g_inval_texture, (unsigned long long)g_inval_passed, (unsigned long long)g_pages_marked);

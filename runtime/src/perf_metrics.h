@@ -1,4 +1,5 @@
-// Performance overlay measurements. GPU intervals include queue stalls; they are not GPU load.
+// Performance overlay measurements. Metal reports GPU busy time per frame (gaps and stalls left out);
+// Vulkan's GPU intervals include queue stalls, so they are not GPU load.
 #pragma once
 #include <array>
 #include <cmath>
@@ -32,6 +33,8 @@ void render_frame();
 uint64_t gpu_begin(uint64_t frame);
 void gpu_complete(uint64_t frame, uint64_t token, double ns);
 void gpu_advance(uint64_t frame);
+// Metal: one frame's measured GPU busy time (metal_main.mm), added directly.
+void gpu_frame(double ms);
 Snapshot snapshot();
 std::string format(const Snapshot&);
 std::string summary();
