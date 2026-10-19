@@ -1773,6 +1773,7 @@ std::atomic<uint64_t> g_pass_stats_merged{0};
 // 2 draw needs more targets, 3 different depth, 4 draw samples an attached target, 5 other targets; 6 passes with <=1 draw
 std::atomic<uint64_t> g_pass_why[7];
 static uint64_t g_pass_first_draw = 0;  // draws kept in a pass whose targets are a superset of theirs
+static int g_open_why = 0;  // why the pass before the one being opened ended (g_pass_why index; [pass] dump)
 // WWHD_GPU_PASS_TIMES=<frame>: GPU time of every render pass of that frame (Metal timestamp
 // counters at the pass's start of vertex and end of fragment work), logged most expensive first
 static id<MTLCounterSampleBuffer> g_pt_buf = nil;
@@ -1783,13 +1784,23 @@ static std::vector<uint64_t> g_pt_draws;
 static uint64_t g_pt_auto_frame = 0;
 static uint64_t g_pt_frame() {
     static const char* e = getenv("WWHD_GPU_PASS_TIMES");
-    static const uint64_t f = e && strcmp(e, "auto") ? strtoull(e, nullptr, 10) : 0;
+    static const uint64_t f = e && strcmp(e, "auto") && strcmp(e, "every") ? strtoull(e, nullptr, 10) : 0;
     return f ? f : g_pt_auto_frame;
 }
 static bool pass_timing_on() { return g_pt_frame() && R.frame == g_pt_frame(); }
 void pass_timing_arm(double lastFrameMs) {
     static const bool autoMode = getenv("WWHD_GPU_PASS_TIMES") && !strcmp(getenv("WWHD_GPU_PASS_TIMES"), "auto");
+    // WWHD_GPU_PASS_TIMES=every: one frame timed every 600 frames from frame 1500, up to 10 times,
+    // each with its [pass] dump (pass_dump_on), to see where GPU time goes in ordinary play
+    static const bool everyMode = getenv("WWHD_GPU_PASS_TIMES") && !strcmp(getenv("WWHD_GPU_PASS_TIMES"), "every");
     static int armed = 0;
+    if (everyMode) {
+        if (armed >= 10 || R.frame < 1500 || R.frame % 600) return;
+        g_pt_auto_frame = R.frame + 1;
+        armed++;
+        LOG("[gputime] timing frame %llu (every 600 frames)", (unsigned long long)g_pt_auto_frame);
+        return;
+    }
     if (!autoMode || armed >= 5 || R.frame < 1500 || lastFrameMs < 40) return;
     if (g_pt_auto_frame && R.frame < g_pt_auto_frame + 300) return;
     g_pt_auto_frame = R.frame + 1;
@@ -1932,7 +1943,8 @@ void pass_timing_end_frame(id<MTLCommandBuffer> last) {
 static uint64_t g_pass_dump_draws = 0;
 bool pass_dump_on() {
     static const uint64_t f = getenv("WWHD_PASS_DUMP") ? strtoull(getenv("WWHD_PASS_DUMP"), nullptr, 10) : 0;
-    return f && R.frame == f;
+    static const bool every = getenv("WWHD_GPU_PASS_TIMES") && !strcmp(getenv("WWHD_GPU_PASS_TIMES"), "every");
+    return (f && R.frame == f) || (every && g_pt_auto_frame && R.frame == g_pt_auto_frame);
 }
 // Merging: a draw whose colour targets are a subset of the open pass's (same slots and slices), with
 // the same depth or none, stays in that pass; the attachments it does not target get a zero write
@@ -1986,8 +1998,10 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, con
         for (int k = 0; k < g_draw_sampled_n; k++) sampled = sampled || (R.passDepth && g_draw_sampled[k] == R.passDepth);
         const int why = sameSurfaces ? 1 : !sharesAny ? 5 : sampled ? 4 : R.passDepth != depth ? 3 : superset ? 2 : 5;
         g_pass_why[why]++;
+        g_open_why = why;
     } else {
         g_pass_why[0]++;
+        g_open_why = 0;
     }
     if (R.enc && R.drawCount - g_pass_first_draw <= 1) g_pass_why[6]++;
     g_pass_first_draw = R.drawCount;
@@ -2005,7 +2019,9 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, con
         if (depth && depth->tex) bytes += (uint64_t)depth->tex.width * depth->tex.height * 5;
         if (pass_dump_on()) {
             char b[400];
-            int n = snprintf(b, sizeof b, "[pass] draw pass (prev had %llu draws):", (unsigned long long)(R.drawCount - g_pass_dump_draws));
+            static const char* const whyName[] = {"other work", "slice change", "more targets", "other depth", "sampling an attached target", "other targets"};
+            int n = snprintf(b, sizeof b, "[pass] draw pass (prev had %llu draws, ended by %s) PS %08X:", (unsigned long long)(R.drawCount - g_pass_dump_draws),
+                             whyName[g_open_why], g_pt_ps);
             for (int i = 0; i < 8; i++)
                 if (colors[i] && colors[i]->tex)
                     n += snprintf(b + n, sizeof b - n, " C%d %08X %lux%lu f%X", i, colors[i]->addr, (unsigned long)colors[i]->tex.width,
