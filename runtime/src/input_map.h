@@ -21,6 +21,7 @@ enum Action : int {
     kLUp, kLDown, kLLeft, kLRight,   // left stick (move)
     kRUp, kRDown, kRLeft, kRRight,   // right stick (camera)
     kScreenshot,                     // app action, not a GamePad input: save a screenshot (screenshot.h)
+    kQuickPrev, kQuickNext,          // app actions: step the game's quick select (mouse_look.h)
     kActionCount
 };
 const char* action_id(int a);     // JSON key, e.g. "ZL", "LeftStickUp"
@@ -53,12 +54,27 @@ int key_from_id(const std::string& id);  // kNoKey if unknown
 // Controls window reserves (Escape cancels a capture). Returns what the key does, or nullptr.
 const char* reserved_key(int code);
 
+// Mouse inputs (macOS / SDL). Each one drives one action (or none); they only reach the game while
+// the pointer is captured (mods/mouse.mm). The wheel steps once per notch.
+enum Mouse : int { kMouseLeft, kMouseRight, kMouseMiddle, kMouseBack, kMouseForward, kWheelUp, kWheelDown, kMouseCount };
+const char* mouse_id(int b);     // JSON key, e.g. "Left", "WheelUp"
+const char* mouse_label(int b);  // for the UI, e.g. "Left button"
+int mouse_from_id(const std::string& id);  // -1 if unknown
+constexpr int kNoAction = -1;
+
 struct Mapping {
     std::array<std::array<int, kKeysPerAction>, kActionCount> keys;  // kNoKey = empty slot
     std::array<int, kActionCount> pad;                                // kPadNone = unbound
+    std::array<int, kMouseCount> mouse;                               // action of each mouse input, kNoAction = none
     float deadzone = 0.0f;          // radial dead zone for controller sticks, 0..0.9
     bool invert_camera_y = false;   // right stick Y, keyboard and controller
     bool face_auto = false;         // Automatic face preset: follow the dominant pad's labels
+    // mouse (mouse_look.h): a click into the game captures the pointer, its movement turns the camera
+    bool mouse_look = true;
+    float mouse_sensitivity = 1.0f;  // 1 = 800 points/s of movement is a full right-stick push
+    bool mouse_invert_y = false;
+    float mouse_floor = 0.15f;       // smallest stick push the mouse gives (past the game's own dead zone), 0..0.5
+    bool mouse_menu_release = true;  // + / − (the game's menus) release the pointer; + / − / B recapture it
     static Mapping defaults();
     bool operator==(const Mapping&) const = default;
 };
@@ -129,6 +145,7 @@ void set_pad_binding(Mapping& m, int action, int pad);
 // actions (other than `except`) that use this key / controller input
 std::vector<int> key_users(const Mapping& m, int code, int except = -1);
 std::vector<int> pad_users(const Mapping& m, int pad, int except = -1);
+std::vector<int> mouse_inputs(const Mapping& m, int action);  // mouse inputs bound to `action`
 // true if a key or the controller input bound to `a` is also bound to another action
 bool has_conflict(const Mapping& m, int a);
 // keys + controller inputs bound to more than one action (each counted once)

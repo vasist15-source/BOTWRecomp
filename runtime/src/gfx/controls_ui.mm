@@ -422,9 +422,9 @@ struct UIState {
     multi(@"Left stick (move)", {kLUp, kLDown, kLLeft, kLRight, kStickLClick}, {@"↑", @"↓", @"←", @"→", @"Click"}, PU(d.lstick), false);
     multi(@"Right stick (camera)", {kRUp, kRDown, kRLeft, kRRight, kStickRClick}, {@"↑", @"↓", @"←", @"→", @"Click"}, PU(d.rstick), true);
     multi(@"D-pad", {kDUp, kDDown, kDLeft, kDRight}, {@"↑", @"↓", @"←", @"→"}, PU(d.dpad), false);
-    // app actions: the bottom of the left column, no leader line ("Photo": the row label column is narrow;
-    // hovering shows "Screenshot (app)")
-    single(@"Photo", kScreenshot, NSMakePoint(0, sz.height), false);
+    // app actions: the bottom of the left column, no leader line (short row labels: the row label column is
+    // narrow; hovering shows the full name)
+    multi(@"Extras", {kScreenshot, kQuickPrev, kQuickNext}, {@"Photo", @"Item ◀", @"Item ▶"}, NSMakePoint(0, sz.height), false);
     g.groups.back().leader = false;
     for (auto& p : g.parts)
         if (p.kind == kPartRound) {

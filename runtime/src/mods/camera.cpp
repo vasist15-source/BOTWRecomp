@@ -36,6 +36,7 @@
 // manual and subject modes run at 30 Hz in both 60 fps modes (true60 converts the follow camera only),
 // so the per-step amounts above hold in all modes; interpolation blends the drawn camera.
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -43,7 +44,9 @@
 #include <vector>
 
 #include "input.h"
+#include "input_map.h"
 #include "mods.h"
+#include "../mouse_look.h"
 #include "../motion/motion.h"
 #include "runtime.h"
 
@@ -63,7 +66,7 @@ constexpr uint32_t kReadyItemBtn = 0x68D9;  // daPy_lk_c::mReadyItemBtn
 
 std::mutex g_mu;
 float g_dx = 0, g_dy = 0;       // mouse movement not yet used by the camera (points)
-uint64_t g_move_step = 0;       // logic step of the last mouse movement
+uint64_t g_move_step = ~0ull;   // logic step of the last mouse movement (Wind Waker camera; never set here)
 float g_wheel = 0;              // wheel movement not yet used
 bool g_left = false;            // left button held (captured)
 uint64_t g_manual_step = ~0ull, g_subject_step = ~0ull;  // last step manualCamera / subjectCamera ran
@@ -168,24 +171,21 @@ bool test_mouse() {
 }
 }  // namespace
 
-void mouse_add(float dx, float dy) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_dx += dx;
-    g_dy += dy;
-    g_move_step = step();
-}
-void mouse_wheel(float dy) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_wheel += dy;
-}
-void mouse_button(int button, bool down) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    if (button == 0) g_left = down;
-}
+// Breath of the Wild has none of the Wind Waker camera hooks above: the mouse goes to mouse_look
+// (the right stick, the mouse bindings), which the test aids below still feed
+void mouse_add(float dx, float dy) { mouse_look::motion(dx, dy); }
+void mouse_wheel(float dy) { mouse_look::wheel(dy); }
+void mouse_button(int button, bool down) { mouse_look::button(button, down); }
 
 // end of input::read(): synthetic right stick for the mouse, R3 pulses for the wheel, left click
 void filter_pad(input::PadState& s) {
     inject_test_mouse();
+    {
+        // the mouse (it only moves this while captured, so with mouse controls on) and quick select
+        using clock = std::chrono::steady_clock;
+        static const clock::time_point t0 = clock::now();
+        mouse_look::apply(s, input_map::current(), std::chrono::duration<double>(clock::now() - t0).count());
+    }
     test_goto(s);
     uint64_t now = step();
     std::lock_guard<std::mutex> lk(g_mu);

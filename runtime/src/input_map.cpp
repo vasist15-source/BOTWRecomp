@@ -35,6 +35,13 @@ const ActionInfo kActions[kActionCount] = {
     {"RightStickUp", "Right stick ↑ (camera)", 0}, {"RightStickDown", "Right stick ↓ (camera)", 0},
     {"RightStickLeft", "Right stick ← (camera)", 0}, {"RightStickRight", "Right stick → (camera)", 0},
     {"Screenshot", "Screenshot (app)", 0},
+    {"QuickSelectPrev", "Quick select ◀ (previous item)", 0}, {"QuickSelectNext", "Quick select ▶ (next item)", 0},
+};
+
+struct MouseInfo { const char* id; const char* label; };
+const MouseInfo kMice[kMouseCount] = {
+    {"Left", "Left button"}, {"Right", "Right button"}, {"Middle", "Middle button"},
+    {"Back", "Back button (4)"}, {"Forward", "Forward button (5)"}, {"WheelUp", "Wheel up"}, {"WheelDown", "Wheel down"},
 };
 
 struct PadInfo { const char* id; const char* label; };
@@ -109,6 +116,14 @@ int action_from_id(const std::string& id) {
     return -1;
 }
 
+const char* mouse_id(int b) { return b >= 0 && b < kMouseCount ? kMice[b].id : ""; }
+const char* mouse_label(int b) { return b >= 0 && b < kMouseCount ? kMice[b].label : ""; }
+int mouse_from_id(const std::string& id) {
+    for (int b = 0; b < kMouseCount; b++)
+        if (id == kMice[b].id) return b;
+    return -1;
+}
+
 const char* pad_id(int p) { return p >= 0 && p < kPadCount ? kPads[p].id : ""; }
 const char* pad_label(int p) { return p > 0 && p < kPadCount ? kPads[p].label : ""; }
 int pad_from_id(const std::string& id) {
@@ -140,17 +155,10 @@ int key_from_id(const std::string& id) {
 }
 
 const char* reserved_key(int code) {
-    // keep in sync with gfx::menu_hotkey (gfx/menu.mm)
+    // keep in sync with gfx::menu_hotkey (gfx/menu.mm). Its single-letter and digit hotkeys (N, R, P,
+    // 6-9) are not reserved: a key the controls bind goes to the game instead (gfx/input.mm).
     switch (code) {
-    case kVK_ANSI_O: return "Graphics › Ambient occlusion";
-    case kVK_ANSI_M: return "Graphics › Full-size occlusion depth";
-    case kVK_ANSI_N: return "Graphics › Anisotropic filtering";
-    case kVK_ANSI_R: return "Graphics › Internal resolution";
-    case kVK_ANSI_6: return "Graphics › Frame rate: 60 fps";
-    case kVK_ANSI_7: return "Graphics › Frame rate: uncapped";
-    case kVK_ANSI_8: return "Graphics › FXAA";
-    case kVK_ANSI_9: return "Graphics › Record sound activity";
-    case kVK_ANSI_P: case kVK_F12: return "Graphics › Capture frame";
+    case kVK_F12: return "Graphics › Capture frame";
     case kVK_F1: return "the settings overlay (F1; Shift+F1 saves slot 1)";
     case kVK_F2: case kVK_F3: case kVK_F4: case kVK_F5: return "Save States (F2-F5 load, Shift+F1-F5 save)";
     case kVK_Escape: return "cancelling a key assignment";
@@ -166,14 +174,20 @@ Mapping Mapping::defaults() {
     for (auto& k : m.keys) k.fill(kNoKey);
     m.pad.fill(kPadNone);
     auto key = [&](int a, int k0, int k1 = kNoKey) { m.keys[a] = {k0, k1}; };
-    key(kA, kVK_ANSI_K, kVK_Space); key(kB, kVK_ANSI_J); key(kX, kVK_ANSI_L); key(kY, kVK_ANSI_I);
-    key(kL, kVK_ANSI_Q); key(kR, kVK_ANSI_E); key(kZL, kVK_Shift); key(kZR, kVK_ANSI_C);
-    key(kPlus, kVK_Return); key(kMinus, kVK_Tab); key(kHome, kVK_ANSI_H);
-    key(kDUp, kVK_ANSI_1); key(kDDown, kVK_ANSI_2); key(kDLeft, kVK_ANSI_3); key(kDRight, kVK_ANSI_4);
-    key(kStickLClick, kVK_ANSI_X); key(kStickRClick, kVK_ANSI_V);
+    // Breath of the Wild with keyboard and mouse: E interact, Shift sprint / back, Space jump, F attack,
+    // Q rune, R throw, Z shield / lock on, X bow, C crouch, V look, Tab inventory, M map, 1-4 the
+    // D-pad (↑ runes, → weapons, ← shields, ↓ whistle), [ ] quick select
+    key(kA, kVK_ANSI_E, kVK_Return); key(kB, kVK_Shift, kVK_Delete); key(kX, kVK_Space); key(kY, kVK_ANSI_F);
+    key(kL, kVK_ANSI_Q); key(kR, kVK_ANSI_R); key(kZL, kVK_ANSI_Z); key(kZR, kVK_ANSI_X);
+    key(kPlus, kVK_Tab, kVK_ANSI_I); key(kMinus, kVK_ANSI_M); key(kHome, kVK_ANSI_H);
+    key(kDUp, kVK_ANSI_1); key(kDRight, kVK_ANSI_2); key(kDLeft, kVK_ANSI_3); key(kDDown, kVK_ANSI_4);
+    key(kStickLClick, kVK_ANSI_C); key(kStickRClick, kVK_ANSI_V);
     key(kLUp, kVK_ANSI_W); key(kLDown, kVK_ANSI_S); key(kLLeft, kVK_ANSI_A); key(kLRight, kVK_ANSI_D);
     key(kRUp, kVK_UpArrow); key(kRDown, kVK_DownArrow); key(kRLeft, kVK_LeftArrow); key(kRRight, kVK_RightArrow);
     key(kScreenshot, kVK_F10);  // free on every host (F11: SDL full screen, F12/P: debug frame capture)
+    key(kQuickPrev, kVK_ANSI_LeftBracket); key(kQuickNext, kVK_ANSI_RightBracket);
+    // mouse: left attack, right shield / lock on, middle look, side buttons bow and throw, wheel quick select
+    m.mouse = {kY, kZL, kStickRClick, kZR, kR, kQuickPrev, kQuickNext};
     // controllers map by position: the bottom face button (Xbox A) is the Wii U's B (face_layout)
     const int pads[kActionCount] = {
         kPadNone, kPadNone, kPadNone, kPadNone,  // A B X Y: face-layout preset, filled below
@@ -181,6 +195,7 @@ Mapping Mapping::defaults() {
         kPadDUp, kPadDDown, kPadDLeft, kPadDRight, kPadL3, kPadR3,
         kPadLSUp, kPadLSDown, kPadLSLeft, kPadLSRight, kPadRSUp, kPadRSDown, kPadRSLeft, kPadRSRight,
         kPadNone,  // Screenshot: no controller input by default (every button already plays)
+        kPadNone, kPadNone,  // quick select: the controller has the D-pad and the right stick
     };
     for (int a = 0; a < kActionCount; a++) m.pad[a] = pads[a];
     apply_face_layout(m, FaceLayout::kPosition);
@@ -357,6 +372,12 @@ std::vector<int> key_users(const Mapping& m, int code, int except) {
         if (a != except)
             for (int k : m.keys[a])
                 if (k == code) { v.push_back(a); break; }
+    return v;
+}
+std::vector<int> mouse_inputs(const Mapping& m, int action) {
+    std::vector<int> v;
+    for (int b = 0; b < kMouseCount; b++)
+        if (m.mouse[b] == action && action != kNoAction) v.push_back(b);
     return v;
 }
 std::vector<int> pad_users(const Mapping& m, int pad, int except) {
@@ -593,8 +614,27 @@ std::string quote(const std::string& s) {
 }
 }  // namespace
 
+// the keyboard defaults of controls.json version 1 (the Wind Waker port's), for from_json's upgrade
+static std::array<std::array<int, kKeysPerAction>, kActionCount> wind_waker_keys() {
+    std::array<std::array<int, kKeysPerAction>, kActionCount> k;
+    for (auto& a : k) a.fill(kNoKey);
+    auto key = [&](int a, int k0, int k1 = kNoKey) { k[a] = {k0, k1}; };
+    key(kA, kVK_ANSI_K, kVK_Space); key(kB, kVK_ANSI_J); key(kX, kVK_ANSI_L); key(kY, kVK_ANSI_I);
+    key(kL, kVK_ANSI_Q); key(kR, kVK_ANSI_E); key(kZL, kVK_Shift); key(kZR, kVK_ANSI_C);
+    key(kPlus, kVK_Return); key(kMinus, kVK_Tab); key(kHome, kVK_ANSI_H);
+    key(kDUp, kVK_ANSI_1); key(kDDown, kVK_ANSI_2); key(kDLeft, kVK_ANSI_3); key(kDRight, kVK_ANSI_4);
+    key(kStickLClick, kVK_ANSI_X); key(kStickRClick, kVK_ANSI_V);
+    key(kLUp, kVK_ANSI_W); key(kLDown, kVK_ANSI_S); key(kLLeft, kVK_ANSI_A); key(kLRight, kVK_ANSI_D);
+    key(kRUp, kVK_UpArrow); key(kRDown, kVK_DownArrow); key(kRLeft, kVK_LeftArrow); key(kRRight, kVK_RightArrow);
+    key(kScreenshot, kVK_F10);
+    // version 1 had no quick select: from_json leaves those at this game's defaults
+    k[kQuickPrev] = Mapping::defaults().keys[kQuickPrev];
+    k[kQuickNext] = Mapping::defaults().keys[kQuickNext];
+    return k;
+}
+
 std::string to_json(const Mapping& m) {
-    std::string o = "{\n  \"version\": 1,\n  \"keyboard\": {\n";
+    std::string o = "{\n  \"version\": 2,\n  \"keyboard\": {\n";
     for (int a = 0; a < kActionCount; a++) {
         o += "    " + quote(action_id(a)) + ": [";
         bool first = true;
@@ -610,10 +650,18 @@ std::string to_json(const Mapping& m) {
         o += "    " + quote(action_id(a)) + ": " + (m.pad[a] == kPadNone ? std::string("null") : quote(pad_id(m.pad[a])));
         o += a + 1 < kActionCount ? ",\n" : "\n";
     }
-    char opt[192];
+    o += "  },\n  \"mouse\": {\n";
+    for (int b = 0; b < kMouseCount; b++) {
+        o += "    " + quote(mouse_id(b)) + ": " + (m.mouse[b] == kNoAction ? std::string("null") : quote(action_id(m.mouse[b])));
+        o += b + 1 < kMouseCount ? ",\n" : "\n";
+    }
+    char opt[512];
     snprintf(opt, sizeof opt,
-             "  },\n  \"options\": {\n    \"stick_deadzone\": %.3g,\n    \"invert_camera_y\": %s%s\n  }\n}\n",
-             m.deadzone, m.invert_camera_y ? "true" : "false",
+             "  },\n  \"options\": {\n    \"stick_deadzone\": %.3g,\n    \"invert_camera_y\": %s,\n"
+             "    \"mouse_look\": %s,\n    \"mouse_sensitivity\": %.3g,\n    \"mouse_invert_y\": %s,\n"
+             "    \"mouse_floor\": %.3g,\n    \"mouse_menu_release\": %s%s\n  }\n}\n",
+             m.deadzone, m.invert_camera_y ? "true" : "false", m.mouse_look ? "true" : "false", m.mouse_sensitivity,
+             m.mouse_invert_y ? "true" : "false", m.mouse_floor, m.mouse_menu_release ? "true" : "false",
              m.face_auto ? ",\n    \"face_layout\": \"auto\"" : "");
     return o + opt;
 }
@@ -647,6 +695,21 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
             }
         }
     }
+    // version 1 is the Wind Waker layout (K = A, J = B, ...): a file that still has its default keys
+    // gets this game's keyboard defaults; a layout the player changed is kept
+    const Json* ver = root.get("version");
+    if ((!ver || ver->type != Json::Num || ver->n < 2) && m.keys == wind_waker_keys()) m.keys = Mapping::defaults().keys;
+    if (const Json* ms = root.get("mouse"); ms && ms->type == Json::Obj) {
+        for (auto& [id, v] : ms->obj) {
+            int b = mouse_from_id(id);
+            if (b < 0) { warn += "unknown mouse input \"" + id + "\"; "; continue; }
+            if (v.type == Json::Null) { m.mouse[b] = kNoAction; continue; }
+            if (v.type != Json::Str) continue;
+            int a = action_from_id(v.s);
+            if (a < 0) { warn += "unknown input \"" + v.s + "\"; "; continue; }
+            m.mouse[b] = a;
+        }
+    }
     if (const Json* pc = root.get("controller"); pc && pc->type == Json::Obj) {
         for (auto& [id, v] : pc->obj) {
             int a = action_from_id(id);
@@ -663,6 +726,12 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
         if (const Json* d = op->get("stick_deadzone"); d && d->type == Json::Num)
             m.deadzone = std::clamp((float)d->n, 0.0f, 0.9f);
         if (const Json* i = op->get("invert_camera_y"); i && i->type == Json::Bool) m.invert_camera_y = i->b;
+        if (const Json* i = op->get("mouse_look"); i && i->type == Json::Bool) m.mouse_look = i->b;
+        if (const Json* d = op->get("mouse_sensitivity"); d && d->type == Json::Num)
+            m.mouse_sensitivity = std::clamp((float)d->n, 0.05f, 10.0f);
+        if (const Json* i = op->get("mouse_invert_y"); i && i->type == Json::Bool) m.mouse_invert_y = i->b;
+        if (const Json* d = op->get("mouse_floor"); d && d->type == Json::Num) m.mouse_floor = std::clamp((float)d->n, 0.0f, 0.5f);
+        if (const Json* i = op->get("mouse_menu_release"); i && i->type == Json::Bool) m.mouse_menu_release = i->b;
         // only "automatic" is stored: the two manual presets are the shape of the face bindings
         if (const Json* f = op->get("face_layout"); f && f->type == Json::Str) m.face_auto = f->s == "auto";
         else if (faceSet) m.face_auto = false;

@@ -790,18 +790,27 @@ std::string summary(const input_map::Mapping& m, int a) {
     for (int k : m.keys[a])
         if (k != input_map::kNoKey) out += (out.empty() ? "" : "  -  ") + input_map::key_label(k);
     if (m.pad[a] != input_map::kPadNone) out += (out.empty() ? "controller " : "  -  controller ") + std::string(input_map::pad_label(m.pad[a]));
+    for (int b : input_map::mouse_inputs(m, a)) out += (out.empty() ? "mouse " : "  -  mouse ") + std::string(input_map::mouse_label(b));
     return out.empty() ? "not bound" : out;
+}
+
+static bool g_mouse_open = false;  // the Mouse window (Controls tab)
+std::string mouse_summary(const input_map::Mapping& m, int a) {
+    std::string out;
+    for (int b : input_map::mouse_inputs(m, a)) out += (out.empty() ? "" : ", ") + std::string(input_map::mouse_label(b));
+    return out.empty() ? "-" : out;
 }
 
 // the table (List view)
 void controls_list(input_map::Mapping& m, float h) {
-    if (ImGui::BeginTable("map", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchSame,
+    if (ImGui::BeginTable("map", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchSame,
                           ImVec2(0, h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Wii U input", ImGuiTableColumnFlags_WidthStretch, 1.6f);
         ImGui::TableSetupColumn("Key");
         ImGui::TableSetupColumn("Key 2");
         ImGui::TableSetupColumn("Controller");
+        ImGui::TableSetupColumn("Mouse");
         ImGui::TableHeadersRow();
         for (int a = 0; a < input_map::kActionCount; a++) {
             ImGui::PushID(a);
@@ -825,6 +834,8 @@ void controls_list(input_map::Mapping& m, float h) {
                      (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))))
                     clear_binding(a, col);
             }
+            ImGui::TableNextColumn();  // mouse: edited in the Mouse window (one action per mouse input)
+            if (ImGui::Button((mouse_summary(m, a) + "##mouse").c_str(), ImVec2(-FLT_MIN, 0)) && U.cap_action < 0) g_mouse_open = true;
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -941,6 +952,76 @@ void gyro_window(bool& open) {
     ImGui::TextUnformatted(motion::status().c_str());
     ImGui::PopTextWrapPos();
     if (!(g == before)) save_gyro(g);
+    if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+// the Mouse window (Controls tab > Mouse...): capture, camera sensitivity, and what each mouse input does
+void mouse_window(bool& open) {
+    const char* title = "Mouse##mouse";
+    if (open) { ImGui::OpenPopup(title); open = false; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+    input_map::Mapping m = input_map::current();
+    const input_map::Mapping before = m;
+    bool v;
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34);
+    if (check("Mouse controls", m.mouse_look, &v)) m.mouse_look = v;
+    help("Click the game to capture the pointer: it disappears, moving the mouse turns the camera and the "
+         "buttons and wheel do what is set below. Esc or a quick tap of Cmd lets the pointer go; so do this "
+         "menu, dialogs and switching to another app. Click the game again to capture it.");
+    ImGui::BeginDisabled(!m.mouse_look);
+    ImGui::SetNextItemWidth(220);
+    ImGui::SliderFloat("Camera sensitivity", &m.mouse_sensitivity, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    ImGui::SameLine(0, 16);
+    if (check("Invert up/down", m.mouse_invert_y, &v)) m.mouse_invert_y = v;
+    float floor = m.mouse_floor * 100.0f;
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::SliderFloat("Smallest camera push", &floor, 0.0f, 50.0f, "%.0f%%")) m.mouse_floor = std::clamp(floor / 100.0f, 0.0f, 0.5f);
+    help("The game ignores a slightly pushed stick. Even slow mouse movement pushes the camera stick at "
+         "least this far; raise it if small movements do nothing, lower it if the camera jumps.");
+    if (check("Let the pointer go in the game's menus", m.mouse_menu_release, &v)) m.mouse_menu_release = v;
+    help("+ or − (the inventory, the map) shows the pointer; B, or the same button again, captures it again. "
+         "The game's own menu state is not visible to the port, so this follows those presses.");
+    heading("Buttons and wheel");
+    for (int b = 0; b < input_map::kMouseCount; b++) {
+        ImGui::PushID(b);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(input_map::mouse_label(b));
+        ImGui::SameLine(ImGui::GetFontSize() * 10);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+        const int cur = m.mouse[b];
+        if (ImGui::BeginCombo("##act", cur == input_map::kNoAction ? "Nothing" : input_map::action_label(cur))) {
+            if (ImGui::Selectable("Nothing", cur == input_map::kNoAction)) m.mouse[b] = input_map::kNoAction;
+            for (int a = 0; a < input_map::kActionCount; a++)
+                if (a != input_map::kScreenshot && ImGui::Selectable(input_map::action_label(a), cur == a)) m.mouse[b] = a;
+            ImGui::EndCombo();
+        }
+        ImGui::PopID();
+    }
+    help("Quick select: one step through the item bar per wheel notch (it opens the weapons; hold a D-pad "
+         "key first for the runes or shields), and lets go after a moment, which equips the item.");
+    if (ImGui::Button("Default mouse settings")) {
+        const input_map::Mapping d = input_map::Mapping::defaults();
+        m.mouse = d.mouse;
+        m.mouse_look = d.mouse_look;
+        m.mouse_sensitivity = d.mouse_sensitivity;
+        m.mouse_invert_y = d.mouse_invert_y;
+        m.mouse_floor = d.mouse_floor;
+        m.mouse_menu_release = d.mouse_menu_release;
+    }
+    ImGui::EndDisabled();
+    ImGui::PopTextWrapPos();
+    // applied at once; a slider is saved to controls.json when it is let go, not on every step of the drag
+    static bool unsaved = false;
+    const bool dragging = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (!(m == before)) {
+        input_map::set_current(m, !dragging);
+        unsaved = dragging;
+    } else if (unsaved && !dragging) {
+        input_map::set_current(m);
+        unsaved = false;
+    }
     if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }
@@ -1089,6 +1170,10 @@ void tab_controls() {
         help("Aim in first person by moving a controller with a gyro, a Cemuhook (DSU) source or the mouse (Steam Input)");
     }
     gyro_window(gyro_open);
+    ImGui::SameLine(0, 24);
+    if (ImGui::Button(m.mouse_look ? "Mouse..." : "Mouse: off...")) g_mouse_open = true;
+    help("Mouse camera, sensitivity, and what the mouse buttons and wheel do");
+    mouse_window(g_mouse_open);
     ImGui::SameLine(0, 24);
     if (ImGui::Button("Reset to defaults")) input_map::set_current(input_map::Mapping::defaults());
 }

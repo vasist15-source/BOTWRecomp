@@ -2,10 +2,10 @@
 // Keyboard and GameController input, merged into one GamePad state.
 //
 // Which key or controller input drives which GamePad input is the controls mapping (input_map.h,
-// edited in Input > Controls…). Defaults: WASD move, arrows camera, K/Space = A, J = B, L = X, I = Y,
-// Q = L, E = R, Left Shift = ZL, C = ZR, Enter = +, Tab = -, H = Home, 1-4 = D-pad up/down/left/right,
-// X = L-stick click, V = R-stick click; controllers use button positions (Xbox "A" = Wii U B),
-// switchable to by-label with input_map::FaceLayout (issue #78).
+// edited in the settings overlay's Controls tab; defaults in Mapping::defaults: WASD move, arrows and
+// the mouse camera, E interact, Shift sprint, Space jump, F / left click attack ...); controllers use
+// button positions (Xbox "A" = Wii U B), switchable to by-label with input_map::FaceLayout (issue #78).
+// The mouse: mods/mouse.mm and mouse_look.h.
 #import <AppKit/AppKit.h>
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime
@@ -23,6 +23,7 @@
 #include "../true60.h"
 #include "../motion/motion.h"
 #include "../overlay/overlay.h"
+#include "../mouse_look.h"
 
 #include <memory>
 #include <string>
@@ -357,7 +358,13 @@ void init() {
         }
         std::lock_guard<std::mutex> lk(g_mu);
         if (e.type == NSEventTypeKeyDown && !e.isARepeat && mods::host_key_down(code)) return nil;  // e.g. Esc releases the mouse
-        if (e.type == NSEventTypeKeyDown && !e.isARepeat && gfx::menu_hotkey(code)) return nil;
+        if (e.type == NSEventTypeKeyDown && !e.isARepeat) {
+            // a key the controls bind plays (the Graphics hotkeys N, R, P, 6-9 only act on free keys)
+            const std::vector<int> users = input_map::key_users(input_map::current(), code);
+            if (users.empty() && gfx::menu_hotkey(code)) return nil;
+            for (int a : users)
+                if (a == input_map::kQuickPrev || a == input_map::kQuickNext) mouse_look::quick_step(a == input_map::kQuickNext ? 1 : -1);
+        }
         // a repeat never presses a key: one held down while the overlay or the text prompt had the keyboard
         // (Enter that confirmed a name) stays out of the game until pressed again
         if (e.type == NSEventTypeKeyDown) g_keys[code] = g_keys[code] || !e.isARepeat;
@@ -407,6 +414,15 @@ void init() {
             }
             motion::poll_recalibrate(v, keys);
             screenshot::poll_controller(v);  // a controller input bound to Screenshot
+            // controller inputs bound to quick select step it once per press
+            static bool quick_held[2] = {};
+            const input_map::Mapping m = input_map::current();
+            for (int i = 0; i < 2; i++) {
+                const int p = m.pad[i ? input_map::kQuickNext : input_map::kQuickPrev];
+                const bool held = p != input_map::kPadNone && v[p] > 0.5f;
+                if (held && !quick_held[i]) mouse_look::quick_step(i ? 1 : -1);
+                quick_held[i] = held;
+            }
         }
         mods::update_gyro_mouse();
     }];

@@ -10,6 +10,7 @@
 #include <string>
 
 #include "input_map.h"
+#include "mouse_look.h"
 #include "platform/touch_face.h"
 
 using namespace input_map;
@@ -29,13 +30,14 @@ static input::PadState press(const Mapping& m, std::initializer_list<int> codes)
 
 static void test_defaults() {
     Mapping m = Mapping::defaults();
-    // the hard-coded keyboard layout this replaces
+    // Breath of the Wild's keyboard layout
     struct { int code; uint32_t bit; } old[] = {
-        {kVK_ANSI_K, input::kA}, {kVK_Space, input::kA}, {kVK_ANSI_J, input::kB}, {kVK_ANSI_L, input::kX},
-        {kVK_ANSI_I, input::kY}, {kVK_ANSI_Q, input::kL}, {kVK_ANSI_E, input::kR}, {kVK_Shift, input::kZL},
-        {kVK_ANSI_C, input::kZR}, {kVK_Return, input::kPlus}, {kVK_Tab, input::kMinus}, {kVK_ANSI_H, input::kHome},
-        {kVK_ANSI_1, input::kUp}, {kVK_ANSI_2, input::kDown}, {kVK_ANSI_3, input::kLeft}, {kVK_ANSI_4, input::kRight},
-        {kVK_ANSI_X, input::kStickL}, {kVK_ANSI_V, input::kStickR},
+        {kVK_ANSI_E, input::kA}, {kVK_Return, input::kA}, {kVK_Shift, input::kB}, {kVK_Delete, input::kB},
+        {kVK_Space, input::kX}, {kVK_ANSI_F, input::kY}, {kVK_ANSI_Q, input::kL}, {kVK_ANSI_R, input::kR},
+        {kVK_ANSI_Z, input::kZL}, {kVK_ANSI_X, input::kZR}, {kVK_Tab, input::kPlus}, {kVK_ANSI_I, input::kPlus},
+        {kVK_ANSI_M, input::kMinus}, {kVK_ANSI_H, input::kHome},
+        {kVK_ANSI_1, input::kUp}, {kVK_ANSI_2, input::kRight}, {kVK_ANSI_3, input::kLeft}, {kVK_ANSI_4, input::kDown},
+        {kVK_ANSI_C, input::kStickL}, {kVK_ANSI_V, input::kStickR},
     };
     for (auto& o : old) CHECK(press(m, {o.code}).buttons == o.bit);
     auto s = press(m, {kVK_ANSI_W, kVK_ANSI_D});
@@ -46,7 +48,10 @@ static void test_defaults() {
     CHECK(s.ly == -1);
     s = press(m, {kVK_UpArrow, kVK_RightArrow});
     CHECK(s.rx == 1 && s.ry == 1);  // right stick: no diagonal scaling (as before)
-    CHECK(press(m, {kVK_ANSI_Z}).buttons == 0);
+    CHECK(press(m, {kVK_ANSI_K}).buttons == 0);
+    // the mouse: left attack, right shield, wheel quick select; quick select keys press nothing themselves
+    CHECK(m.mouse[kMouseLeft] == kY && m.mouse[kMouseRight] == kZL && m.mouse[kWheelDown] == kQuickNext);
+    CHECK(press(m, {kVK_ANSI_RightBracket}).buttons == 0 && m.mouse_look);
     // the Screenshot app action: F10, no controller input, never a GamePad button or stick
     CHECK(m.keys[kScreenshot][0] == kVK_F10 && m.pad[kScreenshot] == kPadNone);
     CHECK(press(m, {kVK_F10}).buttons == 0 && press(m, {kVK_F10}).lx == 0);
@@ -294,23 +299,24 @@ static void test_names() {
 }
 
 static void test_reserved() {
-    for (int k : std::initializer_list<int>{kVK_ANSI_O, kVK_ANSI_M, kVK_ANSI_N, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9, kVK_ANSI_P,
-                  kVK_ANSI_R, kVK_F12, kVK_Escape})
+    for (int k : std::initializer_list<int>{kVK_F1, kVK_F2, kVK_F5, kVK_F12, kVK_Escape, kVK_Command})
         CHECK(reserved_key(k) != nullptr);
-    CHECK(reserved_key(kVK_ANSI_K) == nullptr);
+    // the single-key Graphics hotkeys give way to a binding (gfx/input.mm)
+    for (int k : std::initializer_list<int>{kVK_ANSI_K, kVK_ANSI_R, kVK_ANSI_M, kVK_ANSI_N, kVK_ANSI_P, kVK_ANSI_6})
+        CHECK(reserved_key(k) == nullptr);
     CHECK(reserved_key(kVK_ANSI_5) == nullptr);
 }
 
 static void test_conflicts() {
     Mapping m = Mapping::defaults();
-    auto u = key_users(m, kVK_ANSI_K);
+    auto u = key_users(m, kVK_ANSI_E);
     CHECK(u.size() == 1 && u[0] == kA);
-    CHECK(key_users(m, kVK_ANSI_K, kA).empty());
-    m.keys[kB][1] = kVK_ANSI_K;  // K on A and B
-    u = key_users(m, kVK_ANSI_K, kB);
+    CHECK(key_users(m, kVK_ANSI_E, kA).empty());
+    m.keys[kB][1] = kVK_ANSI_E;  // E on A and B
+    u = key_users(m, kVK_ANSI_E, kB);
     CHECK(u.size() == 1 && u[0] == kA);
-    CHECK(key_users(m, kVK_ANSI_K).size() == 2);
-    CHECK(press(m, {kVK_ANSI_K}).buttons == (input::kA | input::kB));
+    CHECK(key_users(m, kVK_ANSI_E).size() == 2);
+    CHECK(press(m, {kVK_ANSI_E}).buttons == (input::kA | input::kB));
     auto p = pad_users(m, kPadA);
     CHECK(p.size() == 1 && p[0] == kB);
     CHECK(pad_users(m, kPadNone).empty());
@@ -330,12 +336,19 @@ static void test_json_roundtrip() {
     m.keys[kZR] = {kVK_ANSI_C, 93};  // unnamed code survives as "Key93"
     m.deadzone = 0.15f;
     m.invert_camera_y = true;
+    m.mouse[kMouseMiddle] = kNoAction;
+    m.mouse[kWheelUp] = kDUp;
+    m.mouse_look = false;
+    m.mouse_sensitivity = 2.5f;
+    m.mouse_invert_y = true;
+    m.mouse_floor = 0.25f;
+    m.mouse_menu_release = false;
     std::string j = to_json(m);
     CHECK(j.find("\"Key93\"") != std::string::npos);
     CHECK(from_json(j, r, &err) && err.empty());
     CHECK(r == m);
-    CHECK(press(r, {kVK_ANSI_K}).buttons == input::kB);
-    CHECK(press(r, {kVK_ANSI_J}).buttons == input::kA);
+    CHECK(press(r, {kVK_ANSI_E}).buttons == input::kB);
+    CHECK(press(r, {kVK_Shift}).buttons == input::kA);
     CHECK(press(r, {kVK_ANSI_H}).buttons == 0);
     CHECK(press(r, {kVK_UpArrow}).ry == -1);  // inverted camera
     CHECK(press(r, {kVK_ANSI_W}).ly == 1);    // move stick not inverted
@@ -361,7 +374,7 @@ static void test_json_partial_and_bad() {
     CHECK(r.pad[kHome] == kPadNone && r.pad[kA] == kPadB);
     CHECK(r.deadzone == 0 && !r.invert_camera_y);
     // unknown names and app shortcuts are dropped with a warning, the rest still loads
-    CHECK(from_json(R"({"keyboard": {"A": ["R", "K"], "Jump": ["J"], "B": ["Bogus"]}, "options": {"stick_deadzone": 5}})", r, &err));
+    CHECK(from_json(R"({"keyboard": {"A": ["F12", "K"], "Jump": ["J"], "B": ["Bogus"]}, "options": {"stick_deadzone": 5}})", r, &err));
     CHECK(!err.empty());
     CHECK(r.keys[kA][0] == kVK_ANSI_K && r.keys[kA][1] == kNoKey);
     CHECK(r.keys[kB][0] == kNoKey);
@@ -430,11 +443,119 @@ static void test_files() {
     std::filesystem::remove_all(dir,ec);
 }
 
+// controls.json version 1 (the Wind Waker port's): untouched default keys become this game's
+static void test_upgrade() {
+    Mapping r;
+    std::string err;
+    const char* ww = R"({"version": 1, "keyboard": {
+        "A": ["K", "Space"], "B": ["J"], "X": ["L"], "Y": ["I"], "L": ["Q"], "R": ["E"], "ZL": ["LeftShift"], "ZR": ["C"],
+        "Plus": ["Return"], "Minus": ["Tab"], "Home": ["H"], "DpadUp": ["1"], "DpadDown": ["2"], "DpadLeft": ["3"],
+        "DpadRight": ["4"], "LeftStickClick": ["X"], "RightStickClick": ["V"], "LeftStickUp": ["W"], "LeftStickDown": ["S"],
+        "LeftStickLeft": ["A"], "LeftStickRight": ["D"], "RightStickUp": ["Up"], "RightStickDown": ["Down"],
+        "RightStickLeft": ["Left"], "RightStickRight": ["Right"], "Screenshot": ["F10"]},
+        "controller": {"A": "A", "B": "B"}, "options": {"stick_deadzone": 0.1}})";
+    CHECK(from_json(ww, r, &err) && err.empty());
+    CHECK(r.keys == Mapping::defaults().keys);
+    CHECK(r.pad[kA] == kPadA && r.deadzone == 0.1f && r.mouse == Mapping::defaults().mouse);
+    // a version 1 file the player changed keeps its keys
+    std::string changed = ww;
+    changed.replace(changed.find("\"K\", \"Space\""), 12, "\"K\", \"G\"    ");
+    CHECK(from_json(changed, r, &err) && err.empty());
+    CHECK(r.keys[kA][0] == kVK_ANSI_K && r.keys[kA][1] == kVK_ANSI_G && r.keys[kB][0] == kVK_ANSI_J);
+    // version 2 is never rewritten, even with those keys
+    std::string v2 = ww;
+    v2.replace(v2.find("\"version\": 1"), 12, "\"version\": 2");
+    CHECK(from_json(v2, r, &err) && r.keys[kA][0] == kVK_ANSI_K);
+}
+
+// mouse_look: the mouse as the right stick, its buttons and wheel, quick select
+static void test_mouse_look() {
+    Mapping m = Mapping::defaults();
+    set_current(m, false);
+    double t = 0;
+    auto read = [&](double dt) {
+        t += dt;
+        input::PadState s;
+        mouse_look::apply(s, m, t);
+        return s;
+    };
+    for (int i = 0; i < 20; i++) read(1.0 / 60);  // settle
+    // 400 points/s to the right at sensitivity 1: half a push, plus the floor
+    input::PadState s;
+    for (int i = 0; i < 20; i++) {
+        mouse_look::motion(400.0f / 60, 0);
+        s = read(1.0 / 60);
+    }
+    CHECK(std::fabs(s.rx - (0.15f + 0.85f * 0.5f)) < 0.02f && std::fabs(s.ry) < 1e-4f);
+    // stopped: back to rest within 0.15 s
+    for (int i = 0; i < 9; i++) s = read(1.0 / 60);
+    CHECK(s.rx == 0 && s.ry == 0);
+    // mouse up looks up; inverted, down
+    for (int i = 0; i < 10; i++) { mouse_look::motion(0, -2000.0f / 60); s = read(1.0 / 60); }
+    CHECK(std::fabs(s.ry - 1.0f) < 1e-3f);
+    m.mouse_invert_y = true;
+    for (int i = 0; i < 10; i++) { mouse_look::motion(0, -2000.0f / 60); s = read(1.0 / 60); }
+    CHECK(std::fabs(s.ry + 1.0f) < 1e-3f);
+    m.mouse_invert_y = false;
+    for (int i = 0; i < 20; i++) read(1.0 / 60);
+    // reads twice per frame see the same push as once per frame
+    for (int i = 0; i < 20; i++) {
+        mouse_look::motion(400.0f / 60, 0);
+        read(1.0 / 60 - 0.0005);
+        s = read(0.0005);
+    }
+    CHECK(std::fabs(s.rx - (0.15f + 0.85f * 0.5f)) < 0.03f);
+    for (int i = 0; i < 20; i++) read(1.0 / 60);
+    // buttons: left attack (Y), right shield (ZL)
+    mouse_look::button(kMouseLeft, true);
+    mouse_look::button(kMouseRight, true);
+    CHECK(read(1.0 / 60).buttons == (input::kY | input::kZL));
+    mouse_look::release_all();
+    CHECK(read(1.0 / 60).buttons == 0);
+    // a wheel bound to a button presses it briefly per notch
+    m.mouse[kWheelUp] = kDUp;
+    set_current(m, false);
+    mouse_look::wheel(1.0f);
+    CHECK(read(1.0 / 60).buttons == input::kUp);
+    for (int i = 0; i < 10; i++) s = read(1.0 / 60);
+    CHECK(s.buttons == 0);
+    // quick select: a notch down holds D-pad right, flicks the right stick right once, then lets go
+    mouse_look::wheel(-0.4f);
+    mouse_look::wheel(-0.7f);  // one notch from two trackpad deltas
+    int flicks = 0, held = 0;
+    float prev = 0;
+    for (int i = 0; i < 90; i++) {
+        s = read(1.0 / 60);
+        if (s.buttons & input::kRight) held++;
+        if (s.rx > 0.5f && prev <= 0.5f) flicks++;
+        prev = s.rx;
+    }
+    CHECK(flicks == 1 && held > 40 && held < 70 && !(s.buttons & input::kRight));
+    // the menus: + opens, B closes; − then + switches screens; the same button closes
+    auto press_bits = [&](uint32_t b) { input::PadState p; p.buttons = b; mouse_look::apply(p, m, t += 0.02); };
+    mouse_look::take_menu_event();
+    press_bits(input::kPlus);
+    CHECK(mouse_look::take_menu_event() == mouse_look::kMenuOpened);
+    press_bits(0);
+    press_bits(input::kB);
+    CHECK(mouse_look::take_menu_event() == mouse_look::kMenuClosed);
+    press_bits(0);
+    press_bits(input::kMinus);
+    CHECK(mouse_look::take_menu_event() == mouse_look::kMenuOpened);
+    press_bits(0);
+    press_bits(input::kPlus);
+    CHECK(mouse_look::take_menu_event() == mouse_look::kMenuNone);
+    press_bits(0);
+    press_bits(input::kMinus);
+    CHECK(mouse_look::take_menu_event() == mouse_look::kMenuClosed);
+    set_current(Mapping::defaults(), false);
+}
+
 static void test_conflict_helpers() {
     Mapping m = Mapping::defaults();
     CHECK(conflict_count(m) == 0);
     for (int a = 0; a < kActionCount; a++) CHECK(!has_conflict(m, a));
-    m.keys[kZR][1] = kVK_ANSI_K;  // K is also A's key
+    m.keys[kZR][1] = kVK_ANSI_E;  // E is also A's key
     CHECK(has_conflict(m, kZR) && has_conflict(m, kA) && !has_conflict(m, kB));
     CHECK(conflict_count(m) == 1);
     m.pad[kX] = m.pad[kY];        // two actions on one controller button
@@ -464,6 +585,8 @@ int main() {
     test_json_partial_and_bad();
     test_deadzone();
     test_files();
+    test_upgrade();
+    test_mouse_look();
     printf("input_map_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -9,6 +9,7 @@
 #include "mods.h"
 #include "move_speed.h"
 #include "../input.h"
+#include "../input_map.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -49,7 +50,8 @@ void set_camera_speed(float s) {
     g_speed = s;
     LOG("[mods] camera speed x%.2f", s);
 }
-bool mouse_camera() { return g_mouse.load(std::memory_order_relaxed); }
+// on with the Controls tab's mouse controls (controls.json), or WWHD_MOD_MOUSE_CAMERA=1
+bool mouse_camera() { return g_mouse.load(std::memory_order_relaxed) || input_map::current().mouse_look; }
 void set_mouse_camera(bool on) {
     g_mouse = on;
     note("mouse camera", on);

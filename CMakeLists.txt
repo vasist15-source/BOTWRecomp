@@ -353,7 +353,7 @@ add_executable(headless_compose_test runtime/tools/headless_compose_test.cpp)
 target_include_directories(headless_compose_test PRIVATE runtime/src)
 target_compile_options(headless_compose_test PRIVATE -UNDEBUG)
 
-add_executable(input_map_test runtime/tools/input_map_test.cpp runtime/src/input_map.cpp)
+add_executable(input_map_test runtime/tools/input_map_test.cpp runtime/src/input_map.cpp runtime/src/mouse_look.cpp)
 target_include_directories(input_map_test PRIVATE runtime/src)
 # screenshots: PNG writer, file names, binding, requests and the encoding thread (runtime/src/screenshot.cpp)
 add_executable(screenshot_test runtime/tools/screenshot_test.cpp runtime/src/screenshot.cpp runtime/src/input_map.cpp)
