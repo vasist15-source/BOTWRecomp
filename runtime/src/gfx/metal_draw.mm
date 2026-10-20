@@ -1079,6 +1079,20 @@ void set_ao_mode(int) {}
 // wait for their compile without the budget, like the Vulkan renderer does for every draw.
 static bool g_building_ahead = false;
 static bool g_log_uniforms = false;  // [arraydraw]: this draw's uniforms are logged too
+// F12 capture: programs whose uniforms are dumped (WWHD_UB_DUMP=<program address>[,...])
+static bool ub_dump_program(uint32_t prog) {
+    static const std::vector<uint32_t> progs = [] {
+        std::vector<uint32_t> v;
+        for (const char* p = getenv("WWHD_UB_DUMP"); p && *p; p += *p == ',') {
+            char* e;
+            v.push_back((uint32_t)strtoul(p, &e, 16));
+            if (e == p) break;
+            p = e;
+        }
+        return v;
+    }();
+    return std::find(progs.begin(), progs.end(), prog) != progs.end();
+}
 static bool g_draw_must_run = false;  // the current draw writes a target that isn't redrawn every frame
 // render target address -> its draw history. Every draw in a target's first frame waits (upstream
 // 26c9114: a later draw of that frame may be the only one of its result).
@@ -1681,7 +1695,9 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
                 for (auto& e : g.entries) memcpy(dst + e.mappedIndexOffset, mem::ptr(addr + e.indexOffset), 16);
             }
             // F12 capture: the uniforms of vertex shaders that fetch textures (grass, terrain); [arraydraw] draws
-            if ((capturing() && vertex && dec->textureUnitListCount > 0) || g_log_uniforms) {
+            if ((capturing() && ((vertex && dec->textureUnitListCount > 0) ||
+                                 ub_dump_program(regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8))) ||
+                g_log_uniforms) {
                 const size_t n = std::min<size_t>((buf.size() - dec->uniform.loc_remapped) / 16, 32);
                 std::string l = vertex ? "[draw]   VS remapped:" : "[draw]   PS remapped:";
                 char t[96];
@@ -1749,23 +1765,12 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         DLOG("[draw]   %s ub%d %08X size %X", vertex ? "VS" : "PS", i, addr, size);
         if (!gb) continue;
         // capture: the contents of the blocks of some programs (WWHD_UB_DUMP=<program address>[,...], e.g. 3C599B00)
-        static const std::vector<uint32_t> dumpProgs = [] {
-            std::vector<uint32_t> v;
-            for (const char* p = getenv("WWHD_UB_DUMP"); p && *p; p += *p == ',') {
-                char* e;
-                v.push_back((uint32_t)strtoul(p, &e, 16));
-                if (e == p) break;
-                p = e;
-            }
-            return v;
-        }();
-        const uint32_t prog = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
-        if (!dumpProgs.empty() && log_this_frame() && std::find(dumpProgs.begin(), dumpProgs.end(), prog) != dumpProgs.end()) {
+        if (log_this_frame() && ub_dump_program(regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8)) {
             const uint32_t* w = (const uint32_t*)mem::ptr(addr);
             std::string line;
             char b[48];
             for (uint32_t k = 0; k < std::min<uint32_t>(size / 4, 1024); k++) {
-                uint32_t v = __builtin_bswap32(w[k]);  // guest memory is big-endian
+                uint32_t v = w[k];  // uniform blocks are stored little-endian (the game swaps them for GX2)
                 float f;
                 memcpy(&f, &v, 4);
                 snprintf(b, sizeof b, "%s%g", k % 4 ? "," : (k ? " | " : ""), f);
