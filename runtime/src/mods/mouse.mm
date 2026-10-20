@@ -1,10 +1,9 @@
 // Mouse capture for mouse and keyboard play (macOS). With the Controls tab's mouse controls on
 // (input_map::Mapping::mouse_look), a click into the TV window captures the pointer: it is hidden and
 // detached from the cursor position, its movement turns the camera and its buttons and wheel are the
-// inputs the controls give them (mouse_look.h). Esc, a lone Cmd tap, the settings overlay, a dialog,
-// leaving the window or the game's menus (+ / −, mouse_look::take_menu_event) release it; the
-// overlay closing and the menu closing (+ / − / B) capture it again if it was captured. While the
-// pointer is free over the game it is the Triforce pointer (triforce_cursor.mm).
+// inputs the controls give them (mouse_look.h; in the game's menus it moves the highlight). Esc, a
+// lone Cmd tap, the settings overlay, a dialog or leaving the window release it; the overlay closing
+// captures it again if it was captured.
 // WWHD_NO_HOST_INPUT ignores the real mouse (test runs; WWHD_TEST_MOUSE injects movement).
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime
@@ -21,38 +20,14 @@
 
 namespace gfx { bool drc_overlay_hit(void* window, double x, double y); }  // gfx/display.mm
 
-namespace mods { void show_free_pointer(); }
-
-// receives the TV picture's cursor updates (mouse_init)
-@interface TriforcePointer : NSResponder
-+ (instancetype)shared;
-@end
-@implementation TriforcePointer
-+ (instancetype)shared {
-    static TriforcePointer* p = [TriforcePointer new];
-    return p;
-}
-- (void)cursorUpdate:(NSEvent*)e { mods::show_free_pointer(); }
-- (void)mouseEntered:(NSEvent*)e { mods::show_free_pointer(); }
-- (void)mouseExited:(NSEvent*)e { [[NSCursor arrowCursor] set]; }
-@end
-
 namespace mods {
-NSCursor* triforce_cursor();  // triforce_cursor.mm
 namespace {
 NSWindow* __weak g_tv;
 std::atomic<bool> g_captured{false};
 double g_released_at = -10;   // when the pointer was last released (the overlay resumes a capture it ended)
-bool g_menu_released = false; // released because the game's menu opened
 
 bool in_tv(NSEvent* e) { return g_tv && e.window == g_tv; }
 bool in_tv_content(NSEvent* e) { return in_tv(e) && NSPointInRect(e.locationInWindow, g_tv.contentView.frame); }
-// the pointer over the game, while it is free (a captured one is hidden)
-void show_pointer() {
-    if (!g_tv || g_captured.load() || !NSApp.isActive) return;
-    const NSPoint p = [g_tv mouseLocationOutsideOfEventStream];
-    if (NSPointInRect(p, g_tv.contentView.frame)) [triforce_cursor() set];
-}
 
 bool gyro_capture_active();
 void capture() {
@@ -71,15 +46,14 @@ void release_now() {
         [NSCursor unhide];
     }
     mouse_look::release_all();
-    show_pointer();
     LOG("[mods] mouse released");
 }
-// capture again on our own (overlay or game menu closed): only into the active game window
+// capture again on our own (the overlay closed): only into the active game window
 void recapture() {
     if (g_tv && g_tv.isKeyWindow && NSApp.isActive && mouse_camera() && !overlay::captures() && !getenv("WWHD_NO_HOST_INPUT"))
         capture();
 }
-// once per input timer tick (main thread): the overlay and the game's menus
+// once per input timer tick (main thread): the overlay
 void update_capture() {
     static bool was_open = false, resume = false;
     const bool open = overlay::captures();
@@ -89,24 +63,10 @@ void update_capture() {
         recapture();
     }
     was_open = open;
-    switch (mouse_look::take_menu_event()) {
-    case mouse_look::kMenuOpened:
-        if (g_captured.load() && input_map::current().mouse_menu_release) {
-            release_now();
-            g_menu_released = true;
-        }
-        break;
-    case mouse_look::kMenuClosed:
-        if (g_menu_released) recapture();
-        g_menu_released = false;
-        break;
-    default: break;
-    }
 }
 }  // namespace
 
 bool mouse_captured() { return g_captured.load(std::memory_order_relaxed); }
-void show_free_pointer() { show_pointer(); }
 
 // the mouse as a gyro (motion/motion.h): while the game aims the pointer is captured, so that Steam
 // Input's gyro-to-mouse (or the mouse) never stops at the screen's edge; released when the aim ends.
@@ -140,7 +100,6 @@ void mouse_release() {
 
 bool host_key_down(uint16_t code) {
     if (code == kVK_Escape && mouse_captured()) {
-        g_menu_released = false;
         mouse_release();
         return true;
     }
@@ -167,18 +126,12 @@ void mouse_init(void* tv_window) {
             down_at = CACurrentMediaTime();
         } else if (tap) {
             tap = false;
-            if (CACurrentMediaTime() - down_at < 0.6 && mouse_captured()) {
-                g_menu_released = false;
-                release_now();
-            }
+            if (CACurrentMediaTime() - down_at < 0.6 && mouse_captured()) release_now();
         }
         return e;
     }];
     [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent*(NSEvent* e) {
-        if (overlay::captures()) {  // the settings overlay (or the text prompt) has the mouse (gfx/overlay_appkit.mm)
-            if (e.type == NSEventTypeMouseMoved && in_tv_content(e)) show_pointer();
-            return e;
-        }
+        if (overlay::captures()) return e;  // the settings overlay (or the text prompt) has the mouse (gfx/overlay_appkit.mm)
         if (e.type == NSEventTypeScrollWheel) {
             if (mouse_camera() && mouse_captured()) {
                 // the wheel's physical direction (natural scrolling flips the deltas); a notch is
@@ -198,14 +151,12 @@ void mouse_init(void* tv_window) {
             motion::mouse_motion((float)e.deltaX, (float)e.deltaY);
             if (motion::mouse_drives_gyro()) return nil;
         }
-        if (!mouse_captured() && e.type == NSEventTypeMouseMoved && in_tv_content(e)) show_pointer();
         if (!mouse_camera()) return e;
         if (!mouse_captured()) {
             // a click into the game picture captures the pointer (the title bar stays usable)
             // (except on the GamePad picture-in-picture, where a click is a touch)
             if (e.type == NSEventTypeLeftMouseDown && in_tv_content(e) &&
                 !gfx::drc_overlay_hit((__bridge void*)g_tv, e.locationInWindow.x, e.locationInWindow.y)) {
-                g_menu_released = false;
                 capture();
                 return nil;
             }
@@ -236,14 +187,7 @@ void mouse_init(void* tv_window) {
                                                       object:nil queue:nil usingBlock:^(NSNotification*) { release_now(); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidResignKeyNotification
                                                       object:g_tv queue:nil usingBlock:^(NSNotification*) { release_now(); }];
-    // the free pointer over the game is the Triforce one: on entering the picture and whenever AppKit
-    // puts the arrow back (cursor updates), as well as on every move (the monitor above)
-    NSTrackingArea* area = [[NSTrackingArea alloc]
-        initWithRect:NSZeroRect
-             options:NSTrackingCursorUpdate | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
-               owner:[TriforcePointer shared]
-            userInfo:nil];
-    [g_tv.contentView addTrackingArea:area];
+
 }
 
 }  // namespace mods

@@ -71,10 +71,10 @@ struct Mapping {
     bool face_auto = false;         // Automatic face preset: follow the dominant pad's labels
     // mouse (mouse_look.h): a click into the game captures the pointer, its movement turns the camera
     bool mouse_look = true;
-    float mouse_sensitivity = 1.0f;  // 1 = 800 points/s of movement is a full right-stick push
+    float mouse_sensitivity = 1.0f;  // 1 = 320 points/s of movement is a full right-stick push
     bool mouse_invert_y = false;
     float mouse_floor = 0.15f;       // smallest stick push the mouse gives (past the game's own dead zone), 0..0.5
-    bool mouse_menu_release = true;  // + / − (the game's menus) release the pointer; + / − / B recapture it
+    bool mouse_menu_nav = true;      // in the game's menus (+ / −) the mouse moves the highlight (mouse_look.h)
     static Mapping defaults();
     bool operator==(const Mapping&) const = default;
 };

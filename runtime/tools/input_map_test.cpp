@@ -342,7 +342,7 @@ static void test_json_roundtrip() {
     m.mouse_sensitivity = 2.5f;
     m.mouse_invert_y = true;
     m.mouse_floor = 0.25f;
-    m.mouse_menu_release = false;
+    m.mouse_menu_nav = false;
     std::string j = to_json(m);
     CHECK(j.find("\"Key93\"") != std::string::npos);
     CHECK(from_json(j, r, &err) && err.empty());
@@ -480,10 +480,10 @@ static void test_mouse_look() {
         return s;
     };
     for (int i = 0; i < 20; i++) read(1.0 / 60);  // settle
-    // 400 points/s to the right at sensitivity 1: half a push, plus the floor
+    // 160 points/s to the right at sensitivity 1: half a push, plus the floor
     input::PadState s;
     for (int i = 0; i < 20; i++) {
-        mouse_look::motion(400.0f / 60, 0);
+        mouse_look::motion(160.0f / 60, 0);
         s = read(1.0 / 60);
     }
     CHECK(std::fabs(s.rx - (0.15f + 0.85f * 0.5f)) < 0.02f && std::fabs(s.ry) < 1e-4f);
@@ -500,7 +500,7 @@ static void test_mouse_look() {
     for (int i = 0; i < 20; i++) read(1.0 / 60);
     // reads twice per frame see the same push as once per frame
     for (int i = 0; i < 20; i++) {
-        mouse_look::motion(400.0f / 60, 0);
+        mouse_look::motion(160.0f / 60, 0);
         read(1.0 / 60 - 0.0005);
         s = read(0.0005);
     }
@@ -548,6 +548,28 @@ static void test_mouse_look() {
     press_bits(0);
     press_bits(input::kMinus);
     CHECK(mouse_look::take_menu_event() == mouse_look::kMenuClosed);
+    press_bits(0);
+    // in the inventory the mouse moves the highlight: a left-stick flick per 70 points, clicks are A / B
+    for (int i = 0; i < 10; i++) read(1.0 / 60);
+    press_bits(input::kPlus);
+    press_bits(0);
+    mouse_look::motion(75, 10);
+    int right = 0;
+    for (int i = 0; i < 20; i++) {
+        s = read(1.0 / 60);
+        if (s.lx > 0.5f) right++;
+        CHECK(s.rx == 0 && s.ly == 0);  // not the camera, no diagonal
+    }
+    CHECK(right >= 3 && right <= 6);
+    mouse_look::button(kMouseLeft, true);
+    CHECK(read(1.0 / 60).buttons == input::kA);
+    mouse_look::button(kMouseLeft, false);
+    mouse_look::button(kMouseRight, true);
+    CHECK(read(1.0 / 60).buttons == input::kB);  // B closes the menu: the camera again
+    mouse_look::button(kMouseRight, false);
+    mouse_look::button(kMouseLeft, true);
+    CHECK(read(1.0 / 60).buttons == input::kY);
+    mouse_look::button(kMouseLeft, false);
     set_current(Mapping::defaults(), false);
 }
 

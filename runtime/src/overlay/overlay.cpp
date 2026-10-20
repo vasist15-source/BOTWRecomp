@@ -143,9 +143,9 @@ ImGuiKey imgui_key(int code) {
 }
 
 // ---------------------------------------------------------------- UI state (render thread)
-enum Tab { kSaves, kGraphics, kDisplay, kAudio, kControls, kAbout, kTabs };  // no Mods: Wind Waker code mods and cheats
-const char* const kTabNames[kTabs] = {"Saves", "Graphics", "Display", "Audio", "Controls", "Language / About"};
-const char* const kTabIds[kTabs] = {"saves", "graphics", "display", "audio", "controls", "about"};
+enum Tab { kSaves, kGraphics, kDisplay, kAudio, kControls, kKeyboard, kAbout, kTabs };  // no Mods: Wind Waker code mods and cheats
+const char* const kTabNames[kTabs] = {"Saves", "Graphics", "Display", "Audio", "Controls", "Keyboard & Mouse", "Language / About"};
+const char* const kTabIds[kTabs] = {"saves", "graphics", "display", "audio", "controls", "keyboard", "about"};
 
 struct Ui {
     bool init = false;
@@ -956,40 +956,38 @@ void gyro_window(bool& open) {
     ImGui::EndPopup();
 }
 
-// the Mouse window (Controls tab > Mouse...): capture, camera sensitivity, and what each mouse input does
-void mouse_window(bool& open) {
-    const char* title = "Mouse##mouse";
-    if (open) { ImGui::OpenPopup(title); open = false; }
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
-    input_map::Mapping m = input_map::current();
-    const input_map::Mapping before = m;
+// mouse settings (the Keyboard & Mouse tab, and the Mouse window of the Controls tab)
+void mouse_camera_settings(input_map::Mapping& m) {
     bool v;
-    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34);
     if (check("Mouse controls", m.mouse_look, &v)) m.mouse_look = v;
     help("Click the game to capture the pointer: it disappears, moving the mouse turns the camera and the "
-         "buttons and wheel do what is set below. Esc or a quick tap of Cmd lets the pointer go; so do this "
+         "buttons and wheel do what is set here. Esc or a quick tap of Cmd lets the pointer go; so do this "
          "menu, dialogs and switching to another app. Click the game again to capture it.");
     ImGui::BeginDisabled(!m.mouse_look);
     ImGui::SetNextItemWidth(220);
-    ImGui::SliderFloat("Camera sensitivity", &m.mouse_sensitivity, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-    ImGui::SameLine(0, 16);
+    ImGui::SliderFloat("Camera sensitivity", &m.mouse_sensitivity, 0.1f, 10.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    help("How fast moving the mouse turns the camera. The game's camera has a top speed (a fully pushed "
+         "stick); past that, faster movement turns no faster.");
     if (check("Invert up/down", m.mouse_invert_y, &v)) m.mouse_invert_y = v;
     float floor = m.mouse_floor * 100.0f;
     ImGui::SetNextItemWidth(220);
     if (ImGui::SliderFloat("Smallest camera push", &floor, 0.0f, 50.0f, "%.0f%%")) m.mouse_floor = std::clamp(floor / 100.0f, 0.0f, 0.5f);
     help("The game ignores a slightly pushed stick. Even slow mouse movement pushes the camera stick at "
          "least this far; raise it if small movements do nothing, lower it if the camera jumps.");
-    if (check("Let the pointer go in the game's menus", m.mouse_menu_release, &v)) m.mouse_menu_release = v;
-    help("+ or − (the inventory, the map) shows the pointer; B, or the same button again, captures it again. "
-         "The game's own menu state is not visible to the port, so this follows those presses.");
-    heading("Buttons and wheel");
+    if (check("Mouse moves the highlight in the game's menus", m.mouse_menu_nav, &v)) m.mouse_menu_nav = v;
+    help("After + (inventory) or − (map) the mouse moves the selection instead of the camera: left click "
+         "is A, right click B, the wheel L / R. B, or the same button again, goes back to the camera. The "
+         "game's own menu state is not visible to the port, so this follows those presses.");
+    ImGui::EndDisabled();
+}
+void mouse_buttons(input_map::Mapping& m) {
+    ImGui::BeginDisabled(!m.mouse_look);
     for (int b = 0; b < input_map::kMouseCount; b++) {
         ImGui::PushID(b);
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(input_map::mouse_label(b));
-        ImGui::SameLine(ImGui::GetFontSize() * 10);
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+        ImGui::SameLine(ImGui::GetFontSize() * 9);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 17);
         const int cur = m.mouse[b];
         if (ImGui::BeginCombo("##act", cur == input_map::kNoAction ? "Nothing" : input_map::action_label(cur))) {
             if (ImGui::Selectable("Nothing", cur == input_map::kNoAction)) m.mouse[b] = input_map::kNoAction;
@@ -1008,11 +1006,12 @@ void mouse_window(bool& open) {
         m.mouse_sensitivity = d.mouse_sensitivity;
         m.mouse_invert_y = d.mouse_invert_y;
         m.mouse_floor = d.mouse_floor;
-        m.mouse_menu_release = d.mouse_menu_release;
+        m.mouse_menu_nav = d.mouse_menu_nav;
     }
     ImGui::EndDisabled();
-    ImGui::PopTextWrapPos();
-    // applied at once; a slider is saved to controls.json when it is let go, not on every step of the drag
+}
+// applied at once; a slider is saved to controls.json when it is let go, not on every step of the drag
+void commit_mouse(const input_map::Mapping& m, const input_map::Mapping& before) {
     static bool unsaved = false;
     const bool dragging = ImGui::IsMouseDown(ImGuiMouseButton_Left);
     if (!(m == before)) {
@@ -1022,8 +1021,62 @@ void mouse_window(bool& open) {
         input_map::set_current(m);
         unsaved = false;
     }
+}
+
+// the Mouse window (Controls tab > Mouse...)
+void mouse_window(bool& open) {
+    const char* title = "Mouse##mouse";
+    if (open) { ImGui::OpenPopup(title); open = false; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+    input_map::Mapping m = input_map::current();
+    const input_map::Mapping before = m;
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34);
+    mouse_camera_settings(m);
+    heading("Buttons and wheel");
+    mouse_buttons(m);
+    ImGui::PopTextWrapPos();
+    commit_mouse(m, before);
     if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
+}
+
+// Keyboard & Mouse: the mouse settings and every input's keys in one list
+void tab_keyboard() {
+    input_map::Mapping m = input_map::current();
+    const input_map::Mapping before = m;
+    if (ImGui::BeginTable("kbm", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableNextColumn();
+        heading("Mouse camera");
+        mouse_camera_settings(m);
+        ImGui::TableNextColumn();
+        heading("Mouse buttons and wheel");
+        mouse_buttons(m);
+        ImGui::EndTable();
+    }
+    commit_mouse(m, before);
+    m = input_map::current();
+    heading("Keys");
+    std::string status;
+    if (U.cap_action >= 0)
+        status = std::string(input_map::action_label(U.cap_action)) + ": " +
+                 (U.cap_col == kColPad ? "press a controller button or stick direction (Esc cancels)"
+                                       : "press a key (Esc cancels, Backspace clears)");
+    else if (!U.cap_note.empty())
+        status = U.cap_note;
+    else if (int n = input_map::conflict_count(m))
+        status = std::to_string(n) + " key(s) or controller input(s) are bound to more than one action (orange).";
+    else
+        status = "Click a key to change it, right-click to clear it. Saved to controls.json.";
+    ImGui::TextColored(U.cap_action >= 0 ? ImVec4(1.0f, 0.85f, 0.35f, 1.0f) : ImVec4(0.70f, 0.78f, 0.84f, 1.0f), "%s", status.c_str());
+    const float h = std::max(160.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 4);
+    controls_list(m, h);
+    if (ImGui::Button("Reset keys to defaults")) {
+        input_map::Mapping d = input_map::current();
+        d.keys = input_map::Mapping::defaults().keys;
+        input_map::set_current(d);
+    }
+    mouse_window(g_mouse_open);  // the list's Mouse column
 }
 
 void tab_controls() {
@@ -1373,7 +1426,7 @@ void settings_window() {
     ImGuiIO& io = ImGui::GetIO();
     const ImVec2 ds = io.DisplaySize;
     // the Controls drawing wants room: that tab gets (almost) the whole picture
-    const ImVec2 size = U.tab == kControls ? ImVec2(std::min(1240.0f, ds.x * 0.98f), std::min(720.0f, ds.y * 0.97f))
+    const ImVec2 size = U.tab == kControls || U.tab == kKeyboard ? ImVec2(std::min(1240.0f, ds.x * 0.98f), std::min(720.0f, ds.y * 0.97f))
                                            : ImVec2(std::min(860.0f, ds.x * 0.94f), std::min(620.0f, ds.y * 0.92f));
     ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
@@ -1403,6 +1456,7 @@ void settings_window() {
                     case kDisplay: tab_display(); break;
                     case kAudio: tab_audio(); break;
                     case kControls: tab_controls(); break;
+                    case kKeyboard: tab_keyboard(); break;
                     default: tab_about(); break;
                     }
                     ImGui::EndChild();

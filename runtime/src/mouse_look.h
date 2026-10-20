@@ -7,7 +7,7 @@
 //
 // Mouse camera: the game turns its camera at a rate set by the right stick, so the mouse's speed
 // (points per second, smoothed over about 30 ms) becomes the stick's push: Mapping::mouse_sensitivity
-// 1 is a full push at 800 points/s. A push smaller than Mapping::mouse_floor is raised to it, so slow
+// 1 is a full push at 320 points/s. A push smaller than Mapping::mouse_floor is raised to it, so slow
 // movement still gets past the game's own stick dead zone.
 //
 // Quick select (the game's item bar): holding a D-pad direction shows the runes (↑), weapons (→) or
@@ -34,10 +34,11 @@ void apply(input::PadState& s, const input_map::Mapping& m, double now);
 
 // The game's menus, as far as the input shows them: + or − opens the menu (the inventory or the
 // map), B or the button that opened it again closes it (the other one switches screens). The port
-// cannot see the game's own menu state, so this follows the presses. take_menu_event() returns
-// and clears the last change (mods/mouse.mm releases and recaptures the pointer with it).
+// cannot see the game's own menu state, so this follows the presses. While it is open (and
+// Mapping::mouse_menu_nav) the mouse moves the highlight instead of the camera: in the inventory one
+// left-stick flick per kNavStep points, on the map the left stick as the camera's right stick; left
+// click is A, right click B, the wheel L / R. take_menu_event() returns and clears the last change.
 enum MenuEvent { kMenuNone, kMenuOpened, kMenuClosed };
 int take_menu_event();
-void menu_reset();  // the player recaptured the pointer by hand: the menu counts as closed
 
 }  // namespace mouse_look

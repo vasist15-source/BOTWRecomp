@@ -659,9 +659,9 @@ std::string to_json(const Mapping& m) {
     snprintf(opt, sizeof opt,
              "  },\n  \"options\": {\n    \"stick_deadzone\": %.3g,\n    \"invert_camera_y\": %s,\n"
              "    \"mouse_look\": %s,\n    \"mouse_sensitivity\": %.3g,\n    \"mouse_invert_y\": %s,\n"
-             "    \"mouse_floor\": %.3g,\n    \"mouse_menu_release\": %s%s\n  }\n}\n",
+             "    \"mouse_floor\": %.3g,\n    \"mouse_menu_nav\": %s%s\n  }\n}\n",
              m.deadzone, m.invert_camera_y ? "true" : "false", m.mouse_look ? "true" : "false", m.mouse_sensitivity,
-             m.mouse_invert_y ? "true" : "false", m.mouse_floor, m.mouse_menu_release ? "true" : "false",
+             m.mouse_invert_y ? "true" : "false", m.mouse_floor, m.mouse_menu_nav ? "true" : "false",
              m.face_auto ? ",\n    \"face_layout\": \"auto\"" : "");
     return o + opt;
 }
@@ -731,7 +731,7 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
             m.mouse_sensitivity = std::clamp((float)d->n, 0.05f, 10.0f);
         if (const Json* i = op->get("mouse_invert_y"); i && i->type == Json::Bool) m.mouse_invert_y = i->b;
         if (const Json* d = op->get("mouse_floor"); d && d->type == Json::Num) m.mouse_floor = std::clamp((float)d->n, 0.0f, 0.5f);
-        if (const Json* i = op->get("mouse_menu_release"); i && i->type == Json::Bool) m.mouse_menu_release = i->b;
+        if (const Json* i = op->get("mouse_menu_nav"); i && i->type == Json::Bool) m.mouse_menu_nav = i->b;
         // only "automatic" is stored: the two manual presets are the shape of the face bindings
         if (const Json* f = op->get("face_layout"); f && f->type == Json::Str) m.face_auto = f->s == "auto";
         else if (faceSet) m.face_auto = false;
