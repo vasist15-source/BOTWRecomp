@@ -273,6 +273,50 @@ FaceLabel face_label_from_text(const char* text) {
     return found;
 }
 
+AppleFaceLayout apple_face_layout(const char* product_category, const char* vendor_name) {
+    auto words = [](const char* text) {
+        std::string out = " ";
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text ? text : ""); *p; ++p) {
+            if (std::isalnum(*p)) out += char(std::tolower(*p));
+            else if (out.back() != ' ') out += ' ';
+        }
+        return out + " ";
+    };
+    const std::string category = words(product_category), vendor = words(vendor_name);
+    // A recognized standard profile wins over a vendor name (e.g. a Nintendo-style pad
+    // connected in Xbox mode). Its GameController elements already represent positions.
+    for (const char* family : {" xbox ", " dualsense ", " dualshock ", " playstation "})
+        if (category.find(family) != std::string::npos) return AppleFaceLayout::kStandard;
+    const std::string who = category + vendor;
+    auto has = [&](const char* word) { return who.find(word) != std::string::npos; };
+    // Do not infer the four-button diamond for other Nintendo retro controllers.
+    if (has(" n64 ") || has(" nes ") || has(" genesis ") || has(" gamecube ")) return AppleFaceLayout::kStandard;
+    const bool joycon = has(" joy con ") || has(" joycon ");
+    if (joycon && !has(" l r ") && !has(" pair ") && (has(" l ") || has(" r ")))
+        return AppleFaceLayout::kJoyConSingle;
+    if (joycon || has(" nintendo ") || has(" switch pro ") || has(" snes ") || has(" super famicom "))
+        return AppleFaceLayout::kNintendo;
+    return AppleFaceLayout::kStandard;
+}
+
+int apple_face_input(AppleFaceLayout layout, int pad) {
+    if (pad < kPadA || pad > kPadY) return pad;
+    // SDL's MFi driver uses these same destinations for GCInputButtonA/B/X/Y.
+    static constexpr int nintendo[] = {kPadB, kPadA, kPadY, kPadX};
+    static constexpr int single[] = {kPadA, kPadX, kPadB, kPadY};
+    return layout == AppleFaceLayout::kNintendo ? nintendo[pad - kPadA]
+         : layout == AppleFaceLayout::kJoyConSingle ? single[pad - kPadA] : pad;
+}
+
+void apple_face_labels(AppleFaceLayout layout, FaceLabel labels[4]) {
+    const std::array<FaceLabel, 4> raw = {labels[0], labels[1], labels[2], labels[3]};
+    for (int i = 0; i < 4; ++i) labels[apple_face_input(layout, kPadA + i) - kPadA] = raw[i];
+}
+
+bool apple_face_workaround(const Mapping& m, AppleFaceLayout layout) {
+    return layout == AppleFaceLayout::kNintendo && !m.face_auto && face_layout(m) == FaceLayout::kLabels;
+}
+
 bool face_bindings_from_labels(const FaceLabel labels[4], int out[4]) {
     // 0..3 are the face pads in the labels' order: kPadA (south), kPadB (east), kPadX, kPadY
     int bind[4] = {-1, -1, -1, -1};  // bind[Wii U letter] = the host face button driving it

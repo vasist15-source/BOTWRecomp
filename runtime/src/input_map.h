@@ -95,6 +95,17 @@ enum class FaceLabel { kUnknown, kA, kB, kX, kY, kCross, kCircle, kSquare, kTria
 // like "button" are ignored in a free-form name. kUnknown when the name says nothing.
 FaceLabel face_label_from_text(const char* text);
 
+// GameController's Nintendo face elements use printed letters, unlike our positional Pad
+// inputs. A single sideways Joy-Con has a different permutation from a Pro / paired pad.
+// Name parsing and routing are pure so macOS hardware is not needed for regression tests.
+enum class AppleFaceLayout { kStandard, kNintendo, kJoyConSingle };
+AppleFaceLayout apple_face_layout(const char* product_category, const char* vendor_name);
+int apple_face_input(AppleFaceLayout layout, int pad);  // non-face inputs pass through
+void apple_face_labels(AppleFaceLayout layout, FaceLabel labels[4]);  // raw A/B/X/Y -> positions
+// A possible pre-#181 manual workaround; report it, never silently overwrite an intentional
+// by-label choice (or a shared mapping used with another controller).
+bool apple_face_workaround(const Mapping& m, AppleFaceLayout layout);
+
 // The face bindings a pad with these labels asks for: each printed letter drives the Wii U button
 // of that letter (Cross is A, Circle is B, and so on). A letter no button carries falls back to the
 // by-position preset. Returns false and leaves `out` alone when no label is known at all (there is

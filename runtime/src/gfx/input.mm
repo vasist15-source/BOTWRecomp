@@ -63,8 +63,10 @@ void controller_values(float* v) {
     for (GCController* c in [GCController controllers]) {
         GCExtendedGamepad* g = c.extendedGamepad;
         if (!g) continue;
+        // Nintendo pads report their printed letters as A/B/X/Y; Pad inputs are positions (upstream #181)
+        const auto layout = input_map::apple_face_layout(c.productCategory.UTF8String, c.vendorName.UTF8String);
         auto b = [&](GCControllerButtonInput* in, int p) {
-            if (in) put(p, in.isPressed ? std::max(in.value, 0.51f) : std::min(in.value, 0.5f));
+            if (in) put(apple_face_input(layout, p), in.isPressed ? std::max(in.value, 0.51f) : std::min(in.value, 0.5f));
         };
         b(g.buttonA, kPadA); b(g.buttonB, kPadB); b(g.buttonX, kPadX); b(g.buttonY, kPadY);
         b(g.leftShoulder, kPadLB); b(g.rightShoulder, kPadRB);
@@ -99,8 +101,8 @@ static input_map::FaceLabel button_letter(GCControllerButtonInput* in) {
 static void family_letters(GCController* c, input_map::FaceLabel out[4]) {
     using FL = input_map::FaceLabel;
     NSString* who = [NSString stringWithFormat:@"%@ %@", c.vendorName ?: @"", c.productCategory ?: @""].lowercaseString;
-    BOOL nintendo = [who containsString:@"nintendo"] || [who containsString:@"switch"] || [who containsString:@"joy-con"] ||
-                    [who containsString:@"joycon"] || [who containsString:@"wii"];
+    const bool nintendo = input_map::apple_face_layout(c.productCategory.UTF8String, c.vendorName.UTF8String) ==
+                          input_map::AppleFaceLayout::kNintendo;
     BOOL xboxish = [who containsString:@"xbox"] || [who containsString:@"microsoft"] || [who containsString:@"sony"] ||
                    [who containsString:@"dualsense"] || [who containsString:@"dualshock"] || [who containsString:@"playstation"] ||
                    [who containsString:@"steam"] || [who containsString:@"stadia"] || [who containsString:@"luna"];
@@ -124,12 +126,14 @@ static void note_dominant_labels() {
     }
     if (dominant) {
         GCExtendedGamepad* g = dominant.extendedGamepad;
-        GCControllerButtonInput* face[4] = {g.buttonA, g.buttonB, g.buttonX, g.buttonY};  // south, east, west, north
+        GCControllerButtonInput* face[4] = {g.buttonA, g.buttonB, g.buttonX, g.buttonY};  // framework element order
         bool any = false;
         for (int i = 0; i < 4; i++) {
             labels[i] = button_letter(face[i]);
             any |= labels[i] != FL::kUnknown;
         }
+        input_map::apple_face_labels(
+            input_map::apple_face_layout(dominant.productCategory.UTF8String, dominant.vendorName.UTF8String), labels);
         if (!any) family_letters(dominant, labels);  // nothing printed we can read: guess the family
     }
     input_map::note_face_labels(labels);
