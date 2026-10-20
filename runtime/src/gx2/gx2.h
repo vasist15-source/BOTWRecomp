@@ -43,6 +43,9 @@ constexpr uint32_t kDepthSlicesReg = 0xA002;  // our convention (unused register
 // (CB_COLORn_VIEW slice start). The game renders its 8x8x8 colour-grading volumes slice by slice that way.
 constexpr uint32_t kColorTarget3D = 0x80000000u;
 constexpr uint32_t color_target_slices(uint32_t tile) { return std::max<uint32_t>((tile >> 16) & 0x7FFF, 1); }
+// a target whose view selects one of its array slices or cube faces (CB_COLORn_VIEW / DB_DEPTH_VIEW slice start)
+// (Latte::E_DIM: 3 cube map, 5 2D array, 7 2D array MSAA)
+template <typename Dim> constexpr bool is_layered(Dim dim) { return (uint32_t)dim == 3 || (uint32_t)dim == 5 || (uint32_t)dim == 7; }
 }
 
 namespace gfx {

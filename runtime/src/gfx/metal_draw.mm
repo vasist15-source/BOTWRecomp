@@ -1495,11 +1495,14 @@ static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = fals
     return s;
 }
 
+// the type the translated shader declares for a texture unit of this dimension. Cube maps are declared
+// texturecube_array (Cemu's MSL); a plain cube view bound there samples one constant texel on Apple GPUs
+// whatever the direction, so the sky light cube came out one flat colour (the orange tint over everything).
 static MTLTextureType texture_type_for_dim(Latte::E_DIM dim) {
     switch (dim) {
     case E_DIM::DIM_1D: return MTLTextureType1D;
     case E_DIM::DIM_3D: return MTLTextureType3D;
-    case E_DIM::DIM_CUBEMAP: return MTLTextureTypeCube;
+    case E_DIM::DIM_CUBEMAP: return MTLTextureTypeCubeArray;
     case E_DIM::DIM_1D_ARRAY: return MTLTextureType1DArray;
     case E_DIM::DIM_2D_ARRAY: case E_DIM::DIM_2D_ARRAY_MSAA: return MTLTextureType2DArray;
     default: return MTLTextureType2D;
@@ -1551,7 +1554,8 @@ static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t wo
     NSUInteger firstSlice = base.textureType == MTLTextureType3D ? 0 : std::min<NSUInteger>(tv->firstSlice, layers - 1);
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : std::max<NSUInteger>(1, std::min<NSUInteger>(tv->numSlice, layers - firstSlice));
     // what the shader declared vs what the texture is
-    if (type == MTLTextureTypeCube && (slices < 6 || base.textureType == MTLTextureType2D)) type = slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+    if ((type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) && (slices < 6 || base.textureType == MTLTextureType2D))
+        type = slices > 1 ? MTLTextureType2DArray : MTLTextureType2D;
     if (type == MTLTextureTypeCube && slices > 6) slices = 6;
     if (type == MTLTextureTypeCubeArray) slices -= slices % 6;
     if ((type == MTLTextureType2D || type == MTLTextureType1D) && slices > 1) slices = 1;

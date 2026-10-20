@@ -1545,7 +1545,7 @@ TexView* depth_target(const uint32_t* regs) {
 TexView* surface_from_color_buffer(uint32_t addr, uint32_t* numSlices) {
     auto* cb = (GX2::GX2ColorBuffer*)mem::ptr(addr);
     const bool volume = cb->surface.dim.value() == Latte::E_DIM::DIM_3D;
-    const uint32_t slices = cb->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(cb->surface.depth, 1)
+    const uint32_t slices = gx2::is_layered(cb->surface.dim.value()) ? std::max<uint32_t>(cb->surface.depth, 1)
                             : volume ? std::max<uint32_t>(cb->surface.depth >> cb->viewMip, 1) : 1;
     const uint32_t first = std::min<uint32_t>(cb->viewFirstSlice, slices - 1);
     if (numSlices) *numSlices = std::clamp<uint32_t>(cb->viewNumSlices, 1, slices - first);
@@ -1559,7 +1559,7 @@ TexView* surface_from_color_buffer(uint32_t addr, uint32_t* numSlices) {
 
 TexView* surface_from_depth_buffer(uint32_t addr, uint32_t* numSlices) {
     auto* db = (GX2::GX2DepthBuffer*)mem::ptr(addr);
-    const uint32_t slices = db->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(db->surface.depth, 1) : 1;
+    const uint32_t slices = gx2::is_layered(db->surface.dim.value()) ? std::max<uint32_t>(db->surface.depth, 1) : 1;
     const uint32_t first = std::min<uint32_t>(db->viewFirstSlice, slices - 1);
     if (numSlices) *numSlices = std::clamp<uint32_t>(db->viewNumSlices, 1, slices - first);
     LatteAddrLib::AddrSurfaceInfo_OUT info{};

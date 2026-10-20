@@ -61,12 +61,14 @@ HLE(gx2, GX2SetColorBuffer) {
     set_reg(mmCB_COLOR0_VIEW + target, cb->reg_view);
     set_reg(mmCB_COLOR0_INFO + target, cb->reg_info);
     // our convention (gx2.h kColorTarget3D): the unused TILE/FRAG registers carry the view's real width
-    // (| slices << 16 | volume flag) and height. A volume's slices are its depth at the view's mip.
+    // (| slices << 16 | volume flag) and height. A volume's slices are its depth at the view's mip; a cube
+    // map's are its 6 faces (counted as 1, every face was drawn into face 0: the game renders its sky light
+    // cube face by face, and its one orange face then lit and exposed the whole picture by camera angle).
     auto dim = cb->surface.dim.value();
     bool volume = dim == Latte::E_DIM::DIM_3D;
-    uint32 slices = dim == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32>(cb->surface.depth, 1)
-                    : volume                          ? std::max<uint32>(cb->surface.depth >> cb->viewMip, 1)
-                                                      : 1;
+    uint32 slices = gx2::is_layered(dim) ? std::max<uint32>(cb->surface.depth, 1)
+                    : volume                ? std::max<uint32>(cb->surface.depth >> cb->viewMip, 1)
+                                            : 1;
     set_reg(mmCB_COLOR0_TILE + target, std::max<uint32>(cb->surface.width >> cb->viewMip, 1) | (std::min<uint32>(slices, 0x7FFF) << 16) |
                                            (volume ? gx2::kColorTarget3D : 0));
     set_reg(mmCB_COLOR0_FRAG + target, std::max<uint32>(cb->surface.height >> cb->viewMip, 1));
@@ -90,7 +92,7 @@ HLE(gx2, GX2SetDepthBuffer) {
     set_reg(mmDB_DEPTH_VIEW, view);
     set_reg(mmDB_HTILE_DATA_BASE, (uint32)db->surface.width << 16 | (db->surface.height & 0xFFFF));  // our convention
     // our convention: unused register 0xA002 (between DB_DEPTH_VIEW and DB_DEPTH_BASE) = array slices
-    set_reg(gx2::kDepthSlicesReg, db->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32>(db->surface.depth, 1) : 1);
+    set_reg(gx2::kDepthSlicesReg, gx2::is_layered(db->surface.dim.value()) ? std::max<uint32>(db->surface.depth, 1) : 1);
 }
 
 // ---------------------------------------------------------------- textures and samplers
