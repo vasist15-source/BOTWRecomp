@@ -2046,7 +2046,9 @@ void write_back_linear_targets() {
         // DrawDone and reads it. A frame late, its water colour table (BotW) took each value one slot off and
         // kept a white default in the first, on the boots where the copy lagged (white water). One wait for
         // all of a DrawDone's probes, only on the frames that draw them; the big targets stay asynchronous.
-        const bool probe = (uint64_t)s->width * s->height <= 64;
+        // 1x1 only: the 3x3 end of the exposure chain (3D0FCB00) is drawn last in every frame, so waiting
+        // for it held the game thread until the GPU finished the whole frame (~6 ms a frame in villages)
+        const bool probe = s->width == 1 && s->height == 1;
         if (probe && !sync) {
             probes.push_back({encode_texel_read(s, s->width, s->height), addr, s->width, s->height, bytes, pitch});
             continue;
