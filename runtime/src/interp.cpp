@@ -733,11 +733,24 @@ static void paced_pass_start() {
     g_slept = {};
     if (g_hold_next) return;
     if (g_wait_step && now < g_last_logic + kPacedStep) {
-        threads::park_sleep_until(g_last_logic + kPacedStep);  // the game keeps 30 steps a second
+        const auto due = g_last_logic + kPacedStep;
+        threads::park_sleep_until(due);  // the game keeps 30 steps a second
         g_slept = pace_clock::now() - now;
+        // the step starts at its time, not when the sleep timer woke up (0.2-1 ms later): counted from
+        // the wake-up, every waited step was that much longer than 33.3 ms (at 120 fps, with flips
+        // that do not wait for a missed vsync, 28.9 instead of 30 logic steps a second)
+        g_wait_step = false;
+        g_last_logic = due;
+        return;
     }
+    // 120/240 fps (every step waits for its time): a step that starts late, because its in-between
+    // passes took longer than planned, keeps the schedule if it is less than a step late, so this
+    // step plans fewer in-between frames and the game catches up (counted from its own start, a
+    // late step was lost: 29.4 logic steps a second at 240 fps on a computer that draws ~150 fps)
+    const bool keep = g_wait_step && in_between() > 1 && g_last_logic != pace_clock::time_point{} &&
+                      now - (g_last_logic + kPacedStep) < kPacedStep;
     g_wait_step = false;
-    g_last_logic = pace_clock::now();
+    g_last_logic = keep ? g_last_logic + kPacedStep : pace_clock::now();
 }
 // logic pass: the in-between frames of this step (pacing::plan_in_between: as many as fit at the
 // recent pass duration)

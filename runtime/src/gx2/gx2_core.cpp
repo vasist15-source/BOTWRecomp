@@ -1,4 +1,5 @@
 #include "../game_clock.h"
+#include "vsync_pacing.h"
 #include "../mods/fast_forward.h"
 #include "../perf_metrics.h"
 #include "../platform/host.h"
@@ -769,37 +770,43 @@ static constexpr std::chrono::nanoseconds kVsyncPeriod(16683333);  // 59.94 Hz
 static constexpr uint64_t kTicksPerVsync = 4;
 // a flip also waits for the GPU to finish that frame, as on hardware: the game reuses a frame's
 // buffers once its flip has executed
-struct PendingFlip { uint64_t vsync, swap; };  // (vsync: tick of the swap)
+struct PendingFlip { uint64_t swap; std::chrono::steady_clock::time_point at; };  // (at: when it was swapped)
 static std::deque<PendingFlip> g_pending_flips;
 static uint64_t g_last_flip_vsync = 0;  // tick (a granule boundary)
 static uint64_t g_last_flip_time = 0;  // timebase
 static int64_t g_count_offset = 0;     // guest-visible swap/flip counts minus ours (set by a loaded save state)
 
-static uint64_t vsync_index() {  // in ticks
-    if (!game_clock::shifted())
-        return uint64_t((std::chrono::steady_clock::now() - g_vsync_epoch).count()) * kTicksPerVsync / uint64_t(kVsyncPeriod.count());
-    const auto sample = game_clock::sample();
+// The clock is advanced (g_vsync_shift) when a late flip moves the grid (vsync_pacing.h, upstream e8207ca).
+static constexpr vsync_pacing::Clock kVsyncClock{kVsyncPeriod.count(), kTicksPerVsync};
+static std::atomic<int64_t> g_vsync_shift{0};  // ns; written with g_flip_mutex held
+static int64_t vsync_clock_now() {  // ns since the epoch on the vsync's clock (the game's clock when it runs faster)
+    if (!game_clock::shifted()) return (std::chrono::steady_clock::now() - g_vsync_epoch).count();
     const auto epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(g_vsync_epoch.time_since_epoch()).count();
-    return uint64_t(sample.guest - epoch) * kTicksPerVsync / uint64_t(kVsyncPeriod.count());
+    return game_clock::sample().guest - epoch;
+}
+static uint64_t vsync_index() {  // in ticks
+    return kVsyncClock.index(vsync_clock_now(), g_vsync_shift.load(std::memory_order_relaxed));
 }
 static uint64_t vsync_granule() {  // ticks per vsync at the current rate: 4 (30/60 fps), 2 (120), 1 (240)
     const int rate = interp::vsync_rate();
     return rate >= 4 ? 1 : rate >= 2 ? 2 : kTicksPerVsync;
 }
 static std::chrono::steady_clock::time_point tick_time(uint64_t tick) {
+    const auto at = std::chrono::nanoseconds(kVsyncClock.time(tick, g_vsync_shift.load(std::memory_order_relaxed)));
     if (!game_clock::shifted())
-        return g_vsync_epoch + std::chrono::nanoseconds(tick * uint64_t(kVsyncPeriod.count()) / kTicksPerVsync);
+        return g_vsync_epoch + at;
     const auto sample = game_clock::sample();
-    const auto target = g_vsync_epoch + std::chrono::nanoseconds(tick * uint64_t(kVsyncPeriod.count()) / kTicksPerVsync);
+    const auto target = g_vsync_epoch + at;
     const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(target.time_since_epoch()).count() - sample.guest;
     return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(sample.host + std::max<int64_t>(0, (left + sample.rate - 1) / sample.rate)));
 }
-// the first tick at which this flip may execute: the vsync after its swap, and `swap interval`
-// vsyncs after the previous flip
-static uint64_t flip_due(const PendingFlip& f) {
+// the first tick at which this flip may execute: `swap interval` vsyncs after the previous flip.
+// (On hardware also the vsync after its swap, which is the same for a swap made before that tick; a
+// later swap, a frame that missed its vsync, flips as soon as it is ready: vsync_pacing.h.)
+static uint64_t flip_due(const PendingFlip&) {
     const uint64_t g = vsync_granule();
     const uint32_t interval = gx2::fps_pacing() ? 1 : interp::effective_swap_interval(g_swap_interval);
-    return std::max((f.vsync / g + 1) * g, g_last_flip_vsync + interval * g);
+    return g_last_flip_vsync + interval * g;
 }
 // Uncapped (gx2.h): debug, to see how fast the renderer can go; GPU completion ordering is kept
 static std::atomic<int> g_uncapped{-1};  // -1: not read from the environment yet
@@ -965,9 +972,15 @@ bool gx2::fps_pacing() { return gx2::fps_target() != 30 && g_fps_gameplay.load(s
 static void update_flips() {  // g_flip_mutex held
     uint64_t now = vsync_index();
     while (!g_pending_flips.empty()) {
-        uint64_t at = flip_due(g_pending_flips.front());
-        if ((!uncapped_benchmark() && at > now) || render::frames_completed() < g_pending_flips.front().swap) break;
-        at = now / vsync_granule() * vsync_granule();
+        const uint64_t due = flip_due(g_pending_flips.front());
+        if ((!uncapped_benchmark() && due > now) || render::frames_completed() < g_pending_flips.front().swap) break;
+        uint64_t at = now / vsync_granule() * vsync_granule();
+        if (!uncapped_benchmark()) {  // on its vsync, or late: then the grid may move (vsync_pacing.h)
+            int64_t shift = g_vsync_shift.load(std::memory_order_relaxed);
+            at = vsync_pacing::flip_executed(kVsyncClock, shift, due, vsync_clock_now(), vsync_granule());
+            g_vsync_shift.store(shift, std::memory_order_relaxed);
+            now = std::max(now, at);
+        }
         const uint64_t flipped = g_pending_flips.front().swap;
         g_pending_flips.pop_front();
         g_last_flip_vsync = at;
@@ -988,6 +1001,33 @@ static void update_flips() {  // g_flip_mutex held
             lastFlip = t;
         }
     }
+}
+// A flip whose vsync has come but whose frame is not ready yet (the game swapped late, or the
+// renderer has not finished it): GX2WaitForVsync waits for that frame in short steps instead of
+// sleeping to the next vsync, and returns when the flip has executed (vsync_pacing.h).
+static bool late_flip_pending() {  // g_flip_mutex held
+    if (g_pending_flips.empty()) return false;
+    const auto& front = g_pending_flips.front();
+    return flip_due(front) <= vsync_index() && render::frames_completed() < front.swap;
+}
+static bool wait_for_late_flip(std::chrono::steady_clock::time_point deadline) {
+    uint64_t flips;
+    {
+        std::lock_guard<std::mutex> lk(g_flip_mutex);
+        flips = g_flip_count;
+        update_flips();
+        if (g_flip_count != flips) return true;
+        if (!late_flip_pending()) return false;
+    }
+    constexpr auto kStep = std::chrono::microseconds(250);
+    for (auto now = std::chrono::steady_clock::now(); now < deadline; now = std::chrono::steady_clock::now()) {
+        threads::park_sleep_until(std::min(deadline, now + kStep));
+        std::lock_guard<std::mutex> lk(g_flip_mutex);
+        update_flips();
+        if (g_flip_count != flips) return true;
+        if (!late_flip_pending()) return false;
+    }
+    return false;
 }
 #ifdef WWHD_HAS_VULKAN
 static void ready_flip_before_resume() {
@@ -1307,7 +1347,7 @@ HLE(gx2, GX2SwapScanBuffers) {
         std::lock_guard<std::mutex> lk(g_flip_mutex);
         update_flips();
         g_swap_count++;
-        g_pending_flips.push_back({vsync_index(), g_swap_count});
+        g_pending_flips.push_back({g_swap_count, std::chrono::steady_clock::now()});
         if (ftrace::on) {
             ftrace::Rec& r = ftrace::ring[g_swap_count & 255];
             r.guestSwap = ftrace::now();
@@ -1366,9 +1406,8 @@ static void event_callback_thread() {
         // wake just after the next vsync of the clock flips execute on (vsync_index), so a flip that
         // executes at that vsync is reported at once, like the hardware's interrupt: the game's fence
         // target is "count at the last flip + swap interval"
-        const auto sinceEpoch = std::chrono::steady_clock::now() - g_vsync_epoch;
-        const auto k = sinceEpoch / kVsyncPeriod + 1;
-        std::this_thread::sleep_until(g_vsync_epoch + k * kVsyncPeriod + std::chrono::microseconds(200));
+        // on the vsync grid flips execute on, which a late flip moves (vsync_pacing.h)
+        std::this_thread::sleep_until(tick_time((vsync_index() / kTicksPerVsync + 1) * kTicksPerVsync) + std::chrono::microseconds(200));
         uint64_t flips;
         {
             std::lock_guard<std::mutex> lk(g_flip_mutex);
@@ -1465,6 +1504,7 @@ HLE(gx2, GX2WaitForVsync) {
     }();
     const uint64_t granule = vsync_granule();
     const auto deadline = tick_time((vsync_index() / granule + 1) * granule);  // the next (virtual) vsync
+    if (wait_for_late_flip(deadline)) return;
 #ifdef WWHD_HAS_VULKAN
     static const bool readyFlipPark = [] {
         const char* value = getenv("WWHD_VK_READY_FLIP_PARK");
