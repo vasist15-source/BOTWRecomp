@@ -16,6 +16,8 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
+#include "graphic_pack_hash.h"
+#include "mods/graphic_packs.h"
 #include "gx2/gx2.h"
 #include "render_prof.h"
 #include "gx2/gx2_cmd.h"
@@ -921,6 +923,64 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     return s;
 }
 
+// Graphic packs (mods/graphic_packs.h): Cemu names a Metal pixel shader replacement by the shader's base
+// hash and its Metal aux hash (Cemu's LatteSHRC_CalcPSAuxHash): the Vulkan aux hash, then the units read
+// through framebuffer fetch, each colour buffer's data type (Cemu's MTL_COLOR_FORMAT_TABLE) and whether a
+// depth buffer is active.
+static uint64_t pack_color_data_type(Latte::E_GX2SURFFMT f) {
+    using F = Latte::E_GX2SURFFMT;
+    enum : uint64_t { NONE, INT, UINT, FLOAT };  // Cemu's MetalDataType
+    switch (f) {
+    case F::INVALID_FORMAT: return NONE;
+    case F::R8_UINT: case F::R8_G8_UINT: case F::R8_G8_B8_A8_UINT: case F::R10_G10_B10_A2_UINT: case F::A2_B10_G10_R10_UINT:
+    case F::R16_UINT: case F::R16_G16_UINT: case F::R16_G16_B16_A16_UINT: case F::X24_G8_UINT: case F::X32_G8_UINT_X24:
+    case F::R32_UINT: case F::R32_G32_UINT: case F::R32_G32_B32_A32_UINT:
+        return UINT;
+    case F::R8_SINT: case F::R8_G8_SINT: case F::R8_G8_B8_A8_SINT: case F::R10_G10_B10_A2_SINT: case F::R16_SINT:
+    case F::R16_G16_SINT: case F::R16_G16_B16_A16_SINT: case F::R32_SINT: case F::R32_G32_SINT: case F::R32_G32_B32_A32_SINT:
+        return INT;
+    default: return FLOAT;  // the table's float formats and its fallback
+    }
+}
+static uint64_t pack_ps_aux(const LatteDecompilerShader& d, const uint32_t* regs) {
+    uint64_t h = cemu_pack_hash::auxiliary(d, regs, false);
+    for (uint32_t i = 0; i < d.textureUnitListCount; i++) h = std::rotl(h, 11) + d.textureRenderTargetIndex[d.textureUnitList[i]];
+    const auto& lcr = *(const LatteContextRegister*)regs;
+    for (uint32_t i = 0; i < 8; i++) h = std::rotl(h, 7) + pack_color_data_type(LatteMRT::GetColorBufferFormat(i, lcr));
+    if (LatteMRT::GetActiveDepthBufferMask(lcr)) h = std::rotl(h, 5) + 13;
+    return h;
+}
+// the blocks Cemu marks "predetermined by Cemu. Do not touch": a pack shader must declare the same ones
+static std::string pack_interface(const std::string& src) {
+    std::string out;
+    for (const char* name : {"struct SupportBuffer {", "struct FragmentIn {", "struct FragmentOut {"}) {
+        size_t a = src.find(name);
+        size_t b = a == std::string::npos ? a : src.find("};", a);
+        if (b == std::string::npos) continue;
+        for (size_t i = a; i < b; i++)
+            if (!isspace((unsigned char)src[i])) out += src[i];
+        out += '|';
+    }
+    return out;
+}
+static void apply_graphic_pack(Shader* s, const uint32_t* regs, uint32_t addr, uint32_t size) {
+    if (!graphic_packs::has_shaders() || !s->dec || !s->dec->strBuf_shaderSource) return;
+    const uint64_t base = cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr);
+    const uint64_t aux = pack_ps_aux(*s->dec, regs);
+    if (getenv("WWHD_GPACK_LOG")) LOG("[gpack] ps %016llx_%016llx", (unsigned long long)base, (unsigned long long)aux);
+    std::string src = graphic_packs::shader_source(base, aux, false);
+    if (src.empty()) return;
+    const std::string ours = s->dec->strBuf_shaderSource->c_str();
+    if (pack_interface(src) != pack_interface(ours)) {
+        LOG("[gpack] ps %016llx_%016llx: interface differs from this port's translation, not replaced\n  pack: %s\n  ours: %s",
+            (unsigned long long)base, (unsigned long long)aux, pack_interface(src).c_str(), pack_interface(ours).c_str());
+        return;
+    }
+    s->dec->strBuf_shaderSource->reset();
+    s->dec->strBuf_shaderSource->add(std::string_view(src));
+    LOG("[gpack] ps %016llx_%016llx replaced (shader %08X)", (unsigned long long)base, (unsigned long long)aux, addr);
+}
+
 // translation and compile start of a new shader: on the render thread, or on a worker (async: regs is a
 // snapshot, and s->tstate is published when s->dec is set or translation failed)
 static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t base, uint32_t addr,
@@ -949,6 +1009,7 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
         return;
     }
     s->dec = FinishDecompiledShader(out);
+    if (!vertex) apply_graphic_pack(s, regs, addr, size);
     {
         uint32_t m = 0;
         for (int u = 0; u < s->dec->textureUnitListCount; u++) m |= 1u << s->dec->textureUnitList[u];

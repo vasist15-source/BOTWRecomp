@@ -47,6 +47,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../mods/mods.h"
 #include "../mods/manager.h"
 #include "../mods/packages.h"
+#include "../mods/graphic_packs.h"
 #include "../mods/catalogue_client.h"
 #include "../platform/https.h"
 #include "guest_addr.h"
@@ -649,6 +650,25 @@ void tab_graphics() {
     ImGui::SameLine(0, 30);
     if (check("Edge smoothing (FXAA)", render::fxaa(), &v, render::feature_available(render::kFeatureFXAA)))
         post_changed([v] { render::set_fxaa(v); });
+    if (!render::vulkan()) {
+        // Cemu's graphic packs (bundled, mods/graphic_packs.h); the shaders read the choices at start-up
+        for (const auto& pack : graphic_packs::packs()) {
+            heading(pack.name.c_str());
+            for (const auto& cat : pack.categories) {
+                const std::string cur = graphic_packs::selected(pack, cat);
+                ImGui::SetNextItemWidth(320);
+                if (ImGui::BeginCombo(cat.name.c_str(), cur.c_str())) {
+                    for (const auto& name : cat.presets)
+                        if (ImGui::Selectable(name.c_str(), name == cur))
+                            hostui::post([&pack, &cat, name] { graphic_packs::select(pack, cat, name); });
+                    ImGui::EndCombo();
+                }
+            }
+            help("From Cemu's community graphic pack of the same name (Clarity: colour and contrast presets).\n"
+                 "Changes apply after restarting the game.");
+        }
+        if (graphic_packs::restart_needed()) note("Restart the game to apply the changed enhancements.");
+    }
     heading("Overlay");
     if (check("Performance overlay (FPS, frame time)", perf_shown(), &v)) set_perf_shown(v);
     if (!render::vulkan()) {
