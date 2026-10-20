@@ -350,6 +350,10 @@ MTLTextureUsage format_view_usage() {
     return on ? MTLTextureUsagePixelFormatView : 0;
 }
 
+// an upload, copy or resample into s->tex is being encoded on the main queue: readback probes that sample it
+// stay there until it has run (probe_draw_eligible). Conservative: this command buffer or the next one
+static void note_tex_write(Surface* s) { s->texCmdSeq = cmd_seq() + 1; }
+
 // the bits of src's level/slice region into dst (same texel size, any formats) through a scratch buffer
 static void copy_bits_via_buffer(id<MTLBlitCommandEncoder> b, id<MTLTexture> src, NSUInteger srcSlice, NSUInteger srcLevel,
                                  id<MTLTexture> dst, NSUInteger dstSlice, NSUInteger dstLevel, MTLSize size, NSUInteger bytesPerPixel) {
@@ -694,6 +698,7 @@ static void convert_copy(Surface* src, uint32_t srcSlice, uint32_t srcMip, Surfa
         writeDepth = [R.device newDepthStencilStateWithDescriptor:dd];
     }
     if (src->fmt.compressed || dst->fmt.compressed || src->fmt.kind != FormatInfo::FLOAT || dst->fmt.kind != FormatInfo::FLOAT) return;
+    note_tex_write(dst);
     const bool toDepth = dst->fmt.depth;
     const uint64_t key = (uint64_t)dst->tex.pixelFormat | (toDepth ? 1ull << 40 : 0);
     auto it = pipes.find(key);
@@ -785,6 +790,7 @@ static void gpu_copy_impl(Surface* src, uint32_t srcSlice, uint32_t srcMip, uint
     if (srcMip >= src->tex.mipmapLevelCount || dstMip >= dst->tex.mipmapLevelCount) return;
     if ((!s3 && srcSlice >= layer_count(src->tex)) || (!d3 && dstSlice >= layer_count(dst->tex))) return;
     end_encoder();
+    note_tex_write(dst);
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     const MTLOrigin so = MTLOriginMake(sx, sy, s3 ? srcSlice : 0), dorig = MTLOriginMake(dx, dy, d3 ? dstSlice : 0);
     if (src->tex.pixelFormat == dst->tex.pixelFormat) {
@@ -1066,6 +1072,7 @@ static MTLTextureType texture_type_for(const Surface* s) {
 static bool in_mem1(uint32_t a) { return a >= 0xF4000000 && a < 0xF6000000; }
 // every level and slice of a new texture to 0 (colour) / 1 (depth): private textures start undefined
 static void clear_surface_to_zero(Surface* t) {
+    note_tex_write(t);
     if (t->fmt.compressed || !(t->tex.usage & MTLTextureUsageRenderTarget)) return;
     end_encoder();
     for (uint32_t mip = 0; mip < t->mips && mip < t->tex.mipmapLevelCount; mip++)
@@ -1847,6 +1854,7 @@ void upload_surface(Surface* s) {
 
     if (enc_pass_open()) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
     end_encoder();
+    note_tex_write(s);
     const double t1 = ms_now();
     // a texture at the internal resolution (its size matched a scaling rule): the guest-size picture is
     // uploaded to a scratch texture and filtered up into level 0 (a CPU texture at a render target's size)
@@ -2020,6 +2028,55 @@ void drain_write_backs(bool all) {
     }
     g_pending_write_backs.erase(g_pending_write_backs.begin(), g_pending_write_backs.begin() + done);
 }
+// readback probes drawn on the second queue (probe_begin): each target's latest read, and the write it saw
+struct ProbeRead {
+    id<MTLBuffer> buf;
+    id<MTLCommandBuffer> cmd;
+    uint64_t writeSeq;
+};
+static std::unordered_map<Surface*, ProbeRead> g_probe_reads;
+std::atomic<uint64_t> g_probe_draws_apart{0}, g_probe_draws_main{0};
+static bool is_probe_target(const Surface* s) {
+    return s->width == 1 && s->height == 1 && s->slices == 1 && !s->isDepth && s->tex &&
+           std::find(R.linearTargets.begin(), R.linearTargets.end(), s) != R.linearTargets.end();
+}
+// the draw about to open its pass draws only a readback probe from CPU textures already on the GPU
+bool probe_draw_eligible(Surface* const* colors, const Surface* depth, Surface* const* sampled, int nSampled) {
+    if (!colors[0] || depth || !is_probe_target(colors[0])) return false;
+    for (int i = 1; i < 8; i++)
+        if (colors[i]) return false;
+    // drawn from GPU results (the sky cube, a screen image): read back asynchronously like any other target
+    bool fromGpu = false;
+    for (int i = 0; i < nSampled; i++) fromGpu = fromGpu || (sampled[i] && sampled[i]->gpuWritten && sampled[i] != colors[0]);
+    colors[0]->probeFromGpu = fromGpu;
+    if (fromGpu) return false;
+    for (int i = 0; i < nSampled; i++) {
+        const Surface* t = sampled[i];
+        if (!t || t->gpuWritten || t == colors[0] || !cmd_seq_done(t->texCmdSeq)) {
+            g_probe_draws_main++;
+            static std::set<std::tuple<uint32_t, uint32_t, int>> seen;  // why, once per target, texture and reason
+            const int why = !t ? 0 : t->gpuWritten ? 1 : t == colors[0] ? 2 : 3;
+            if (seen.size() < 40 && seen.insert({colors[0]->addr, t ? t->addr : 0, why}).second)
+                LOG("[gfx] readback probe %08X stays on the main queue: texture %08X %ux%u x%u f%X %s", colors[0]->addr, t ? t->addr : 0,
+                    t ? t->width : 0, t ? t->height : 0, t ? t->slices : 0, t ? t->format : 0,
+                    why == 1 ? "is GPU-written" : why == 2 ? "is the target" : why == 3 ? "has an upload or copy in flight" : "missing");
+            return false;
+        }
+    }
+    return true;
+}
+// after a probe's draw (probe_begin): its readback joins the probe's command buffer, which is committed
+void probe_draw_done(Surface* s) {
+    id<MTLBuffer> buf = can_write_back(s) ? encode_texel_read(s, s->width, s->height) : nil;
+    id<MTLCommandBuffer> cmd = probe_commit();
+    if (buf && cmd) {
+        g_probe_reads[s] = {buf, cmd, s->writeSeq};
+        g_probe_draws_apart++;
+    } else {
+        g_probe_reads.erase(s);
+        g_probe_draws_main++;
+    }
+}
 std::atomic<uint64_t> g_copy_cpu{0}, g_copy_cpu_bytes{0}, g_copy_gpu{0}, g_write_backs{0}, g_write_back_bytes{0}, g_write_backs_sync{0};
 void write_back_linear_targets() {
     static const bool sync = getenv("WWHD_SYNC_WRITE_BACK") && atoi(getenv("WWHD_SYNC_WRITE_BACK")) != 0;
@@ -2027,7 +2084,7 @@ void write_back_linear_targets() {
     uint64_t readNs = 0, bytesDone = 0;
     uint32_t count = 0;
     drain_write_backs(false);
-    struct Probe { id<MTLBuffer> buf; uint32_t addr, w, h, bytes, pitch; };
+    struct Probe { id<MTLBuffer> buf; id<MTLCommandBuffer> cmd; uint32_t addr, w, h, bytes, pitch; };  // cmd: on the probe queue
     std::vector<Probe> probes;  // read together after one wait
     // linear aligned only: a tile mode of 0 can also be GX2's "default" (a tiled copy destination)
     for (Surface* s : R.linearTargets) {
@@ -2047,10 +2104,19 @@ void write_back_linear_targets() {
         // kept a white default in the first, on the boots where the copy lagged (white water). One wait for
         // all of a DrawDone's probes, only on the frames that draw them; the big targets stay asynchronous.
         // 1x1 only: the 3x3 end of the exposure chain (3D0FCB00) is drawn last in every frame, so waiting
-        // for it held the game thread until the GPU finished the whole frame (~6 ms a frame in villages)
-        const bool probe = s->width == 1 && s->height == 1;
+        // for it held the game thread until the GPU finished the whole frame (~6 ms a frame in villages).
+        // And drawn from CPU textures only: the 1x1 targets drawn from GPU results (the sky cube's 3D0F9900
+        // and 3D0F9E00, 3CD9BC00 from a screen image) waited for the frame's whole GPU backlog likewise
+        const bool probe = s->width == 1 && s->height == 1 && !s->probeFromGpu;
         if (probe && !sync) {
-            probes.push_back({encode_texel_read(s, s->width, s->height), addr, s->width, s->height, bytes, pitch});
+            // drawn on the probe queue with nothing newer since: wait for that command buffer only
+            auto pr = g_probe_reads.find(s);
+            if (pr != g_probe_reads.end() && pr->second.writeSeq == s->writeSeq) {
+                probes.push_back({pr->second.buf, pr->second.cmd, addr, s->width, s->height, bytes, pitch});
+                g_probe_reads.erase(pr);
+                continue;
+            }
+            probes.push_back({encode_texel_read(s, s->width, s->height), nil, addr, s->width, s->height, bytes, pitch});
             continue;
         }
         if (!sync) {
@@ -2071,15 +2137,21 @@ void write_back_linear_targets() {
     }
     if (!probes.empty()) {
         const uint64_t r0 = rprof::now_ns();
-        wait_idle();
+        bool idle = false;
+        for (const Probe& p : probes)
+            if (!p.cmd && !idle) {
+                wait_idle();
+                idle = true;
+            }
         for (const Probe& p : probes) {
+            if (p.cmd) [p.cmd waitUntilCompleted];
             const uint8_t* raw = (const uint8_t*)p.buf.contents;
             for (uint32_t y = 0; y < p.h; y++)
                 memcpy(mem::ptr(p.addr + y * p.pitch * p.bytes), raw + (size_t)y * p.w * p.bytes, (size_t)p.w * p.bytes);
             bytesDone += (uint64_t)p.w * p.h * p.bytes;
             count++;
         }
-        g_write_backs_sync++;  // waits, not probes
+        if (idle) g_write_backs_sync++;  // waits for the main queue, not probes
         readNs += rprof::now_ns() - r0;
     }
     rprof::add_write_back(std::max<uint64_t>(1, rprof::now_ns() - t0 - readNs), count, bytesDone, readNs);
@@ -2159,6 +2231,7 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
             id<MTLTexture> dview = [dst->tex newTextureViewWithPixelFormat:dst->tex.pixelFormat textureType:MTLTextureType2D
                                                                     levels:NSMakeRange(dv->firstMip, 1) slices:NSMakeRange(dv->firstSlice, 1)];
             if (sview && dview && src->fmt.depth == dst->fmt.depth) {
+                note_tex_write(dst);
                 g_resample_why = "copy";
                 resample(sview, dview, dst->fmt, 1, std::min(1.0f, cw * src->sx / sview.width), std::min(1.0f, ch * src->sy / sview.height),
                          eff(cw, dst->sx), eff(ch, dst->sy));

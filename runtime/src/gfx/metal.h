@@ -71,6 +71,8 @@ struct Surface {
     uint64_t lastWriteFrame = 0;  // frame of the last GPU write (save states keep the ones not redrawn every frame)
     uint64_t writeSeq = 0;     // the latest GPU write event (next_write_seq) of any of its slices
     uint64_t writtenBackSeq = 0;  // writeSeq when last written back to guest memory (linear surfaces)
+    uint64_t texCmdSeq = 0;    // main command buffer (cmd_seq) of the latest upload/copy into tex (readback probes)
+    bool probeFromGpu = false; // 1x1 linear target last drawn from a GPU-written texture: not a CPU readback probe
     uint64_t contentHash = 0;  // hash of all guest bytes (every level) at the last check
     uint64_t lastCheckedFrame = ~0ull;
     uint64_t sparseHash = 0;   // fallback without write tracking: cheap per-frame sampled check
@@ -162,6 +164,14 @@ id<MTLBlitCommandEncoder> timed_blit_encoder(const char* file, int line);
 void time_render_pass(MTLRenderPassDescriptor* rp, const char* file, int line);
 #define TIMED_BLIT() timed_blit_encoder(__FILE_NAME__, __LINE__)
 void end_encoder();
+// main command buffers are numbered: cmd_seq() is the newest (work encoded now goes there)
+uint64_t cmd_seq();
+bool cmd_seq_done(uint64_t seq);
+// readback probes on a second queue (metal_main.mm): probe_begin in a draw before its pass opens,
+// probe_commit after it (the probe's command buffer, or nil: it was not kept apart)
+bool probe_queue_on();
+void probe_begin(id<MTLTexture> target);
+id<MTLCommandBuffer> probe_commit();
 
 // Encoding thread (metal_main.mm). The render thread prepares draws and queues their encoder calls
 // (q_*); a second thread makes the Metal calls. R.enc and R.cmd belong to the encoding thread while

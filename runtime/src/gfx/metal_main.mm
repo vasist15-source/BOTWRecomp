@@ -2,6 +2,7 @@
 #include <deque>
 #include <thread>
 #include <pthread.h>
+#include <mach/mach_time.h>
 #include <chrono>
 #include "perf_metrics.h"
 #include "gfx/capture_schedule.h"
@@ -166,11 +167,20 @@ static thread_local bool t_encoder_thread = false;  // the encoding thread (see 
 // the render thread's view of the command buffer being filled: it has work (queued or encoded) since
 // g_cmd_created_ns; chunked commits are decided from these, on the render thread
 static bool g_cmd_pending = false;
+// main command buffers are numbered as they are made; completions arrive in that order (one queue)
+static std::atomic<uint64_t> g_cmd_seq{0}, g_cmd_seq_done{0};
+uint64_t cmd_seq() { return g_cmd_seq.load(std::memory_order_acquire); }
+bool cmd_seq_done(uint64_t seq) { return g_cmd_seq_done.load(std::memory_order_acquire) >= seq; }
 static id<MTLCommandBuffer> raw_command_buffer(uint64_t frame = R.frame) {
     if (!R.cmd) {
         read_gpu_times();
         R.cmd = [R.queue commandBuffer];
         commandFrame = frame;
+        const uint64_t seq = g_cmd_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        [R.cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+            uint64_t done = g_cmd_seq_done.load(std::memory_order_relaxed);
+            while (done < seq && !g_cmd_seq_done.compare_exchange_weak(done, seq, std::memory_order_acq_rel)) {}
+        }];
         static const bool ftrace = getenv("WWHD_FRAME_TRACE") != nullptr;
         if (ftrace) {
             const uint64_t swapNo = frame + 1;  // the swap this command buffer's work belongs to
@@ -293,7 +303,9 @@ bool enc_pass_open() { return g_pass_open; }
 // command processor), instead of all at once on swap
 // WWHD_COMMIT_DRAWS (default 16) and WWHD_COMMIT_US (default 500) set how much is held: committing
 // early lets the GPU start on a frame while the rest is still encoded (the GPU idled ~5 ms a frame)
+static bool g_probe_active = false;  // R.cmd is a readback probe's (second queue): never committed as a chunk
 static bool chunk_commit_due() {
+    if (g_probe_active) return false;
     static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
     static const uint32_t commitDraws = getenv("WWHD_COMMIT_DRAWS") ? (uint32_t)atoi(getenv("WWHD_COMMIT_DRAWS")) : 16;
     static const int64_t commitNs = getenv("WWHD_COMMIT_US") ? atoll(getenv("WWHD_COMMIT_US")) * 1000 : 500000;
@@ -505,10 +517,11 @@ void eq_exec(uint16_t type, const uint8_t* p) {
     }
 }
 
-uint64_t thread_cpu_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+// encoding time of a batch: wall clock from the commpage (mach_absolute_time ticks). The thread's CPU clock
+// (CLOCK_THREAD_CPUTIME_ID) is a kernel call: twice per batch, it was a quarter of this thread's time
+uint64_t ticks_ns(uint64_t ticks) {
+    static const mach_timebase_info_data_t tb = [] { mach_timebase_info_data_t t; mach_timebase_info(&t); return t; }();
+    return ticks * tb.numer / tb.denom;
 }
 
 void eq_thread_main() {
@@ -526,7 +539,7 @@ void eq_thread_main() {
                 continue;
             }
         }
-        const uint64_t c0 = thread_cpu_ns();
+        const uint64_t c0 = mach_absolute_time();
         @autoreleasepool {
             while (r < w) {
                 const uint64_t off = r % kEqRing;
@@ -542,7 +555,7 @@ void eq_thread_main() {
                 g_eq_rpos.notify_one();
             }
         }
-        g_eq_enc_cpu_ns += thread_cpu_ns() - c0;
+        g_eq_enc_cpu_ns += mach_absolute_time() - c0;  // ticks (enc_report)
     }
 }
 
@@ -573,9 +586,12 @@ uint8_t* eq_reserve(uint32_t size) {
     }
     return g_eq_ring + off;
 }
-void eq_publish() {
+// wake: the encoding thread sleeps once caught up, and waking it is a kernel call (__ulock_wake). State
+// records are only published (it sees them if it is spinning); the draw, pass end or block that follows
+// wakes it for the batch. Waits for it (enc_sync, a full ring) wake it themselves.
+void eq_publish(bool wake) {
     g_eq_wpos.store(g_eq_wlocal, std::memory_order_release);
-    g_eq_wpos.notify_one();
+    if (wake) g_eq_wpos.notify_one();
     g_eq_records++;
 }
 // queues a record, or makes the call now (direct mode, after the queue drained)
@@ -600,7 +616,7 @@ void eq_submit(uint16_t type, const void* payload, uint32_t n, const void* extra
     memcpy(at + sizeof(EqHdr), payload, n);
     if (extraN) memcpy(at + sizeof(EqHdr) + n, extra, extraN);
     g_eq_wlocal += size;
-    eq_publish();
+    eq_publish(type == EQ_DRAW || type == EQ_DRAWIDX || type == EQ_END || type == EQ_BLOCK);
 }
 }  // namespace
 
@@ -620,6 +636,75 @@ void enc_sync() {
 void enc_set_direct(bool direct) {
     if (direct && !g_eq_direct_draw) enc_sync();
     g_eq_direct_draw = direct;
+}
+
+// ---------------------------------------------------------------- readback probes (second queue)
+// A 1x1 linear target the game reads at DrawDone (BotW's water colour probes) and that samples only CPU
+// textures whose uploads have completed depends on nothing else in the frame. Drawn on the main queue,
+// the DrawDone wait for it was a wait for the frame's whole GPU backlog (~6 ms a frame in Hateno).
+// Its pass and readback go into a command buffer of their own on a second queue, committed at once;
+// the main queue waits for it on the GPU (an event), so later work that reads the target, and the
+// upload-pool buffers it used (recycled with a later main command buffer), stay ordered after it.
+// WWHD_PROBE_QUEUE=0: probes are drawn on the main queue and DrawDone waits for the GPU to go idle.
+static id<MTLCommandQueue> g_probe_queue = nil;
+static id<MTLEvent> g_probe_event = nil;
+static uint64_t g_probe_event_value = 0;
+static id<MTLCommandBuffer> g_probe_cmd = nil;
+static struct { id<MTLCommandBuffer> cmd; bool pending; int64_t created; uint32_t draws; bool direct; } g_probe_saved;
+bool probe_queue_on() {
+    static const bool on = !getenv("WWHD_PROBE_QUEUE") || atoi(getenv("WWHD_PROBE_QUEUE")) != 0;
+    return on;
+}
+// render thread, in a draw: the following pass (and blits) go to the probe's command buffer, in direct mode
+void probe_begin(id<MTLTexture> target) {
+    end_encoder();
+    // held clears: the target's stay held (its pass takes them as its load action), the rest go to the main queue
+    std::vector<PendingClear> mine;
+    for (auto it = g_pending_clears.begin(); it != g_pending_clears.end();) {
+        if (it->tex == target) {
+            mine.push_back(*it);
+            it = g_pending_clears.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    flush_pending_clears();
+    g_pending_clears.swap(mine);
+    if (!g_probe_queue) {
+        g_probe_queue = [R.device newCommandQueue];
+        g_probe_queue.label = @"readback probes";
+        g_probe_event = [R.device newEvent];
+    }
+    g_probe_saved = {R.cmd, g_cmd_pending, g_cmd_created_ns, g_draws_since_commit, g_eq_direct_draw};
+    enc_set_direct(true);
+    R.cmd = g_probe_cmd = [g_probe_queue commandBuffer];
+    g_cmd_pending = false;
+    g_probe_active = true;
+}
+// ends the probe's pass and commits its command buffer (nil if something committed it already: the caller
+// falls back to the main queue's wait); the main command buffer gets the GPU-side wait for it
+id<MTLCommandBuffer> probe_commit() {
+    end_encoder();
+    flush_pending_clears();  // a held clear of the target that its pass did not take
+    id<MTLCommandBuffer> side = R.cmd == g_probe_cmd ? g_probe_cmd : nil;
+    if (side) {
+        [side encodeSignalEvent:g_probe_event value:++g_probe_event_value];
+        [side commit];
+    }
+    if (R.cmd && R.cmd != g_probe_cmd) {  // unexpected (a wait or flush in between made a main-queue buffer): keep its work
+        pool_retire(R.cmd);
+        [R.cmd commit];
+    }
+    g_probe_cmd = nil;
+    g_probe_active = false;
+    R.cmd = g_probe_saved.cmd;
+    g_cmd_pending = g_probe_saved.pending;
+    g_cmd_created_ns = g_probe_saved.created;
+    g_draws_since_commit = g_probe_saved.draws;
+    g_probe_saved.cmd = nil;
+    if (side) [command_buffer() encodeWaitForEvent:g_probe_event value:g_probe_event_value];
+    g_eq_direct_draw = g_probe_saved.direct;
+    return side;
 }
 
 void q_begin_pass(MTLRenderPassDescriptor* rp) {
@@ -692,8 +777,8 @@ void q_command_buffer(void (^block)(id<MTLCommandBuffer>)) {
 void enc_report();
 void enc_report() {
     if (!g_eq_ring) return;
-    LOG("[gfx] last 300 frames: encoding thread CPU %.2f ms/frame, %.0f records/frame; render thread waited for it %.1f times/frame, "
-        "%.2f ms/frame", g_eq_enc_cpu_ns.exchange(0) / 1e6 / 300.0, g_eq_records.exchange(0) / 300.0, g_eq_syncs.exchange(0) / 300.0,
+    LOG("[gfx] last 300 frames: encoding thread busy %.2f ms/frame, %.0f records/frame; render thread waited for it %.1f times/frame, "
+        "%.2f ms/frame", ticks_ns(g_eq_enc_cpu_ns.exchange(0)) / 1e6 / 300.0, g_eq_records.exchange(0) / 300.0, g_eq_syncs.exchange(0) / 300.0,
         g_eq_sync_ns.exchange(0) / 1e6 / 300.0);
 }
 
@@ -1157,10 +1242,13 @@ void swap() {
         LOG("[gfx] last 300 frames: %.1f draws/frame with alpha-to-coverage on", g_alpha_to_mask_draws / 300.0);
         g_alpha_to_mask_draws = 0;
         LOG("[gfx] last 300 frames: surface copies %.1f/frame on the GPU, %.1f on the CPU (%.2f MiB/frame); linear write-backs %.1f/frame "
-            "(%.2f MiB/frame, %.2f/frame waited for: probes); occlusion queries %.1f/frame, conditional renders %.1f/frame",
+            "(%.2f MiB/frame, %.2f/frame waited for the main queue: probes); occlusion queries %.1f/frame, conditional renders %.1f/frame",
             g_copy_gpu.exchange(0) / 300.0, g_copy_cpu.exchange(0) / 300.0, g_copy_cpu_bytes.exchange(0) / 300.0 / 1048576.0,
             g_write_backs.exchange(0) / 300.0, g_write_back_bytes.exchange(0) / 300.0 / 1048576.0, g_write_backs_sync.exchange(0) / 300.0, queries / 300.0,
             cond / 300.0);
+        extern std::atomic<uint64_t> g_probe_draws_apart, g_probe_draws_main;
+        LOG("[gfx] last 300 frames: readback probe draws %.2f/frame on the probe queue, %.2f/frame on the main queue",
+            g_probe_draws_apart.exchange(0) / 300.0, g_probe_draws_main.exchange(0) / 300.0);
         LOG("[gfx] last 300 frames: %.1f clears/frame folded into the next pass, %.1f encoded on their own",
             g_clears_folded.exchange(0) / 300.0, g_clears_flushed.exchange(0) / 300.0);
         {

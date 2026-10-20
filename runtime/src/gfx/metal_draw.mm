@@ -689,21 +689,28 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     }
     buf[n++] = vs ? 0 : regs[REGADDR::DB_DEPTH_CONTROL] & 0x83;
     // texture types and formats; sampling a bound render target switches to framebuffer fetch
-    for (int t = 0; t < 18; t++) {
-        if (!((unitMask >> t) & 1)) { buf[n++] = 0; buf[n++] = 0; buf[n++] = 0; continue; }
+    // (units outside the mask are zeros; only the mask's units are visited: most programs sample a few)
+    memset(&buf[n], 0, (18 * 3 + 18 * 3) * 4);
+    for (uint32_t m = unitMask & 0x3FFFF; m; m &= m - 1) {
+        const int t = __builtin_ctz(m);
         const uint32_t* w = &regs[texBase + t * 7];
-        buf[n++] = (w[0] & 7) | (w[4] & 0x300);
-        buf[n++] = w[1] & 0x3F00000;
+        buf[n + t * 3] = (w[0] & 7) | (w[4] & 0x300);
+        buf[n + t * 3 + 1] = w[1] & 0x3F00000;
         uint32_t fb = 0, base = w[2] << 8;
         if (base)
             for (int i = 0; i < 8; i++)
                 if (base == cbBase[i]) fb = 1 + i;
-        buf[n++] = fb;
+        buf[n + t * 3 + 2] = fb;
     }
+    n += 18 * 3;
     // depth-compare samplers
     // (the unit's sampler in every stage's block: a superset of the one the decompiler reads)
-    for (int i = 0; i < 18 * 3; i++)
-        buf[n++] = ((unitMask >> (i % 18)) & 1) ? regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + i * 3] & 0xF8000000 : 0;
+    for (uint32_t m = unitMask & 0x3FFFF; m; m &= m - 1) {
+        const int t = __builtin_ctz(m);
+        for (int b = 0; b < 3; b++)
+            buf[n + b * 18 + t] = regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (b * 18 + t) * 3] & 0xF8000000;
+    }
+    n += 18 * 3;
     if (g_key_diff) {
         int st = texBase == REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS ? 0 : 1;
         memcpy(g_key_gather[st], buf, n * 4);
@@ -776,6 +783,8 @@ static bool g_defer_compiles = false;
 static std::vector<Shader*> g_deferred_shaders;
 
 static void compile_deferred(Shader* s) {
+    // every draw calls this: a plain load first (the compare-exchange takes the line exclusive: 3% of the render thread)
+    if (s->state.load(std::memory_order_relaxed) != CS_DEFERRED) return;
     int expected = CS_DEFERRED;  // the background warm-up (warm_deferred_in_background) may take it first
     if (!s->state.compare_exchange_strong(expected, CS_PENDING)) return;
     compile_msl(s, s->dec->strBuf_shaderSource->c_str(), s->key);
@@ -2748,6 +2757,8 @@ void report_skips() {
     g_stat_full_checks = g_stat_uploads = g_stat_invalidates = g_stat_invalidated_surfaces = g_stat_hashed_bytes = 0;
 }
 
+bool probe_draw_eligible(Surface* const* colors, const Surface* depth, Surface* const* sampled, int nSampled);
+void probe_draw_done(Surface* s);
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
           uint32_t instances) {
     g_log_uniforms = false;
@@ -2994,6 +3005,15 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     g_pt_ps = regs[mmSQ_PGM_START_PS] << 8;
     g_pt_ps_shader = ps;
 
+    // a readback probe drawn from CPU textures: its pass and readback go to the probe queue (probe_begin),
+    // so the DrawDone that reads it waits for this draw only, not the frame's GPU backlog
+    const bool probeApart = probe_queue_on() && !noAttachments && !streamout && !g_occl_open && !capturing() && !pass_timing_on() &&
+                            probe_draw_eligible(colors, depth, sampled, nSampled);
+    if (probeApart) probe_begin(colors[0]->tex);
+    struct ProbeEnd {
+        Surface* s;
+        ~ProbeEnd() { if (s) probe_draw_done(s); }
+    } probeEnd{probeApart ? colors[0] : nullptr};
     if (!ensure_pass(colors, colorSlices, colorMips, depth, depthSlice, depthMip, noAttachments)) { g_skip[SK_PASS]++; return; }
     rprof::mark(rprof::kPass);
     TargetFormats tf;  // the pass's attachments (a merged pass can have more than the draw targets)

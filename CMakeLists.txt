@@ -215,6 +215,12 @@ endif()
 target_include_directories(wwhd PRIVATE runtime/include runtime/src runtime/src/gx2)
 add_dependencies(wwhd wwhd_build_info)
 target_compile_options(wwhd PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -ffp-contract=off)
+# profiling: line tables for the runtime (Instruments shows the hot lines; the code is unchanged). Off by
+# default: the debug map records this build's absolute object paths in the binary
+option(WWHD_LINE_TABLES "Line tables for the runtime (profiling)" OFF)
+if(WWHD_LINE_TABLES)
+  target_compile_options(wwhd PRIVATE -gline-tables-only)
+endif()
 if(NOT TARGET ZLIB::ZLIB)
   find_package(ZLIB REQUIRED)
 endif()

@@ -66,6 +66,7 @@ extern uint32_t g_reg_dirty;  // bit 0: buffer/constant registers changed, bit 1
 void note_other_reg(uint32_t reg);          // a non-buffer register changed value
 void classify_draw();                       // at each draw: count its class, clear g_reg_dirty
 bool fast_class_reg(uint32_t reg);          // ALU constants, uniform-block and vertex-buffer words
+bool classify_on();  // the draw classifier (WWHD_DRAW_CLASSES=1): a check of every changed register word
 
 // shader translations: called by the Vulkan renderer for each new variant (shaders.cpp)
 void shader_variant(bool newProgram, bool onlyUnusedUnits, const char* const* groups, int groupCount);

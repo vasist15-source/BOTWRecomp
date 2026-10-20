@@ -148,6 +148,11 @@ void add_wait(Wait w, uint64_t ns) {
 }
 void add_idle(uint64_t ns) { W.idleNs += ns; }
 
+bool classify_on() {
+    // off by default: classifying each changed register word was 4% of the render thread
+    static const bool on = enabled() && getenv("WWHD_DRAW_CLASSES") && strcmp(getenv("WWHD_DRAW_CLASSES"), "0") != 0;
+    return on;
+}
 bool fast_class_reg(uint32_t reg) {
     // RegDefines.h: mmSQ_ALU_CONSTANT0_0 0xC000; mmSQ_TEX_RESOURCE_WORD0 0xE000 + 0x7E0 (VS uniform
     // blocks), + 0x250 (PS), + 0xCB0 (GS), + 0x8C0 (vertex attribute buffers), 7 words each
@@ -346,10 +351,14 @@ void frame_end(bool hold) {
             snprintf(line, sizeof line, " %s %.0f", reg_name(top[i].second).c_str(), top[i].first / frames);
             regs += line;
         }
-        add("[prof] draw classes: %.1f%% same registers, %.1f%% only buffer pointers/ALU constants, %.1f%% other "
-            "(%.0f draws/frame); top other writes/frame:%s",
-            100.0 * W.drawsSame / W.draws, 100.0 * W.drawsFast / W.draws, 100.0 * W.drawsOther / W.draws, W.draws / frames,
-            regs.c_str());
+        if (!classify_on()) {
+            add("[prof] %.0f draws/frame (WWHD_DRAW_CLASSES=1: what changed between them)", W.draws / frames);
+        } else {
+            add("[prof] draw classes: %.1f%% same registers, %.1f%% only buffer pointers/ALU constants, %.1f%% other "
+                "(%.0f draws/frame); top other writes/frame:%s",
+                100.0 * W.drawsSame / W.draws, 100.0 * W.drawsFast / W.draws, 100.0 * W.drawsOther / W.draws, W.draws / frames,
+                regs.c_str());
+        }
     }
     if (shaderStats.variants) {
         std::vector<std::pair<uint64_t, std::string>> g;

@@ -182,7 +182,7 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
         return e && !strcmp(e, "1");
     }();
     static const bool collectStats = getenv("WWHD_VK_STATS") != nullptr;
-    const bool classify = rprof::enabled();
+    const bool classify = rprof::classify_on();
     bool changed = false, baselineBump = false, actualBump = false;
     uint64_t maskedWords = 0;
     for (uint32 i = 0; i < n; ++i) {
@@ -233,7 +233,7 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
     }
 #endif
     if (memcmp(&g_regs[first], v, n * 4) != 0) {
-        if (rprof::enabled())  // draw classifier (render_prof.h)
+        if (rprof::classify_on())  // draw classifier (render_prof.h)
             for (uint32 i = 0; i < n; i++)
                 if (g_regs[first + i] != v[i]) {
                     if (rprof::fast_class_reg(first + i)) rprof::g_reg_dirty |= 1;
