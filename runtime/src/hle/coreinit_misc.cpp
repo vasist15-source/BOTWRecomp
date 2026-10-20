@@ -385,3 +385,27 @@ HLE(coreinit, MCP_GetSysProdSettings) {  // (handle, SysProdSettings* 0x46 bytes
     st8(out + 0x0B, region);  // game region
     ret(c, 0);
 }
+
+// ---- diagnostics and checks the game makes
+// OSFatal(message): the console stops on an error screen; here the runtime's error report shows it
+HLE(coreinit, OSFatal) {
+    const std::string msg = arg(c, 0) ? mem::read_cstr(arg(c, 0)) : std::string("(no message)");
+    LOG("[coreinit] OSFatal: %s (lr %08X)", msg.c_str(), c->lr);
+    exception_report::raise("The game stopped with an error (OSFatal): " + msg);
+}
+// COSWarn(module, format, ...): a warning from the game's libraries, logged with its format string
+HLE(coreinit, COSWarn) {
+    if (arg(c, 1)) LOG("[coreinit] COSWarn (module %u): %s", arg(c, 0), mem::read_cstr(arg(c, 1)).c_str());
+}
+// whether an address is mapped: code and data, MEM2, runtime objects, the overlay arena when on, the
+// foreground bucket and MEM1
+namespace mem { bool overlay_arena_enabled(); }
+HLE(coreinit, OSIsAddressValid) {
+    const uint32_t a = arg(c, 0);
+    const bool ok = (a >= 0x01000000u && a < mem::kMem2End) || (a >= mem::kRuntimeStart && a < 0x70000000u) ||
+                    (mem::overlay_arena_enabled() && a >= 0xA0000000u && a < 0xBC000000u) ||
+                    (a >= mem::kFgBucket && a < mem::kFgBucket + mem::kFgBucketSize) || (a >= mem::kMem1 && a < mem::kMem1 + mem::kMem1Size);
+    ret(c, ok);
+}
+HLE(coreinit, OSIsHomeButtonMenuEnabled) { ret(c, 1); }
+HLE(coreinit, OSGetStackPointer) { ret(c, c->r[1]); }

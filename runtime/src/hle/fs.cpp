@@ -310,6 +310,38 @@ HLE(coreinit, FSCloseDir) {
     ret(c, FS_OK);
 }
 
+// Creating and removing: only on writable volumes (saves, temp), never the game's own files
+static bool writable_volume(const std::string& g) {
+    return g.rfind("/vol/save", 0) == 0 || g.rfind("/vol/temp", 0) == 0 || g.rfind("/vol/storage_mlc01/usr/save", 0) == 0;
+}
+static int32_t make_dir(const std::string& g) {
+    if (!writable_volume(g)) { LOG("[fs] mkdir refused (not a save location): %s", g.c_str()); return FS_ACCESS_ERROR; }
+    const std::string hp = host_path(g);
+    struct stat st;
+    if (stat(hp.c_str(), &st) == 0) return FS_EXISTS;
+    std::error_code ec;
+    std::filesystem::create_directories(hp, ec);
+    return ec ? FS_ACCESS_ERROR : FS_OK;
+}
+static int32_t remove_path(const std::string& g) {
+    if (!writable_volume(g)) { LOG("[fs] remove refused (not a save location): %s", g.c_str()); return FS_ACCESS_ERROR; }
+    const std::string hp = host_path(g);
+    struct stat st;
+    if (stat(hp.c_str(), &st) != 0) return FS_NOT_FOUND;
+    std::error_code ec;
+    std::filesystem::remove(hp, ec);  // a directory must be empty, as on the console
+    LOG("[fs] removed %s", g.c_str());
+    return ec ? FS_ACCESS_ERROR : FS_OK;
+}
+// (client, block, path, error mask)
+HLE(coreinit, FSMakeDir) { ret(c, make_dir(mem::read_cstr(arg(c, 2)))); }
+HLE(coreinit, FSRemove) { ret(c, remove_path(mem::read_cstr(arg(c, 2)))); }
+// (client, block, file handle, error mask)
+HLE(coreinit, FSFlushFile) {
+    if (FILE* f = file(arg(c, 2))) fflush(f);
+    ret(c, FS_OK);
+}
+
 // ---------------------------------------------------------------- nn_save
 // Saves live in <save dir>/<account slot or "common">/<path>
 static std::string save_path(uint32_t slot, const std::string& p) {
@@ -327,6 +359,9 @@ HLE(nn_save, SAVEFlushQuota) { ret(c, 0); }
 HLE(nn_save, SAVEOpenFile) {
     ret(c, open_file(save_path(arg(c, 2), mem::read_cstr(arg(c, 3))), mem::read_cstr(arg(c, 4)), arg(c, 5)));
 }
+// (client, block, account slot, path, error mask)
+HLE(nn_save, SAVEMakeDir) { ret(c, make_dir(save_path(arg(c, 2), mem::read_cstr(arg(c, 3))))); }
+HLE(nn_save, SAVERemove) { ret(c, remove_path(save_path(arg(c, 2), mem::read_cstr(arg(c, 3))))); }
 HLE(nn_save, SAVEGetStat) { ret(c, stat_path(save_path(arg(c, 2), mem::read_cstr(arg(c, 3))), arg(c, 4))); }
 HLE(nn_save, SAVEOpenDir) {
     std::string gp = save_path(arg(c, 2), mem::read_cstr(arg(c, 3)));

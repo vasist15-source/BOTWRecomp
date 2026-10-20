@@ -1045,6 +1045,9 @@ HLE(gx2, GX2GetCurrentDisplayList) {
     ret(c, t_rec.start != 0);
 }
 HLE(gx2, GX2CallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
+// a copy into the command stream: run where it stands (our display lists are op lists, not PM4)
+HLE(gx2, GX2CopyDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
+HLE(gx2, GX2SetDefaultState) { set_default_state(); }
 HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 
 // ---------------------------------------------------------------- draws

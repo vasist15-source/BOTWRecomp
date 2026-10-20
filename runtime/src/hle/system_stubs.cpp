@@ -45,6 +45,19 @@ HLE(nn_boss, StartScheduling__Q3_2nn4boss4TaskFb) { ret(c, kResultFail); }
 // a task's outcome: the constructor keeps the Result and returns the object (was 0: the caller's pointer)
 HLE(nn_boss, __ct__Q3_2nn4boss10TaskResultFQ2_2nn6Result) { st32(arg(c, 0), arg(c, 1)); ret(c, arg(c, 0)); }
 HLE(nn_boss, ErrorCode__Q3_2nn4boss10TaskResultCFv) { ret(c, 0); }
+// BotW's overloads: the tasks never run (no SpotPass), they report "stopped"
+HLE(nn_boss, Initialize__Q3_2nn4boss4TaskFPCc) { ret(c, kResultFail); }
+HLE(nn_boss, Run__Q3_2nn4boss4TaskFb) { ret(c, kResultFail); }
+HLE(nn_boss, GetTurnState__Q3_2nn4boss4TaskCFPUi) {  // (task, u32* execution count) -> TaskTurnState
+    if (arg(c, 1)) st32(arg(c, 1), 0);
+    ret(c, 1);  // kStopped
+}
+HLE(nn_boss, GetResult__Q3_2nn4boss4TaskCFPUi) {  // (task, u32* execution count) -> Result
+    if (arg(c, 1)) st32(arg(c, 1), 0);
+    ret(c, kResultFail);
+}
+HLE(nn_boss, Unregister__Q3_2nn4boss4TaskFv) { ret(c, 0); }
+HLE(nn_boss, Set__Q3_2nn4boss17PlayReportSettingFPCcUi) { ret(c, 1); }
 
 // ---- nn_olv (Miiverse)
 HLE(nn_olv, Initialize__Q2_2nn3olvFPCQ3_2nn3olv15InitializeParam) { ret(c, kResultFail); }
@@ -209,6 +222,26 @@ HLE(vpadbase, VPADBASEGetHeadphoneStatus) { ret(c, 0); }
 
 // ---- sysapp
 HLE(sysapp, SYSLaunchSettings) { ret(c, 0); }
+// HOME menu and eShop are not available: the request is logged and the game carries on
+HLE(sysapp, SYSLaunchMenu) {
+    LOG("[sysapp] HOME menu requested: not available");
+    ret(c, 0);
+}
+HLE(sysapp, SYSSwitchToEShop) {
+    LOG("[sysapp] Nintendo eShop requested: not available");
+    ret(c, 0);
+}
+HLE(sysapp, SYSGetArguments) { ret(c, 0); }  // started without arguments
+// Wii Remote pairing and speaker encoding: no Wii Remotes
+HLE(padscore, WPADStartSyncDevice) { ret(c, 0); }
+HLE(padscore, WENCGetEncodeData) { ret(c, 0); }
+// (channel, callback) -> previous callback; samples are read with VPADRead, the callback is not called
+HLE(vpad, VPADSetSamplingCallback) {
+    static uint32_t cb[2] = {};
+    const uint32_t ch = arg(c, 0) & 1, prev = cb[ch];
+    cb[ch] = arg(c, 1);
+    ret(c, prev);
+}
 HLE(sysapp, SYSLaunchAccount) { ret(c, 0); }
 
 // ---- calls with nothing to do here (were logged as unimplemented)
