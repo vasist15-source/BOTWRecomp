@@ -151,14 +151,7 @@ std::string dir() {
         std::string p;
         if (const char* e = getenv("WWHD_SCREENSHOT_DIR"); e && *e) p = e;
         else if (host::portable()) p = host::portable_user_dir() + "/screenshots";
-        else {
-#ifdef __APPLE__
-            // next to the states folder (savestate.cpp state_dir)
-            p = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/Library/Application Support/wwhd/screenshots";
-#else
-            p = host::config_dir() + "/screenshots";
-#endif
-        }
+        else p = host::config_dir() + "/screenshots";  // next to the states folder (savestate.cpp state_dir)
         return p;
     }();
     return d;

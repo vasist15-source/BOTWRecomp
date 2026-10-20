@@ -7,8 +7,8 @@
 // scaling filter is left out: the picture is not resized). Never the settings overlay, the notices or
 // the performance overlay. Optionally (setting "Also save the GamePad screen", off by default) the
 // GamePad picture as a second file while it is shown (GamePad window or picture-in-picture).
-// Where: <user data>/screenshots, next to the states folder: ~/Library/Application Support/wwhd,
-// %APPDATA%\WWHD or ~/.config/wwhd for source builds, data/user in a release folder (portable.txt);
+// Where: <user data>/screenshots, next to the states folder: ~/Library/Application Support/BotW,
+// %APPDATA%\BotW or ~/.config/botw for source builds, data/user in a release folder (portable.txt);
 // WWHD_SCREENSHOT_DIR overrides. Files: BreathOfTheWild_YYYY-MM-DD_HH-MM-SS[_n].png (local time; _2, _3 ...
 // when several land in the same second), the GamePad picture as ..._GamePad.png.
 //

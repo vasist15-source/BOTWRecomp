@@ -12,7 +12,7 @@
 // Shortcuts: Cmd+F (or Ctrl+Cmd+F, or the green button) full screen; Cmd+G show/hide the GamePad screen.
 // Closing the TV window (close button, Cmd+W) quits the app, asking first while a game is in progress
 // (quit_prompt.mm); closing the GamePad window only hides it.
-// The Display menu holds the rest. Choices are kept in ~/Library/Application Support/wwhd/display.plist
+// The Display menu holds the rest. Choices are kept in ~/Library/Application Support/BotW/display.plist
 // (test runs with WWHD_NO_HOST_INPUT neither read nor write it unless WWHD_DISPLAY_SETTINGS names a file).
 //
 // The modes, the layout of the TV window, the automatic overlay and the overlay's touch mapping are
@@ -109,7 +109,7 @@ static NSMutableDictionary* g_settings;
 static NSString* settings_path() {
     if (const char* e = getenv("WWHD_DISPLAY_SETTINGS")) return @(e);
     if (getenv("WWHD_NO_HOST_INPUT")) return nil;  // test runs leave the user's choices alone
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/wwhd/display.plist"];
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/BotW/display.plist"];
 }
 static void load_settings() {
     NSString* p = settings_path();

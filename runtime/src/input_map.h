@@ -2,7 +2,7 @@
 //
 // Plain C++ (no AppKit) so it can be unit-tested (runtime/tools/input_map_test.cpp). input.mm
 // evaluates the current mapping on every read; the Controls window (gfx/controls_ui.mm) edits it.
-// Persisted as JSON in ~/Library/Application Support/WWHD/controls.json ($WWHD_CONTROLS overrides).
+// Persisted as JSON in ~/Library/Application Support/BotW/controls.json ($WWHD_CONTROLS overrides).
 #pragma once
 #include <array>
 #include <cstdint>

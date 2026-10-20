@@ -178,12 +178,12 @@ inline bool portable() { return !portable_user_dir().empty(); }
 inline std::string config_dir() {
  if(portable()) return portable_user_dir();
 #ifdef __APPLE__
- const char* home=getenv("HOME");return std::string(home?home:".")+"/Library/Application Support/WWHD";
+ const char* home=getenv("HOME");return std::string(home?home:".")+"/Library/Application Support/BotW";
 #elif defined(_WIN32)
- const char* root=getenv("APPDATA");return std::string(root?root:".")+"/WWHD";
+ const char* root=getenv("APPDATA");return std::string(root?root:".")+"/BotW";
 #else
- if(const char* xdg=getenv("XDG_CONFIG_HOME"))return std::string(xdg)+"/wwhd";
- const char* home=getenv("HOME");return std::string(home?home:".")+"/.config/wwhd";
+ if(const char* xdg=getenv("XDG_CONFIG_HOME"))return std::string(xdg)+"/botw";
+ const char* home=getenv("HOME");return std::string(home?home:".")+"/.config/botw";
 #endif
 }
 }

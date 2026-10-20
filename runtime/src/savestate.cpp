@@ -211,11 +211,7 @@ std::string state_dir() {
         std::string d;
         if (const char* e = getenv("WWHD_STATE_DIR")) d = e;
         else {
-#ifdef __APPLE__
-            d=std::string(getenv("HOME")?getenv("HOME"):".")+"/Library/Application Support/wwhd/states";
-#else
             d=host::config_dir()+"/states";
-#endif
         }
         std::error_code ec; std::filesystem::create_directories(d,ec);
         return d;
