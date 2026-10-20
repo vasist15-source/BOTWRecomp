@@ -186,8 +186,9 @@ Mapping Mapping::defaults() {
     key(kRUp, kVK_UpArrow); key(kRDown, kVK_DownArrow); key(kRLeft, kVK_LeftArrow); key(kRRight, kVK_RightArrow);
     key(kScreenshot, kVK_F10);  // free on every host (F11: SDL full screen, F12/P: debug frame capture)
     key(kQuickPrev, kVK_ANSI_LeftBracket); key(kQuickNext, kVK_ANSI_RightBracket);
-    // mouse: left attack, right shield / lock on, middle look, side buttons bow and throw, wheel quick select
-    m.mouse = {kY, kZL, kStickRClick, kZR, kR, kQuickPrev, kQuickNext};
+    // mouse: left attack, right draws the bow (left click shoots, mouse_look.h), middle look, side
+    // buttons shield / lock on and throw, wheel quick select
+    m.mouse = {kY, kZR, kStickRClick, kZL, kR, kQuickPrev, kQuickNext};
     // controllers map by position: the bottom face button (Xbox A) is the Wii U's B (face_layout)
     const int pads[kActionCount] = {
         kPadNone, kPadNone, kPadNone, kPadNone,  // A B X Y: face-layout preset, filled below
@@ -634,7 +635,7 @@ static std::array<std::array<int, kKeysPerAction>, kActionCount> wind_waker_keys
 }
 
 std::string to_json(const Mapping& m) {
-    std::string o = "{\n  \"version\": 2,\n  \"keyboard\": {\n";
+    std::string o = "{\n  \"version\": 3,\n  \"keyboard\": {\n";
     for (int a = 0; a < kActionCount; a++) {
         o += "    " + quote(action_id(a)) + ": [";
         bool first = true;
@@ -699,6 +700,7 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
     // gets this game's keyboard defaults; a layout the player changed is kept
     const Json* ver = root.get("version");
     if ((!ver || ver->type != Json::Num || ver->n < 2) && m.keys == wind_waker_keys()) m.keys = Mapping::defaults().keys;
+    const bool mouse_v2 = !ver || ver->type != Json::Num || ver->n < 3;  // version 2: right click was the shield
     if (const Json* ms = root.get("mouse"); ms && ms->type == Json::Obj) {
         for (auto& [id, v] : ms->obj) {
             int b = mouse_from_id(id);
@@ -709,6 +711,8 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
             if (a < 0) { warn += "unknown input \"" + v.s + "\"; "; continue; }
             m.mouse[b] = a;
         }
+        const std::array<int, kMouseCount> v2 = {kY, kZL, kStickRClick, kZR, kR, kQuickPrev, kQuickNext};
+        if (mouse_v2 && m.mouse == v2) m.mouse = Mapping::defaults().mouse;
     }
     if (const Json* pc = root.get("controller"); pc && pc->type == Json::Obj) {
         for (auto& [id, v] : pc->obj) {

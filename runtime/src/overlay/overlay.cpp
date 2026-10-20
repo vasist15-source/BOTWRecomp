@@ -998,7 +998,9 @@ void mouse_buttons(input_map::Mapping& m) {
         ImGui::PopID();
     }
     help("Quick select: one step through the item bar per wheel notch (it opens the weapons; hold a D-pad "
-         "key first for the runes or shields), and lets go after a moment, which equips the item.");
+         "key first for the runes, shields or bows), and lets go after a moment, which equips the item.\n"
+         "Bow (ZR): hold to draw and aim; a left click shoots and the next arrow is drawn while you hold; "
+         "the wheel steps through the arrows while it is drawn.");
     if (ImGui::Button("Default mouse settings")) {
         const input_map::Mapping d = input_map::Mapping::defaults();
         m.mouse = d.mouse;

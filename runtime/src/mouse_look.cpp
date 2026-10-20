@@ -8,13 +8,14 @@
 
 namespace mouse_look {
 namespace {
-constexpr double kTau = 0.025;          // mouse speed smoothing (s)
+constexpr double kTau = 0.012;          // mouse speed smoothing (s): short, the game's own camera eases too
 constexpr float kPointsPerPush = 320;   // points/s for a full stick push at sensitivity 1
 constexpr float kTail = 0.03f;          // below this push the floor fades out (no drift after the mouse stops)
 constexpr double kPulse = 0.10;         // wheel notch on a button: held this long
-constexpr double kQuickLead = 0.20;     // quick select: D-pad held before the first stick flick
-constexpr double kQuickFlick = 0.10;    // stick flick, then as long at rest
-constexpr double kQuickLinger = 0.60;   // D-pad let go this long after the last flick (equips)
+constexpr double kQuickLead = 0.10;     // quick select: D-pad held before the first stick flick
+constexpr double kQuickFlick = 0.07;    // stick flick, then as long at rest (two 30 fps reads each)
+constexpr double kQuickLinger = 0.45;   // D-pad let go this long after the last flick (equips)
+constexpr double kFire = 0.12;          // bow: ZR let go this long by a left click (shoots)
 constexpr int kQuickMax = 4;            // steps queued at most (trackpad momentum)
 constexpr float kNavStep = 70;          // menus: points of movement per highlight step at sensitivity 1
 constexpr double kNavFlick = 0.07;      // menus: left stick flick per step, then as long at rest
@@ -32,6 +33,8 @@ float g_vx = 0, g_vy = 0;               // smoothed mouse speed, points/s
 double g_pulse_until[input_map::kActionCount] = {};
 bool g_quick_on = false;                // quick select holds the D-pad (or a held D-pad is the player's)
 uint32_t g_quick_bit = 0;
+double g_fire_until = 0;                // bow: ZR let go until then
+bool g_fire_held = false;
 double g_flick_until = 0, g_next_flick = 0, g_quick_release = 0;
 float g_flick = 0;
 uint32_t g_prev_buttons = 0;
@@ -188,9 +191,16 @@ void apply(input::PadState& s, const input_map::Mapping& m, double now) {
     g_nav_x = g_nav_y = 0;
 
     // mouse buttons and wheel notches -> actions (wheel: a short press per notch)
+    // while the bow is drawn (ZR from a key or a mouse button), the left button shoots: ZR is let go
+    // for a moment (the game shoots on release) and taken again while still held (the next arrow)
+    bool aiming = s.buttons & input::kZR;
+    for (int b = kMouseRight; b < kWheelUp; b++) aiming |= held[b] && m.mouse[b] == kZR;
+    if (aiming && held[kMouseLeft] && !g_fire_held) g_fire_until = now + kFire;
+    g_fire_held = aiming && held[kMouseLeft];
     float v[kActionCount] = {};
     for (int b = 0; b < kWheelUp; b++)
-        if (held[b] && m.mouse[b] >= 0 && m.mouse[b] < kActionCount && !is_quick(m.mouse[b])) v[m.mouse[b]] = 1;
+        if (held[b] && m.mouse[b] >= 0 && m.mouse[b] < kActionCount && !is_quick(m.mouse[b]) && !(b == kMouseLeft && aiming))
+            v[m.mouse[b]] = 1;
     for (int i = 0; i < 2; i++) {
         const int a = m.mouse[i ? kWheelDown : kWheelUp];
         if (notches[i] && a >= 0 && a < kActionCount) g_pulse_until[a] = now + kPulse;
@@ -199,6 +209,7 @@ void apply(input::PadState& s, const input_map::Mapping& m, double now) {
         if (now < g_pulse_until[a]) v[a] = 1;
     for (int a = 0; a < kActionCount; a++)
         if (v[a]) s.buttons |= action_bit(a);
+    if (now < g_fire_until) s.buttons &= ~input::kZR;
     axis(s.lx, v[kLRight] - v[kLLeft]);
     axis(s.ly, v[kLUp] - v[kLDown]);
     axis(s.rx, v[kRRight] - v[kRLeft]);
@@ -219,7 +230,8 @@ void apply(input::PadState& s, const input_map::Mapping& m, double now) {
     constexpr uint32_t kDpad = input::kUp | input::kDown | input::kLeft | input::kRight;
     if (quick && !g_quick_on) {
         g_quick_on = true;
-        g_quick_bit = (s.buttons & kDpad) ? 0 : input::kRight;  // a bar the player holds open, or weapons
+        // a bar the player holds open, or the arrows while the bow is drawn, or the weapons
+        g_quick_bit = (s.buttons & kDpad) ? 0 : aiming ? input::kLeft : input::kRight;
         g_next_flick = now + (g_quick_bit ? kQuickLead : 0.0);
         g_flick_until = 0;
     }

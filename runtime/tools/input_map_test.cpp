@@ -50,7 +50,7 @@ static void test_defaults() {
     CHECK(s.rx == 1 && s.ry == 1);  // right stick: no diagonal scaling (as before)
     CHECK(press(m, {kVK_ANSI_K}).buttons == 0);
     // the mouse: left attack, right shield, wheel quick select; quick select keys press nothing themselves
-    CHECK(m.mouse[kMouseLeft] == kY && m.mouse[kMouseRight] == kZL && m.mouse[kWheelDown] == kQuickNext);
+    CHECK(m.mouse[kMouseLeft] == kY && m.mouse[kMouseRight] == kZR && m.mouse[kWheelDown] == kQuickNext);
     CHECK(press(m, {kVK_ANSI_RightBracket}).buttons == 0 && m.mouse_look);
     // the Screenshot app action: F10, no controller input, never a GamePad button or stick
     CHECK(m.keys[kScreenshot][0] == kVK_F10 && m.pad[kScreenshot] == kPadNone);
@@ -462,6 +462,10 @@ static void test_upgrade() {
     changed.replace(changed.find("\"K\", \"Space\""), 12, "\"K\", \"G\"    ");
     CHECK(from_json(changed, r, &err) && err.empty());
     CHECK(r.keys[kA][0] == kVK_ANSI_K && r.keys[kA][1] == kVK_ANSI_G && r.keys[kB][0] == kVK_ANSI_J);
+    // version 2's untouched mouse (right click shield) gets the bow on the right button
+    CHECK(from_json(R"({"version": 2, "mouse": {"Left": "Y", "Right": "ZL", "Middle": "RightStickClick", "Back": "ZR",
+        "Forward": "R", "WheelUp": "QuickSelectPrev", "WheelDown": "QuickSelectNext"}})", r, &err) && r.mouse == Mapping::defaults().mouse);
+    CHECK(from_json(R"({"version": 3, "mouse": {"Right": "ZL"}})", r, &err) && r.mouse[kMouseRight] == kZL);
     // version 2 is never rewritten, even with those keys
     std::string v2 = ww;
     v2.replace(v2.find("\"version\": 1"), 12, "\"version\": 2");
@@ -506,10 +510,16 @@ static void test_mouse_look() {
     }
     CHECK(std::fabs(s.rx - (0.15f + 0.85f * 0.5f)) < 0.03f);
     for (int i = 0; i < 20; i++) read(1.0 / 60);
-    // buttons: left attack (Y), right shield (ZL)
+    // buttons: left attack (Y), right draws the bow (ZR); while drawn, a left click lets ZR go briefly (shoots)
     mouse_look::button(kMouseLeft, true);
+    CHECK(read(1.0 / 60).buttons == input::kY);
+    mouse_look::button(kMouseLeft, false);
     mouse_look::button(kMouseRight, true);
-    CHECK(read(1.0 / 60).buttons == (input::kY | input::kZL));
+    CHECK(read(1.0 / 60).buttons == input::kZR);
+    mouse_look::button(kMouseLeft, true);
+    CHECK(read(1.0 / 60).buttons == 0);   // shot, no attack
+    for (int i = 0; i < 9; i++) s = read(1.0 / 60);
+    CHECK(s.buttons == input::kZR);       // the next arrow, left still held: no second shot
     mouse_look::release_all();
     CHECK(read(1.0 / 60).buttons == 0);
     // a wheel bound to a button presses it briefly per notch
@@ -530,7 +540,15 @@ static void test_mouse_look() {
         if (s.rx > 0.5f && prev <= 0.5f) flicks++;
         prev = s.rx;
     }
-    CHECK(flicks == 1 && held > 40 && held < 70 && !(s.buttons & input::kRight));
+    CHECK(flicks == 1 && held > 30 && held < 45 && !(s.buttons & input::kRight));
+    // while the bow is drawn the wheel steps the arrows (D-pad left)
+    mouse_look::button(kMouseRight, true);
+    mouse_look::wheel(-1.0f);
+    held = 0;
+    for (int i = 0; i < 60; i++) held += (read(1.0 / 60).buttons & input::kLeft) != 0;
+    CHECK(held > 20);
+    mouse_look::release_all();
+    for (int i = 0; i < 30; i++) read(1.0 / 60);
     // the menus: + opens, B closes; − then + switches screens; the same button closes
     auto press_bits = [&](uint32_t b) { input::PadState p; p.buttons = b; mouse_look::apply(p, m, t += 0.02); };
     mouse_look::take_menu_event();
