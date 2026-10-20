@@ -1748,15 +1748,24 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         id<MTLBuffer> gb = addr ? guest_buffer(addr, &off) : nil;
         DLOG("[draw]   %s ub%d %08X size %X", vertex ? "VS" : "PS", i, addr, size);
         if (!gb) continue;
-        // capture: the contents of the blocks of one program (WWHD_UB_DUMP=<program address>, e.g. 3C599B00)
-        static const uint32_t dumpProg = getenv("WWHD_UB_DUMP") ? (uint32_t)strtoul(getenv("WWHD_UB_DUMP"), nullptr, 16) : 0;
-        if (dumpProg && log_this_frame() &&
-            (regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8) == dumpProg) {
+        // capture: the contents of the blocks of some programs (WWHD_UB_DUMP=<program address>[,...], e.g. 3C599B00)
+        static const std::vector<uint32_t> dumpProgs = [] {
+            std::vector<uint32_t> v;
+            for (const char* p = getenv("WWHD_UB_DUMP"); p && *p; p += *p == ',') {
+                char* e;
+                v.push_back((uint32_t)strtoul(p, &e, 16));
+                if (e == p) break;
+                p = e;
+            }
+            return v;
+        }();
+        const uint32_t prog = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
+        if (!dumpProgs.empty() && log_this_frame() && std::find(dumpProgs.begin(), dumpProgs.end(), prog) != dumpProgs.end()) {
             const uint32_t* w = (const uint32_t*)mem::ptr(addr);
             std::string line;
             char b[48];
             for (uint32_t k = 0; k < std::min<uint32_t>(size / 4, 1024); k++) {
-                uint32_t v = w[k];
+                uint32_t v = __builtin_bswap32(w[k]);  // guest memory is big-endian
                 float f;
                 memcpy(&f, &v, 4);
                 snprintf(b, sizeof b, "%s%g", k % 4 ? "," : (k ? " | " : ""), f);
