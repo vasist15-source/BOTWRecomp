@@ -1637,6 +1637,16 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         if (s && unit < 18) { texScale[unit][0] = s->sx; texScale[unit][1] = s->sy; }
         uint32_t samplerIdx = dec->textureUnitSamplerAssignment[unit];
         if (capturing() && s && (vertex || (s->gpuWritten && s->slices > 1))) capture_full(s);
+        // F12 capture: small CPU-written cube maps (the lamps' per-direction range cubes): our texture and the guest bytes
+        if (capturing() && s && !s->gpuWritten && s->slices == 6 && s->width <= 8) {
+            capture_full(s);
+            static std::set<uint32_t> raw;
+            if (raw.insert(tw[2] << 8).second) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s/guest_%08X_w0_%08X_w1_%08X_w4_%08X.raw", g_capture_dir.c_str(), tw[2] << 8, tw[0], tw[1], tw[4]);
+                if (FILE* f = fopen(fn, "wb")) { fwrite(mem::ptr(tw[2] << 8), 1, 0x800, f); fclose(f); }
+            }
+        }
         DLOG("[draw]   %s tex%u %08X %ux%u fmt %X gpu=%d view=%d [mips %u+%u of %u, slices %u+%u of %u, dim %u] smp %08X %08X %08X",
              vertex ? "VS" : "PS", unit, tw[2] << 8, s ? s->width : 0, s ? s->height : 0, s ? s->format : 0, s ? s->gpuWritten : -1, tex != nil,
              tv ? tv->firstMip : 0, tv ? tv->numMip : 0, s ? s->mips : 0, tv ? tv->firstSlice : 0, tv ? tv->numSlice : 0, s ? s->slices : 0,
