@@ -77,6 +77,7 @@ bool ensure_core();   // service threads entering guest code; true if the core w
 void release_core();
 void set_service_core(uint32_t core);
 void report_sched();  // log per-thread core usage
+void dump_threads(const char* why);  // every guest thread's state (freeze watchdog)
 }  // namespace threads
 struct BlockingScope {
     BlockingScope() { threads::block_begin(); }

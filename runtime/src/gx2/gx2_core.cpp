@@ -1226,7 +1226,30 @@ HLE(gx2, GX2DrawDone) {
     if (ft0) ftrace::ring[(g_swap_count + 1) & 255].drawDoneMs += (ftrace::now() - ft0) / 1e6;
     ret(c, 1);
 }
+// Freeze watchdog: when the game presents no frame for 1.5 s (outside the first minute's loading),
+// every guest thread's state is logged once per freeze ([freeze]), so what blocked can be found.
+static std::atomic<int64_t> g_last_swap_ns{0};
+static void freeze_watchdog() {
+    bool reported = false;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t gap = now - g_last_swap_ns.load(std::memory_order_relaxed);
+        if (gap < 1500000000ll) { reported = false; continue; }
+        if (reported) continue;
+        reported = true;
+        char why[96];
+        snprintf(why, sizeof why, "no frame for %.1f s (after swap %llu)", gap / 1e9, (unsigned long long)g_swap_count);
+        threads::dump_threads(why);
+    }
+}
 HLE(gx2, GX2SwapScanBuffers) {
+    {
+        g_last_swap_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        static const bool watch = !getenv("WWHD_NO_FREEZE_WATCH");
+        static std::once_flag started;
+        if (watch && g_swap_count > 3600) std::call_once(started, [] { std::thread(freeze_watchdog).detach(); });
+    }
     perf::game_frame();  // the overlay's Game CPU: this thread's CPU time per submitted frame
     // save states are taken and loaded here: the thread that submits frames calls this once a frame from
     // the same place (Wind Waker's per-frame hook, savestate.cpp's anchor, never runs in BotW)
