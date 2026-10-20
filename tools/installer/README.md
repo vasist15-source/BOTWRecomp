@@ -87,6 +87,5 @@ stream). It translates with the same code as `tools/probe_recomp.py` (identical 
 checkout's `build/gen`), configures CMake with `GEN_DIR` in the cache folder (Release, Metal) and
 builds only the `wwhd` target. `tools/installer/macos/BotWInstaller.swift` is the SwiftUI front end,
 built by `tools/installer/macos/build.sh [DEST]`. `tools/make_app.sh` stays the dev bundle (the dev
-checkout's build, dump and `build/save`). The multi-platform setup inherited from the Wind Waker HD
-port (`setup.py`, `gui/`, the Windows and Linux scripts) is not adapted to BotW yet; its notes are in
-[README-wwhd.md](README-wwhd.md).
+checkout's build, dump and `build/save`). Wind Waker HD's multi-platform setup and release
+packaging (Windows, Linux, Android) were removed; this port is macOS only.

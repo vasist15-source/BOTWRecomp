@@ -34,7 +34,7 @@ add_library(wwhd_zstd INTERFACE)
 if(WWHD_ZSTD_TARGET)
   message(STATUS "zstd: system (${WWHD_ZSTD_TARGET})")
   target_link_libraries(wwhd_zstd INTERFACE ${WWHD_ZSTD_TARGET})
-  # tools/release/package.py refuses this build: the extractor would depend on the system's zstd
+  # release packaging refuses this build: the extractor would depend on the system's zstd
   file(WRITE ${CMAKE_BINARY_DIR}/wwhd-zstd.txt "system\n")
 else()
   message(STATUS "zstd: pinned source 1.5.7, static")
@@ -56,6 +56,6 @@ else()
   target_compile_definitions(wwhd_zstd_static PRIVATE ZSTD_DISABLE_ASM XXH_NAMESPACE=ZSTD_)
   target_compile_options(wwhd_zstd_static PRIVATE -w -O2)
   target_link_libraries(wwhd_zstd INTERFACE wwhd_zstd_static)
-  # tools/release/package.py ships this license with the extractor
+  # the extractor ships with this license
   file(WRITE ${CMAKE_BINARY_DIR}/wwhd-zstd.txt "bundled ${zstd_SOURCE_DIR}/LICENSE\n")
 endif()

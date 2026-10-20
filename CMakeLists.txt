@@ -235,7 +235,7 @@ if(WWHD_HAS_VULKAN)
     target_include_directories(wwhd SYSTEM PRIVATE $<TARGET_PROPERTY:Vulkan::Vulkan,INTERFACE_INCLUDE_DIRECTORIES>
                                             $<TARGET_PROPERTY:glslang::glslang,INTERFACE_INCLUDE_DIRECTORIES>)
     # Release builds (WWHD_BUNDLED_DEPS) compile glslang statically into the game and ship the Vulkan
-    # loader and MoltenVK next to it (tools/release/macos_vulkan.py); only shared libraries are weak.
+    # loader and MoltenVK next to it; only shared libraries are weak.
     target_link_options(wwhd PRIVATE "LINKER:-weak_library,$<TARGET_FILE:Vulkan::Vulkan>")
     get_target_property(WWHD_GLSLANG_TYPE glslang::glslang TYPE)
     if(WWHD_GLSLANG_TYPE STREQUAL "SHARED_LIBRARY")
@@ -281,10 +281,6 @@ target_compile_options(shadertest PRIVATE "SHELL:-include ${CEMU_DIR}/cemu_shim.
 
 endif()
 
-option(WWHD_SETUP_GUI "build the graphical installer (wwhd-setup)" OFF)
-if(WWHD_SETUP_GUI)
-  include(cmake/SetupGui.cmake)
-endif()
 
 # recomp mod-manager preferences and catalogue (standalone host stubs)
 
@@ -710,9 +706,6 @@ target_include_directories(guest_hooks_test PRIVATE runtime/include runtime/src)
 target_compile_options(guest_hooks_test PRIVATE -UNDEBUG)
 target_link_libraries(guest_hooks_test PRIVATE ZLIB::ZLIB ${CMAKE_DL_LIBS})
 add_test(NAME guest_hooks COMMAND guest_hooks_test)
-if(Python3_Interpreter_FOUND)
-  add_test(NAME release_sdk_package COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/release/test_sdk_package.py")
-endif()
 
 add_executable(process_test runtime/tools/process_test.cpp)
 target_include_directories(process_test PRIVATE runtime/src)
