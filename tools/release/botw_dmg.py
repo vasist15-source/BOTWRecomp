@@ -67,7 +67,7 @@ def build_kit(version, work):
         if skip:
             skip = False
             continue
-        if a in ("-MT", "-MF", "-o", "-c"):
+        if a in ("-MT", "-MF", "-o", "-c", "-isysroot"):  # the player's clang finds its own SDK
             skip = True
             continue
         if a.startswith("-I") or a == "-MD":
@@ -75,7 +75,14 @@ def build_kit(version, work):
         cflags.append(a)
     # the link line, with the kit's libraries and a placeholder for the player's objects
     out_link = []
+    skip = False
     for a in link[1:]:
+        if skip:
+            skip = False
+            continue
+        if a == "-isysroot":  # CMake 4 names the SDK; the player's clang finds its own
+            skip = True
+            continue
         if a.startswith("CMakeFiles/wwhd.dir/"):
             if "-Wl,-force_load,@KIT@/lib/libbotw_runtime.a" not in out_link:
                 out_link.append("-Wl,-force_load,@KIT@/lib/libbotw_runtime.a")  # keeps the HLE registrations
