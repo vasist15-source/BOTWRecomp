@@ -359,12 +359,41 @@ static void sched_tick_thread() {
     }
 }
 
-// debug: WWHD_LOG_LONGWAIT=1 reports blocking calls that took longer than 2 s (who waited, from where)
-static const bool g_log_longwait = getenv("WWHD_LOG_LONGWAIT") != nullptr;
+// debug: WWHD_LOG_LONGWAIT=1 logs blocking calls that took longer than 1 s (who waited, from where). Off by
+// default: idle workers waiting on their message queues for many seconds are normal (freezes: [freeze])
+static const bool g_log_longwait = getenv("WWHD_LOG_LONGWAIT") && atoi(getenv("WWHD_LOG_LONGWAIT")) != 0;
 static thread_local std::chrono::steady_clock::time_point t_block_start;
 
 namespace threads {
 // share of wall time each thread held / waited for its core since the last report
+// every guest thread's state, for a frozen game (freeze watchdog, gx2 swap): name, running or what it
+// waits on (kind, object), whether it holds its core or waits for it, priority, and where it is (lr, sp)
+void dump_threads(const char* why) {
+    static const char* const kinds[] = {"-", "mutex", "event", "msg send", "msg recv", "sleep queue", "join", "rendezvous", "sleep",
+                                        "service", "entry"};
+    std::unique_lock<std::mutex> lk(g_threads_mutex, std::try_to_lock);
+    if (!lk.owns_lock()) {  // a frozen thread may hold it: give it a moment, then read without it
+        for (int i = 0; i < 50 && !lk.try_lock(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    LOG("[freeze] %s; guest threads:", why);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& [g, t] : g_threads) {
+        if (!t->started || t->exited || t->service) continue;
+        const std::string name = mem::read_cstr(ld32(g + osthread::kName));
+        const int wst = t->wst.load();
+        const char* kind = t->wait_kind < sizeof kinds / sizeof *kinds ? kinds[t->wait_kind] : "?";
+        const double readyMs = !t->holds_core && t->ready_since.time_since_epoch().count()
+                                   ? std::chrono::duration<double, std::milli>(now - t->ready_since).count() : 0;
+        char state[64], core[48] = "";
+        if (wst == kParked) snprintf(state, sizeof state, "waits on %s %08X", kind, t->wait_obj);
+        else snprintf(state, sizeof state, "%s", wst == kRequester ? "main loop" : "running or in a system call");
+        if (t->holds_core) snprintf(core, sizeof core, ", holds its core");
+        else if (readyMs > 1) snprintf(core, sizeof core, ", ready for its core %.0f ms", readyMs);
+        LOG("[freeze]   %08X \"%s\" core %u prio %d: %s, lr %08X sp %08X%s", g, name.empty() ? "(main)" : name.c_str(), t->core, t->prio,
+            state, t->cpu.lr, t->cpu.r[1], core);
+    }
+}
+
 void report_sched() {
     static auto last = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -404,7 +433,7 @@ void block_begin() {
 void block_end() {
     if (g_log_longwait && t_self) {
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_block_start).count();
-        if (sec > 2.0)
+        if (sec > 1.0)
             LOG("[longwait] \"%s\" blocked %.1f s (lr %08X)", mem::read_cstr(ld32(t_self->guest + osthread::kName)).c_str(), sec,
                 t_self->cpu.lr);
     }
@@ -817,12 +846,26 @@ HLE(coreinit, OSYieldThread) {
     // let other ready threads of the same (or higher) priority on this core run. With none (or only lower
     // priorities) waiting, Cafe OS returns at once with the core kept: releasing it each time cost polling
     // threads (RadarMgr, PlacementMgr) more host time than their work, and let lower priorities in
+    // A lower priority that has waited over 1 ms for this core gets it for 1 ms: a thread polling in a
+    // yield loop at a high priority (BotW's movie player: AudioOutputThread and MP4DecodeThread at 17)
+    // otherwise starves the threads it waits for (the game's main thread at 20), and after 5 s the
+    // movie gave up (a slideshow). On the console those loops end sooner; here they must not lock out.
     HostThread* t = t_self;
     if (t && g_sched_on && t->holds_core) {
-        CoreSched& k = g_sched[t->held_core];
-        std::lock_guard<std::mutex> lk(k.m);
-        HostThread* next = best_ready(k);
-        if (!next || next->prio > t->prio) return;
+        bool starving = false;
+        {
+            CoreSched& k = g_sched[t->held_core];
+            std::lock_guard<std::mutex> lk(k.m);
+            HostThread* next = best_ready(k);
+            if (next && next->prio > t->prio)
+                starving = std::chrono::steady_clock::now() - next->ready_since > std::chrono::milliseconds(1);
+            else if (!next) return;
+            if (next && next->prio > t->prio && !starving) return;
+        }
+        if (starving) {
+            threads::park_sleep_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(1));
+            return;
+        }
     }
     threads::release_core();
     threads::ensure_core();
@@ -855,6 +898,15 @@ HLE(coreinit, OSSetThreadAffinity) {
     ret(c, 1);
 }
 HLE(coreinit, OSGetThreadPriority) { ret(c, ld32(arg(c, 0) + osthread::kBasePrio)); }
+// (thread, priority 0-31, 0 highest): applies at the thread's next scheduling decision
+HLE(coreinit, OSSetThreadPriority) {
+    const uint32_t t = arg(c, 0), prio = arg(c, 1);
+    if (!t || prio > 31) { ret(c, 0); return; }
+    st32(t + osthread::kBasePrio, prio);
+    st32(t + osthread::kEffPrio, prio);
+    if (HostThread* ht = host_thread(t)) ht->prio = (int)prio;
+    ret(c, 1);
+}
 HLE(coreinit, OSSetThreadSpecific) { st32(threads::current_thread() + osthread::kSpecific + 4 * arg(c, 0), arg(c, 1)); }
 HLE(coreinit, OSGetThreadSpecific) { ret(c, ld32(threads::current_thread() + osthread::kSpecific + 4 * arg(c, 0))); }
 HLE(coreinit, OSBlockThreadsOnExit) {}

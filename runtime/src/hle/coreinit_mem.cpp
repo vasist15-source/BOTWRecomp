@@ -244,6 +244,57 @@ HLE(coreinit, MEMGetAllocatableSizeForFrmHeapEx) {
     ret(c, r);
 }
 
+// MEMAllocator (0x10 bytes): +0 MEMAllocatorFunc* {alloc(allocator, size), free(allocator, ptr)}, +4 heap,
+// +8 param1 (alignment), +C param2. The function tables hold guest-callable addresses of host functions,
+// so game code may call them directly as well as through MEMAllocFromAllocator / MEMFreeToAllocator.
+// (BotW's movie player allocates its buffers through one; without these its threads quit at once.)
+namespace {
+uint32_t allocator_funcs(PpcFunc alloc, PpcFunc free_, const char* allocName, const char* freeName) {
+    const uint32_t t = mem::host_alloc(8, 8);
+    st32(t, dispatch::register_host(alloc, allocName));
+    st32(t + 4, dispatch::register_host(free_, freeName));
+    return t;
+}
+void exp_allocator_alloc(Cpu* c) { ret(c, exp_alloc(ld32(arg(c, 0) + 4), arg(c, 1), (int32_t)ld32(arg(c, 0) + 8))); }
+void exp_allocator_free(Cpu* c) {
+    std::lock_guard<std::mutex> lk(g_mem_mutex);
+    auto it = g_exp.find(ld32(arg(c, 0) + 4));
+    if (it != g_exp.end() && arg(c, 1)) it->second->release(arg(c, 1));
+}
+void frm_allocator_alloc(Cpu* c) { ret(c, frm_alloc(ld32(arg(c, 0) + 4), arg(c, 1), (int32_t)ld32(arg(c, 0) + 8))); }
+void frm_allocator_free(Cpu*) {}  // a frame heap frees only by state or all at once
+void default_allocator_alloc(Cpu* c) { ret(c, mem_default_alloc(arg(c, 1), 0x40)); }
+void default_allocator_free(Cpu* c) { if (arg(c, 1)) mem_default_free(arg(c, 1)); }
+void init_allocator(uint32_t a, uint32_t funcs, uint32_t heap, uint32_t align) {
+    st32(a + 0x0, funcs);
+    st32(a + 0x4, heap);
+    st32(a + 0x8, align);
+    st32(a + 0xC, 0);
+}
+}  // namespace
+HLE(coreinit, MEMInitAllocatorForExpHeap) {
+    static const uint32_t funcs = allocator_funcs(exp_allocator_alloc, exp_allocator_free, "ExpHeapAllocator_Alloc", "ExpHeapAllocator_Free");
+    init_allocator(arg(c, 0), funcs, arg(c, 1), arg(c, 2));
+}
+HLE(coreinit, MEMInitAllocatorForFrmHeap) {
+    static const uint32_t funcs = allocator_funcs(frm_allocator_alloc, frm_allocator_free, "FrmHeapAllocator_Alloc", "FrmHeapAllocator_Free");
+    init_allocator(arg(c, 0), funcs, arg(c, 1), arg(c, 2));
+}
+HLE(coreinit, MEMInitAllocatorForDefaultHeap) {
+    static const uint32_t funcs =
+        allocator_funcs(default_allocator_alloc, default_allocator_free, "DefaultHeapAllocator_Alloc", "DefaultHeapAllocator_Free");
+    init_allocator(arg(c, 0), funcs, g_default_heap, 0);
+}
+// (allocator, size) / (allocator, ptr): through the allocator's own functions, as on Cafe OS
+HLE(coreinit, MEMAllocFromAllocator) {
+    const uint32_t a = arg(c, 0), funcs = a ? ld32(a) : 0;
+    ret(c, funcs ? guest_call(c, ld32(funcs), {a, arg(c, 1)}) : 0);
+}
+HLE(coreinit, MEMFreeToAllocator) {
+    const uint32_t a = arg(c, 0), funcs = a ? ld32(a) : 0;
+    if (funcs) guest_call(c, ld32(funcs + 4), {a, arg(c, 1)});
+}
+
 // OSGetMemBound(type, u32* start, u32* size): 1 = MEM1, 2 = MEM2. On Cafe OS the MEM2 arena encloses
 // the default heap (coreinit builds it there), so this reports the default heap's range; a game that
 // builds its own heap over it would collide with malloc, so every call is logged.

@@ -1002,6 +1002,14 @@ HLE(snd_core, AXSetVoiceLoopOffsetEx) {
         write_offsets(*v);
     }
 }
+// (voice, offset): relative to the voice's current sample base, like the "Ex" setters
+HLE(snd_core, AXSetVoiceCurrentOffset) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    if (Voice* v = voice(arg(c, 0))) {
+        v->cur_abs = base_units(v->format, v->samples) + arg(c, 1);
+        write_offsets(*v);
+    }
+}
 HLE(snd_core, AXGetVoiceCurrentOffsetEx) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
     Voice* v = voice(arg(c, 0));

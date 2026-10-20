@@ -220,7 +220,7 @@ if(WIN32)
 endif()
 if(WWHD_HAS_METAL)
   target_compile_definitions(wwhd PRIVATE WWHD_HAS_METAL=1)
-  target_link_libraries(wwhd PRIVATE "-framework Metal" "-framework QuartzCore" "-framework AppKit" "-framework Foundation" "-framework ImageIO" "-framework UniformTypeIdentifiers" "-framework GameController" "-framework Carbon" "-framework AudioToolbox" "-framework CoreAudio" compression)
+  target_link_libraries(wwhd PRIVATE "-framework Metal" "-framework QuartzCore" "-framework AppKit" "-framework Foundation" "-framework ImageIO" "-framework UniformTypeIdentifiers" "-framework GameController" "-framework Carbon" "-framework AudioToolbox" "-framework CoreAudio" "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo" compression)
 endif()
 if(WWHD_HAS_VULKAN)
   # VK_NO_PROTOTYPES: the renderer loads every Vulkan function at run time (gfx/vulkan/loader.h), so the
