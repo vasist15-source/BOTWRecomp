@@ -942,12 +942,14 @@ static uint64_t pack_color_data_type(Latte::E_GX2SURFFMT f) {
     default: return FLOAT;  // the table's float formats and its fallback
     }
 }
-static uint64_t pack_ps_aux(const LatteDecompilerShader& d, const uint32_t* regs) {
+// withDepth false: without the depth buffer term (the Enhancements pack's reflection shaders are named so
+// although their draws test depth: made with a Cemu whose hash left it out)
+static uint64_t pack_ps_aux(const LatteDecompilerShader& d, const uint32_t* regs, bool withDepth = true) {
     uint64_t h = cemu_pack_hash::auxiliary(d, regs, false);
     for (uint32_t i = 0; i < d.textureUnitListCount; i++) h = std::rotl(h, 11) + d.textureRenderTargetIndex[d.textureUnitList[i]];
     const auto& lcr = *(const LatteContextRegister*)regs;
     for (uint32_t i = 0; i < 8; i++) h = std::rotl(h, 7) + pack_color_data_type(LatteMRT::GetColorBufferFormat(i, lcr));
-    if (LatteMRT::GetActiveDepthBufferMask(lcr)) h = std::rotl(h, 5) + 13;
+    if (withDepth && LatteMRT::GetActiveDepthBufferMask(lcr)) h = std::rotl(h, 5) + 13;
     return h;
 }
 // the blocks Cemu marks "predetermined by Cemu. Do not touch": a pack shader must declare the same ones
@@ -966,9 +968,10 @@ static std::string pack_interface(const std::string& src) {
 static void apply_graphic_pack(Shader* s, const uint32_t* regs, uint32_t addr, uint32_t size) {
     if (!graphic_packs::has_shaders() || !s->dec || !s->dec->strBuf_shaderSource) return;
     const uint64_t base = cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr);
-    const uint64_t aux = pack_ps_aux(*s->dec, regs);
+    uint64_t aux = pack_ps_aux(*s->dec, regs);
     if (getenv("WWHD_GPACK_LOG")) LOG("[gpack] ps %016llx_%016llx", (unsigned long long)base, (unsigned long long)aux);
     std::string src = graphic_packs::shader_source(base, aux, false);
+    if (src.empty()) src = graphic_packs::shader_source(base, aux = pack_ps_aux(*s->dec, regs, false), false);
     if (src.empty()) return;
     const std::string ours = s->dec->strBuf_shaderSource->c_str();
     if (pack_interface(src) != pack_interface(ours)) {
