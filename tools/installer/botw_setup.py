@@ -39,6 +39,10 @@ SUPPORT = os.path.join(HOME, "Library", "Application Support", "BotW")
 CACHE = os.path.join(HOME, "Library", "Caches", "BotW", "installer")
 LOGS = os.path.join(HOME, "Library", "Logs", "BotW")
 CONFIG = os.path.join(SUPPORT, "install.plist")
+# A release (the installer app's Resources/botwrecomp) has the runtime prebuilt in kit/ (tools/release/
+# botw_dmg.py): only the game code is compiled here, with the Command Line Tools' clang, and linked to
+# it. A source checkout has no kit/ and builds everything with CMake.
+KIT = os.path.join(ROOT, "kit")
 SAVE = os.path.join(SUPPORT, "save")
 GAME_COPY = os.path.join(SUPPORT, "game")
 APP_NAME = "Breath of the Wild.app"
@@ -308,6 +312,14 @@ def import_save(src_user, log):
 
 # ---------------------------------------------------------------- tools
 
+def load_kit():
+    p = os.path.join(KIT, "kit.json")
+    if not os.path.isfile(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+
 def tool_dirs():
     return [d for d in os.environ.get("PATH", "").split(os.pathsep) if d] + [
         "/opt/homebrew/bin", "/usr/local/bin", "/Applications/CMake.app/Contents/bin",
@@ -325,7 +337,6 @@ def find_tool(name):
 def clt_ok():
     try:
         subprocess.run(["/usr/bin/xcrun", "--find", "clang"], check=True, capture_output=True, timeout=60)
-        subprocess.run(["/usr/bin/xcrun", "--find", "swiftc"], check=True, capture_output=True, timeout=60)
         return True
     except (OSError, subprocess.SubprocessError):
         return False
@@ -347,12 +358,13 @@ def requirements(copy_game_bytes=0):
     ok = clt_ok()
     add("Command Line Tools", ok, "compiler found" if ok else "not installed",
         "" if ok else "Apple's free Command Line Tools provide the compiler. Click Install, or run: xcode-select --install")
-    cm = find_tool("cmake")
-    add("CMake", bool(cm), cm or "not found",
-        "" if cm else "Install CMake with Homebrew (brew install cmake ninja) or the CMake app from cmake.org.")
-    nj = find_tool("ninja")
-    add("Ninja (optional)", True if nj else "warn", nj or "not found: the build uses make instead (a little slower)",
-        "" if nj else "Optional: brew install ninja")
+    if not load_kit():  # a source checkout builds the runtime too
+        cm = find_tool("cmake")
+        add("CMake", bool(cm), cm or "not found",
+            "" if cm else "Install CMake with Homebrew (brew install cmake ninja) or the CMake app from cmake.org.")
+        nj = find_tool("ninja")
+        add("Ninja (optional)", True if nj else "warn", nj or "not found: the build uses make instead (a little slower)",
+            "" if nj else "Optional: brew install ninja")
     need = 3 * (1 << 30) + copy_game_bytes
     os.makedirs(os.path.dirname(CACHE), exist_ok=True)
     free = shutil.disk_usage(os.path.dirname(CACHE)).free
@@ -388,6 +400,8 @@ class Installer:
         self.fraction = 0.0
         self.step_eta = None
         self.lock = threading.Lock()
+        self.kit = load_kit()
+        self.children = set()
 
     # -- output
     def emit(self, **ev):
@@ -448,10 +462,10 @@ class Installer:
                   seconds=self.finished[sid], overall=self.overall(), overall_eta=self.overall_eta())
 
     # -- child processes
-    def run(self, cmd, cwd=None, on_line=None, env=None):
+    def run(self, cmd, cwd=None, on_line=None, env=None, show=None):
         if self.cancelled:
             raise Cancelled()
-        self.log("$ " + " ".join(sh_quote(c) for c in cmd))
+        self.log("$ " + (show or " ".join(sh_quote(c) for c in cmd)))
         self.child = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       stdin=subprocess.DEVNULL, bufsize=1, universal_newlines=True, errors="replace")
         tail = []
@@ -470,11 +484,12 @@ class Installer:
 
     def cancel(self, *_):
         self.cancelled = True
-        if self.child and self.child.poll() is None:
-            try:
-                self.child.terminate()
-            except OSError:
-                pass
+        for c in [self.child] + list(self.children):
+            if c and c.poll() is None:
+                try:
+                    c.terminate()
+                except OSError:
+                    pass
 
     # -- the steps
     def main(self):
@@ -482,8 +497,12 @@ class Installer:
         plan = [("check", "Checking your game files and tools")]
         if a.copy_game:
             plan.append(("copy", "Copying the game files"))
-        plan += [("recompile", "Translating the game code"), ("configure", "Preparing the build"),
-                 ("compile", "Compiling the game"), ("bundle", "Creating %s" % APP_NAME)]
+        plan.append(("recompile", "Translating the game code"))
+        if self.kit:
+            plan += [("compile", "Compiling the game"), ("link", "Linking the game")]
+        else:
+            plan += [("configure", "Preparing the build"), ("compile", "Compiling the game")]
+        plan.append(("bundle", "Creating %s" % APP_NAME))
         if a.save:
             plan.append(("save", "Importing your save"))
         if not a.keep_build:
@@ -491,18 +510,22 @@ class Installer:
         self.steps = plan
         cores = max(1, min(self.jobs, os.cpu_count() or 1))
         self.estimates = {"check": 3, "copy": 60, "recompile": EST_RECOMP, "configure": 15,
-                          "compile": EST_COMPILE_CPU / (cores * 0.85), "bundle": 5, "save": 2, "cleanup": 5}
+                          "compile": EST_COMPILE_CPU / (cores * 0.85), "link": 20, "bundle": 5, "save": 2, "cleanup": 5}
         self.emit(event="plan", steps=[{"id": s, "title": t} for s, t in plan], overall_eta=self.overall_eta())
         signal.signal(signal.SIGTERM, self.cancel)
         signal.signal(signal.SIGINT, self.cancel)
-        self.log("Breath of the Wild for Mac installer, source %s (%s)" % (ROOT, git_rev()))
+        self.log("BOTWRecomp installer %s, %s (%s)" % (version(), ROOT, "prebuilt runtime" if self.kit else "source build"))
         try:
             self.do_check()
             if a.copy_game:
                 self.do_copy()
             self.do_recompile()
-            self.do_configure()
-            self.do_compile()
+            if self.kit:
+                self.do_compile_kit()
+                self.do_link_kit()
+            else:
+                self.do_configure()
+                self.do_compile()
             app = self.do_bundle()
             if a.save:
                 self.step("save")
@@ -512,6 +535,7 @@ class Installer:
                 self.step("cleanup")
                 shutil.rmtree(os.path.join(CACHE, "gen"), ignore_errors=True)
                 shutil.rmtree(os.path.join(CACHE, "rt"), ignore_errors=True)
+                shutil.rmtree(os.path.join(CACHE, "obj"), ignore_errors=True)
                 self.step_done("cleanup")
             self.log("Done: %s" % app)
             self.emit(event="done", app=app, log=self.logf.name, save=SAVE)
@@ -561,7 +585,10 @@ class Installer:
         for req in requirements(copy_bytes):
             if req["status"] == "error":
                 problems.append("%s: %s. %s" % (req["name"], req["detail"], req["fix"]))
-        if not os.path.isfile(os.path.join(ROOT, "CMakeLists.txt")) or not os.path.isdir(os.path.join(ROOT, "runtime")):
+        if self.kit:
+            if not all(os.path.isfile(os.path.join(KIT, n)) for n in self.kit["files"]):
+                problems.append("The installer is incomplete (%s); download it again." % KIT)
+        elif not os.path.isfile(os.path.join(ROOT, "CMakeLists.txt")) or not os.path.isdir(os.path.join(ROOT, "runtime")):
             problems.append("The port's source folder is incomplete (%s); download the release again." % ROOT)
         dest = os.path.abspath(os.path.expanduser(a.dest))
         try:
@@ -700,13 +727,89 @@ class Installer:
                  on_line=on_line, env=build_env())
         self.step_done("compile")
 
+    def do_compile_kit(self):
+        """Compiles the generated code with the flags the prebuilt runtime was built with (kit.json)."""
+        self.step("compile")
+        gen, obj = os.path.join(CACHE, "gen"), os.path.join(CACHE, "obj")
+        os.makedirs(obj, exist_ok=True)
+        flags = self.kit["cflags"] + ["-I", os.path.join(KIT, "include"), "-I", gen]
+        flag_stamp = hashlib.sha256(json.dumps(flags).encode()).hexdigest()
+        stamp_file = os.path.join(obj, ".flags")
+        if not os.path.isfile(stamp_file) or open(stamp_file).read() != flag_stamp:
+            shutil.rmtree(obj)
+            os.makedirs(obj)
+            with open(stamp_file, "w") as f:
+                f.write(flag_stamp)
+        sources = sorted(n for n in os.listdir(gen) if n.endswith(".c"))
+        weight = {n: (GEN_WEIGHT if n.startswith("code_") else 1.0) for n in sources}
+        todo = [n for n in sources if not up_to_date(os.path.join(obj, n + ".o"), os.path.join(gen, n))]
+        total = sum(weight.values())
+        done = [total - sum(weight[n] for n in todo), 0]
+        self.objects = [os.path.join(obj, n + ".o") for n in sources]
+        self.log("%d of %d files to compile" % (len(todo), len(sources)))
+        errors = []
+        queue = list(todo)
+        lock = threading.Lock()
+
+        def worker():
+            while True:
+                with lock:
+                    if not queue or errors or self.cancelled:
+                        return
+                    n = queue.pop(0)
+                out = os.path.join(obj, n + ".o")
+                cmd = ["/usr/bin/clang"] + flags + ["-c", os.path.join(gen, n), "-o", out + ".tmp"]
+                t0 = time.time()
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                with lock:
+                    self.children.add(p)
+                text = p.communicate()[0].decode(errors="replace")
+                with lock:
+                    self.children.discard(p)
+                    if p.returncode != 0:
+                        if not self.cancelled:
+                            errors.append((n, text))
+                        return
+                    os.replace(out + ".tmp", out)
+                    done[0] += weight[n]
+                    done[1] += 1
+                    self.log("[%d/%d] %s (%.0f s)" % (done[1], len(todo), n, time.time() - t0))
+                    self.progress(done[0] / total, "game code, part %d of %d" % (done[1], len(todo)))
+
+        threads = [threading.Thread(target=worker) for _ in range(self.jobs)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if self.cancelled:
+            raise Cancelled()
+        if errors:
+            n, text = errors[0]
+            raise StepError("The compiler failed on %s." % n, "\n".join(text.splitlines()[-40:]))
+        self.step_done("compile")
+
+    def do_link_kit(self):
+        self.step("link")
+        self.exe = os.path.join(CACHE, "obj", "wwhd")
+        cmd = ["/usr/bin/clang++"]
+        for a in self.kit["link"]:
+            if a == "@GAMECODE@":
+                cmd += self.objects
+            else:
+                cmd.append(a.replace("@KIT@", KIT).replace("@OUT@", self.exe + ".tmp"))
+        self.progress(0.1, "about half a minute")
+        self.run(cmd, cwd=CACHE, env=build_env(),
+                 show="clang++ -o %s <%d game code objects> <the prebuilt runtime>" % (self.exe, len(self.objects)))
+        os.replace(self.exe + ".tmp", self.exe)
+        self.step_done("link")
+
     def do_bundle(self):
         a = self.args
         self.step("bundle")
         paths = getattr(self, "paths", None) or {"base": a.base, "update": a.update, "dlc": a.dlc or ""}
         dest = os.path.abspath(os.path.expanduser(a.dest))
         app = os.path.join(dest, APP_NAME)
-        exe = os.path.join(CACHE, "rt", "wwhd")
+        exe = getattr(self, "exe", None) or os.path.join(CACHE, "rt", "wwhd")
         tmp = tempfile.mkdtemp(prefix=".botw-app-", dir=dest)
         try:
             c = os.path.join(tmp, APP_NAME, "Contents")
@@ -722,7 +825,7 @@ class Installer:
                 plistlib.dump({
                     "CFBundleName": "Breath of the Wild", "CFBundleDisplayName": "Breath of the Wild",
                     "CFBundleIdentifier": BUNDLE_ID, "CFBundleExecutable": "launch", "CFBundleIconFile": "icon",
-                    "CFBundlePackageType": "APPL", "CFBundleVersion": git_rev(), "CFBundleShortVersionString": "1.5.0",
+                    "CFBundlePackageType": "APPL", "CFBundleVersion": version(), "CFBundleShortVersionString": "1.5.0",
                     "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
                     "GCSupportsControllerUserInteraction": True,
                     "LSApplicationCategoryType": "public.app-category.action-games",
@@ -774,6 +877,18 @@ def recomp_stamp(rpx):
                 with open(os.path.join(d, n), "rb") as f:
                     h.update(n.encode() + f.read())
     return h.hexdigest()
+
+
+def up_to_date(target, source):
+    try:
+        return os.path.getmtime(target) >= os.path.getmtime(source)
+    except OSError:
+        return False
+
+
+def version():
+    kit = load_kit()
+    return kit["version"] if kit else git_rev()
 
 
 def git_rev():

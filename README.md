@@ -1,4 +1,4 @@
-# botw-mac
+# BOTWRecomp
 
 Native macOS port of *The Legend of Zelda: Breath of the Wild* (Wii U, v1.5.0 / update v208) by
 static recompilation, built on the approach and runtime of
@@ -9,9 +9,11 @@ No game code or assets are in this repository. Everything under `build/` is gene
 own dump.
 
 ## Install (players)
-Double-click **Install Breath of the Wild.command** and follow the installer: it checks your dump
-(base game, update v208, optional DLC), can import a save (for example from Cemu) and builds
-`Breath of the Wild.app` on your Mac. Details: [tools/installer/README.md](tools/installer/README.md).
+Download `BOTWRecomp-<version>.dmg` from [Releases](../../releases), open it and run
+**BOTWRecomp Installer**: it checks your dump (base game, update v208, optional DLC), can import a
+save (for example from Cemu) and builds `Breath of the Wild.app` on your Mac. From a source checkout,
+double-click **Install Breath of the Wild.command** instead. Details:
+[tools/installer/README.md](tools/installer/README.md).
 
 ## Layout
 - `ref/ZeldaWWHDRecomp/`: upstream reference checkout (git-ignored; `git clone --depth 1 ...`)

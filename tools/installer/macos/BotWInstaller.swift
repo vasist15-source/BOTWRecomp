@@ -1,4 +1,4 @@
-// Breath of the Wild Installer: the window in front of tools/installer/botw_setup.py.
+// BOTWRecomp Installer: the window in front of tools/installer/botw_setup.py.
 // The player picks their dump (base game, update v208, DLC) and optionally a save; the app checks
 // each one with `botw_setup.py check`, then runs `botw_setup.py install --json` and shows its
 // progress events. All the work (and every check) happens in botw_setup.py; this file is only UI.
@@ -10,10 +10,12 @@ import UniformTypeIdentifiers
 // MARK: - backend
 
 enum Backend {
-    /// The port's source folder: from Info.plist (build.sh writes it), else the folder around the app.
+    /// Where botw_setup.py lives: the release's Contents/Resources/botwrecomp (tools/release/botw_dmg.py),
+    /// a source checkout named in Info.plist (build.sh), or the folder around the app.
     static let root: URL? = {
         let fm = FileManager.default
         func ok(_ u: URL) -> Bool { fm.fileExists(atPath: u.appendingPathComponent("tools/installer/botw_setup.py").path) }
+        if let r = Bundle.main.resourceURL?.appendingPathComponent("botwrecomp"), ok(r) { return r }
         if let s = Bundle.main.object(forInfoDictionaryKey: "BotWSourceRoot") as? String, ok(URL(fileURLWithPath: s)) {
             return URL(fileURLWithPath: s)
         }
@@ -540,6 +542,7 @@ struct Section<Content: View>: View {
                 if let trailing { trailing }
             }
             VStack(alignment: .leading, spacing: 0) { content }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color(nsColor: .separatorColor)))
         }
@@ -550,11 +553,9 @@ struct Header: View {
     let subtitle: String
     var body: some View {
         HStack(spacing: 14) {
-            Image(systemName: "triangle.fill").font(.system(size: 30)).foregroundStyle(
-                LinearGradient(colors: [.yellow, .orange], startPoint: .top, endPoint: .bottom))
-                .frame(width: 52, height: 52).background(RoundedRectangle(cornerRadius: 12).fill(Color(red: 0.08, green: 0.16, blue: 0.22)))
+            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Breath of the Wild for Mac").font(.title.bold())
+                Text("BOTWRecomp").font(.title.bold())
                 Text(subtitle).foregroundStyle(.secondary)
             }
             Spacer()
@@ -569,7 +570,7 @@ struct SetupView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Header(subtitle: "Builds a native Mac app from your own Wii U dump. Nothing is downloaded.")
+                    Header(subtitle: "Breath of the Wild for Mac, built from your own Wii U dump. Nothing is downloaded.")
                     Section(number: 1, title: "Your game files", trailing: AnyView(scanButton)) {
                         if !m.scanNote.isEmpty {
                             Text(m.scanNote).font(.callout).foregroundStyle(.secondary).padding([.horizontal, .top], 12)
@@ -879,7 +880,7 @@ struct MissingSourceView: View {
         VStack(spacing: 14) {
             Image(systemName: "folder.badge.questionmark").font(.system(size: 48)).foregroundStyle(.orange)
             Text("The port's files were not found").font(.title2.bold())
-            Text("Keep this app inside the Breath of the Wild for Mac folder you downloaded (next to its tools and runtime folders), then open it again.")
+            Text("This copy of the installer is incomplete. Download BOTWRecomp again and open the installer from the disk image.")
                 .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 420)
             Button("Quit") { NSApp.terminate(nil) }
         }
@@ -926,7 +927,7 @@ struct BotWInstallerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model = Installer()
     var body: some Scene {
-        WindowGroup("Breath of the Wild Installer") {
+        WindowGroup("BOTWRecomp Installer") {
             RootView().environmentObject(model).onAppear { delegate.model = model }
         }
         .windowResizability(.contentMinSize)
