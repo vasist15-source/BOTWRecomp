@@ -998,6 +998,8 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
     static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
     opt.strictMul = strictMul;
     opt.useTFViaSSBO = true;  // stream out (BotW): the vertex shader writes guest memory through sb (see StreamoutDraw)
+    if (!vertex && graphic_packs::has_shaders())
+        opt.legacyGraphicPackUniforms = graphic_packs::has_base(cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr), false);
     LatteDecompilerOutput_t out{};
     if (vertex)
         LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);

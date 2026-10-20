@@ -25,6 +25,9 @@ void select(const Pack& pack, const Category& category, const std::string& prese
 bool restart_needed();  // a choice differs from the ones this session's shaders use
 
 bool has_shaders();
+// a pack replaces some variant of this program (Cemu base hash): translate it with Cemu's legacy
+// pixel uniform layout (fragCoordScale always present), which the pack shaders were written against
+bool has_base(uint64_t base, bool vertex);
 // replacement source for a shader by Cemu's hashes (Metal flavour), or empty
 std::string shader_source(uint64_t base, uint64_t aux, bool vertex);
 

@@ -243,6 +243,12 @@ bool restart_needed() {
 
 bool has_shaders() { return !active().shaders.empty(); }
 
+bool has_base(uint64_t base, bool vertex) {
+    for (auto& [key, src] : active().shaders)
+        if (std::get<0>(key) == base && std::get<2>(key) == vertex) return true;
+    return false;
+}
+
 std::string shader_source(uint64_t base, uint64_t aux, bool vertex) {
     auto it = active().shaders.find({base, aux, vertex});
     return it == active().shaders.end() ? std::string() : it->second;
