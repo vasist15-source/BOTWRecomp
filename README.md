@@ -8,6 +8,11 @@ Cafe OS reimplemented natively, GX2 mapped directly to Metal.
 No game code or assets are in this repository. Everything under `build/` is generated from your
 own dump.
 
+## Install (players)
+Double-click **Install Breath of the Wild.command** and follow the installer: it checks your dump
+(base game, update v208, optional DLC), can import a save (for example from Cemu) and builds
+`Breath of the Wild.app` on your Mac. Details: [tools/installer/README.md](tools/installer/README.md).
+
 ## Layout
 - `ref/ZeldaWWHDRecomp/`: upstream reference checkout (git-ignored; `git clone --depth 1 ...`)
 - `tools/probe_recomp.py`: runs WWHD's recompiler unchanged on `U-King.rpx`
