@@ -524,6 +524,28 @@ uint64_t ticks_ns(uint64_t ticks) {
     return ticks * tb.numer / tb.denom;
 }
 
+// the value of a once it differs from old, or old after about maxNs. WFE wakes on a store to a's cache
+// line (the exclusive monitor from LDAXR is cleared), an interrupt or the event stream
+uint64_t eq_wait_wfe(const std::atomic<uint64_t>& a, uint64_t old, uint64_t maxNs) {
+#if defined(__aarch64__)
+    const uint64_t t0 = mach_absolute_time();
+    uint64_t v = a.load(std::memory_order_acquire);
+    while (v == old) {
+        uint64_t x;
+        asm volatile("ldaxr %0, [%1]" : "=r"(x) : "r"(&a) : "memory");
+        if (x == old) asm volatile("wfe" ::: "memory");
+        else asm volatile("clrex" ::: "memory");
+        v = a.load(std::memory_order_acquire);
+        if (v == old && ticks_ns(mach_absolute_time() - t0) >= maxNs) break;
+    }
+    return v;
+#else
+    uint64_t v = old;
+    for (int i = 0; i < 2000 && (v = a.load(std::memory_order_acquire)) == old; i++) {}
+    return v;
+#endif
+}
+
 void eq_thread_main() {
     t_encoder_thread = true;
     pthread_setname_np("GX2 encode");
@@ -532,8 +554,11 @@ void eq_thread_main() {
     for (;;) {
         uint64_t w = g_eq_wpos.load(std::memory_order_acquire);
         if (r == w) {
-            // caught up: spin briefly (the next record usually follows within microseconds), then sleep
-            for (int i = 0; i < 2000 && (w = g_eq_wpos.load(std::memory_order_acquire)) == r; i++) __builtin_arm_yield();
+            // caught up: the next record usually follows within microseconds. Wait for it in WFE (the core
+            // idles until the render thread's store to g_eq_wpos's line, no clock reads) for up to ~100 us,
+            // then sleep. A spin of yields kept a P-core at full power through every frame (heat: the
+            // fanless test machine throttles)
+            w = eq_wait_wfe(g_eq_wpos, r, 100000);
             if (w == r) {
                 g_eq_wpos.wait(r, std::memory_order_acquire);
                 continue;

@@ -46,8 +46,13 @@ static bool log_reports() {
 }
 
 uint64_t now_ns() {
+#ifdef __APPLE__
+    // the commpage clock (mach_absolute_time); steady_clock's mach_continuous_time was 2-6% of the render thread
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
 }
 uint64_t thread_cpu_ns() {
 #ifdef _WIN32
