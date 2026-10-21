@@ -44,6 +44,7 @@ struct Device {
     Vec3 last_gyro, last_acc;
 };
 constexpr uint64_t kNone = ~0ull, kDsuDevice = ~1ull;
+bool g_motion_seen = false;  // vpad(): motion arrived from the current source (else Cemu's neutral values)
 std::map<uint64_t, Device> g_devices;   // controllers (key: host device id) and the DSU slot (key kDsuDevice)
 uint64_t g_active = kNone;              // the device that turns the virtual GamePad
 Aim g_pending;                          // the active device's aim not yet read by the game
@@ -403,7 +404,18 @@ VpadMotion vpad(bool repeat) {
         g_read_log_at = now;
         g_read_aim = {};
     }
+    // No motion yet this run (gyro off, or no controller / Cemuhook sender yet): the values Cemu reports
+    // without a motion source (identity direction, no acceleration). BotW's aiming (bow, Sheikah Slate
+    // camera) reads the tilt too and pulled the view up or down towards the virtual GamePad's upright
+    // pose. Once motion arrived the pose stays (no jump when a controller goes or the source changes).
+    g_motion_seen = g_motion_seen || !test_turns().empty() || g_settings.source == kMouse ||
+                    ((g_settings.source == kController || g_settings.source == kCemuhook) && !g_devices.empty());
     g_last = g_pad.vpad();
+    if (!g_motion_seen) {
+        g_last = VpadMotion{};
+        g_last.acc = {0, 0, 0};
+        g_last.acc_magnitude = 0;
+    }
     return g_last;
 }
 

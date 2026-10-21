@@ -381,6 +381,11 @@ static void test_settings_and_sources() {
     Settings s;
     assert(s.source == kOff);  // off by default
     assert(!drives_gamepad());
+    // no motion yet this run: Cemu's values without a motion source (no tilt; BotW's aiming follows the tilt)
+    {
+        const VpadMotion m = vpad(false);
+        assert(m.acc_magnitude == 0 && m.acc.y == 0 && m.dir[0].x == 1 && m.dir[1].y == 1 && m.dir[2].z == 1);
+    }
     s.source = kCemuhook;
     s.tuning.sensitivity_x = 1.5f;
     s.tuning.invert_y = true;
@@ -470,20 +475,21 @@ static void test_settings_and_sources() {
     assert(wants_controller_sensors() && drives_gamepad());
     float right90[3] = {0, -kPi / 2, 0}, still[3] = {0, 0, 0}, acc[3] = {0, 9.80665f, 0};  // 90 deg/s right
     uint64_t t = 1000000000ull;
+    controller_sample(42, t, still, acc);  // connected, at rest: the baseline
     g = {};
     g.frame(vpad(false));
-    // 100 samples, 99 steps of 4 ms: 35.64 degrees, 17.82 with sensitivity 0.5
+    // 100 samples, 100 steps of 4 ms after the resting one: 36 degrees, 18 with sensitivity 0.5
     for (int i = 0; i < 100; i++) controller_sample(42, t += 4000000, right90, acc);
     g.frame(vpad(false));
-    fprintf(stderr, "  controller 35.6 degrees right: game yaw %.3f\n", g.yaw);
-    assert(close_to(g.yaw, game_units_one_frame(17.82f), 0.02f));
+    fprintf(stderr, "  controller 36 degrees right: game yaw %.3f\n", g.yaw);
+    assert(close_to(g.yaw, game_units_one_frame(18.0f), 0.02f));
     // a second controller that rests does not take over; one that turns does once the first one rests
     for (int i = 0; i < 100; i++) {
         controller_sample(42, t += 4000000, right90, acc);
         controller_sample(43, t, still, acc);
     }
     g.frame(vpad(false));
-    assert(close_to(g.yaw, game_units_one_frame(17.82f) + game_units_one_frame(18), 0.03f));
+    assert(close_to(g.yaw, game_units_one_frame(18.0f) + game_units_one_frame(18), 0.03f));
     float left90[3] = {0, kPi / 2, 0};
     controller_sample(42, t += 4000000, still, acc);  // controller 42 now rests (for over half a second) ...
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
@@ -493,7 +499,7 @@ static void test_settings_and_sources() {
     }
     g.frame(vpad(false));
     fprintf(stderr, "  after the second controller turned left: game yaw %.3f\n", g.yaw);
-    assert(g.yaw < game_units_one_frame(17.82f) + game_units_one_frame(18) - game_units(5));
+    assert(g.yaw < game_units_one_frame(18.0f) + game_units_one_frame(18) - game_units(5));
     // disconnecting: the virtual GamePad stays where it is (the game would see a jump)
     float before = g.yaw;
     controller_gone(43);
