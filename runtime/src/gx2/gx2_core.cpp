@@ -311,30 +311,7 @@ static std::mutex g_q_mutex;
 static std::condition_variable g_q_cv;
 static std::vector<uint32> g_q_pending, g_q_work;
 static bool g_q_waiting = false;
-static std::atomic<uint64_t> g_q_seq{0};  // commands queued so far (enqueue; read without the lock)
 
-// render thread, caught up: wait up to maxUs for the game's next command without sleeping. The game
-// queues them microseconds apart, and going to sleep on g_q_cv each time cost both threads a kernel
-// call (and the idle timing two clock reads). arm64: WFE (the core idles until g_q_seq's cache line is
-// written); elsewhere a short spin
-static void wait_for_command(uint64_t seen, uint32_t maxUs) {
-#if defined(__aarch64__)
-    uint64_t f, t0, t;
-    asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
-    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(t0));
-    const uint64_t limit = f / 1000000 * maxUs;
-    while (g_q_seq.load(std::memory_order_acquire) == seen) {
-        uint64_t x;
-        asm volatile("ldaxr %0, [%1]" : "=r"(x) : "r"(&g_q_seq) : "memory");
-        if (x == seen) asm volatile("wfe" ::: "memory");
-        else asm volatile("clrex" ::: "memory");
-        asm volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
-        if (t - t0 >= limit) break;
-    }
-#else
-    for (uint32_t i = 0; i < maxUs * 64 && g_q_seq.load(std::memory_order_acquire) == seen; i++) {}
-#endif
-}
 static uint64_t g_fence_issued = 0;
 // fences the render thread has reached: the game thread waits on it with atomic wait (a __ulock futex); a
 // condition variable's broadcast cost the render thread ~0.3 ms in the kernel at every DrawDone (8% of it)
@@ -359,14 +336,7 @@ static void render_thread_main() {
     host::set_thread_name("GX2 render");
     host::boost_thread_priority();
     perf_hint::add_current_thread();
-    uint64_t seen = 0;  // g_q_seq at the last take
     for (;;) {
-        if (g_q_seq.load(std::memory_order_acquire) == seen) {
-            // counted as idle (the thread's CPU time includes it: the report's render thread CPU does too)
-            const uint64_t idle = rprof::enabled() ? rprof::now_ns() : 0;
-            wait_for_command(seen, 30);
-            if (idle) rprof::add_idle(rprof::now_ns() - idle);
-        }
         {
             std::unique_lock<std::mutex> lk(g_q_mutex);
             g_q_waiting = true;
@@ -383,7 +353,6 @@ static void render_thread_main() {
             }
             g_q_waiting = false;
             g_q_work.swap(g_q_pending);
-            seen = g_q_seq.load(std::memory_order_relaxed);
         }
         {
             std::lock_guard<std::recursive_mutex> lk(g_exec_mutex);
@@ -401,7 +370,6 @@ static void enqueue(Op op, const uint32* payload, uint32 n) {
         std::lock_guard<std::mutex> lk(g_q_mutex);
         g_q_pending.push_back(op | (n << 8));
         g_q_pending.insert(g_q_pending.end(), payload, payload + n);
-        g_q_seq.fetch_add(1, std::memory_order_release);
         wake = g_q_waiting;
     }
     if (wake) g_q_cv.notify_one();  // after unlocking: the woken render thread would block on the mutex at once
