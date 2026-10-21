@@ -664,8 +664,9 @@ void tab_graphics() {
                     ImGui::EndCombo();
                 }
             }
-            help("From Cemu's community graphic pack of the same name (Clarity: colour and contrast presets).\n"
-                 "Changes apply after restarting the game.");
+            help("From Cemu's community graphic pack of the same name (Enhancements: Clarity colour presets;\n"
+                 "Graphics: anti-aliasing, shadow resolution, and shader fixes that follow the internal resolution).\n"
+                 "Changes, and a new internal resolution for those shader fixes, apply after restarting the game.");
         }
         if (graphic_packs::restart_needed()) note("Restart the game to apply the changed enhancements.");
     }

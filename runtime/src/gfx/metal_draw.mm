@@ -961,10 +961,27 @@ static uint64_t pack_ps_aux(const LatteDecompilerShader& d, const uint32_t* regs
     if (withDepth && LatteMRT::GetActiveDepthBufferMask(lcr)) h = std::rotl(h, 5) + 13;
     return h;
 }
+// Cemu's Metal vertex shader base hash: the Vulkan one plus the vertex strides when vertices are fetched
+// in the shader (or rects), +51 when rasterizing, +349 when fetched in the shader (LatteSHRC_UpdateVSBaseHash)
+static uint64_t pack_vs_base(uint64_t vulkanBase, const uint32_t* regs, const LatteFetchShader* fs) {
+    const bool rect = (regs[Latte::REGADDR::VGT_PRIMITIVE_TYPE] & 0x3f) == 0x11;
+    uint64_t h = vulkanBase;
+    if (rect || fs->mtlFetchVertexManually)
+        for (auto& g : fs->bufferGroups) {
+            h += (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
+            h = std::rotl(h, 7);
+        }
+    if (!rect) {
+        if (((const LatteContextRegister*)regs)->IsRasterizationEnabled()) h += 51;
+        if (fs->mtlFetchVertexManually) h += 349;
+    }
+    return h;
+}
 // the blocks Cemu marks "predetermined by Cemu. Do not touch": a pack shader must declare the same ones
 static std::string pack_interface(const std::string& src) {
     std::string out;
-    for (const char* name : {"struct SupportBuffer {", "struct FragmentIn {", "struct FragmentOut {"}) {
+    for (const char* name : {"struct SupportBuffer {", "struct FragmentIn {", "struct FragmentOut {", "struct VertexIn {",
+                             "struct VertexOut {"}) {
         size_t a = src.find(name);
         size_t b = a == std::string::npos ? a : src.find("};", a);
         if (b == std::string::npos) continue;
@@ -974,23 +991,36 @@ static std::string pack_interface(const std::string& src) {
     }
     return out;
 }
-static void apply_graphic_pack(Shader* s, const uint32_t* regs, uint32_t addr, uint32_t size) {
-    if (!graphic_packs::has_shaders() || !s->dec || !s->dec->strBuf_shaderSource) return;
-    const uint64_t base = cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr);
-    uint64_t aux = pack_ps_aux(*s->dec, regs);
-    if (getenv("WWHD_GPACK_LOG")) LOG("[gpack] ps %016llx_%016llx", (unsigned long long)base, (unsigned long long)aux);
-    std::string src = graphic_packs::shader_source(base, aux, false);
-    if (src.empty()) src = graphic_packs::shader_source(base, aux = pack_ps_aux(*s->dec, regs, false), false);
+static void apply_graphic_pack(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint32_t addr, uint32_t size) {
+    if (!graphic_packs::has_shaders() || !s->dec || !s->dec->strBuf_shaderSource || (vertex && !fs)) return;
+    const char* stage = vertex ? "vs" : "ps";
+    uint64_t base = cemu_pack_hash::base(mem::ptr(addr), size, regs, vertex, fs), aux;
+    std::string src;
+    if (vertex) {
+        // the Metal hash; the Graphics pack's vertex shaders were named with an older Cemu: also the Vulkan one
+        const uint64_t vulkanBase = base;
+        aux = cemu_pack_hash::auxiliary(*s->dec, regs, true);
+        src = graphic_packs::shader_source(base = pack_vs_base(vulkanBase, regs, fs), aux, true);
+        if (getenv("WWHD_GPACK_LOG"))
+            LOG("[gpack] vs %016llx_%016llx (vulkan %016llx)", (unsigned long long)base, (unsigned long long)aux,
+                (unsigned long long)vulkanBase);
+        if (src.empty()) src = graphic_packs::shader_source(base = vulkanBase, aux, true);
+    } else {
+        aux = pack_ps_aux(*s->dec, regs);
+        if (getenv("WWHD_GPACK_LOG")) LOG("[gpack] ps %016llx_%016llx", (unsigned long long)base, (unsigned long long)aux);
+        src = graphic_packs::shader_source(base, aux, false);
+        if (src.empty()) src = graphic_packs::shader_source(base, aux = pack_ps_aux(*s->dec, regs, false), false);
+    }
     if (src.empty()) return;
     const std::string ours = s->dec->strBuf_shaderSource->c_str();
     if (pack_interface(src) != pack_interface(ours)) {
-        LOG("[gpack] ps %016llx_%016llx: interface differs from this port's translation, not replaced\n  pack: %s\n  ours: %s",
-            (unsigned long long)base, (unsigned long long)aux, pack_interface(src).c_str(), pack_interface(ours).c_str());
+        LOG("[gpack] %s %016llx_%016llx: interface differs from this port's translation, not replaced\n  pack: %s\n  ours: %s",
+            stage, (unsigned long long)base, (unsigned long long)aux, pack_interface(src).c_str(), pack_interface(ours).c_str());
         return;
     }
     s->dec->strBuf_shaderSource->reset();
     s->dec->strBuf_shaderSource->add(std::string_view(src));
-    LOG("[gpack] ps %016llx_%016llx replaced (shader %08X)", (unsigned long long)base, (unsigned long long)aux, addr);
+    LOG("[gpack] %s %016llx_%016llx replaced (shader %08X)", stage, (unsigned long long)base, (unsigned long long)aux, addr);
 }
 
 // translation and compile start of a new shader: on the render thread, or on a worker (async: regs is a
@@ -1023,7 +1053,7 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
         return;
     }
     s->dec = FinishDecompiledShader(out);
-    if (!vertex) apply_graphic_pack(s, regs, addr, size);
+    apply_graphic_pack(s, regs, vertex, fs, addr, size);
     {
         uint32_t m = 0;
         for (int u = 0; u < s->dec->textureUnitListCount; u++) m |= 1u << s->dec->textureUnitList[u];

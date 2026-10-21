@@ -10,3 +10,10 @@ Only the Metal (`_msl`) shaders and `rules.txt` are kept. They are compiled into
 
 Changed here: `Enhancements/cb0e6e8cbec4502a_..._ps_msl.txt`, depth of field off sampled with a float4
 coordinate and did not compile; it samples the centre the depth-of-field path uses.
+
+- `Graphics/`: anti-aliasing, shadow resolution and the shaders that follow the internal resolution
+  (`$width`/`$height` come from Settings > Graphics > Internal resolution; its Resolution, Aspect Ratio,
+  HUD and Shadow Draw Distance options are not offered, and its `patch_*.asm` code patches are left out).
+  Made by Kiri, Skalfate, rajkosto and NAVras. Changed here: a "Match internal resolution" Shadows preset
+  (the default, as this port scaled shadow maps before), and its copy of the Enhancements depth-of-field
+  shader is left out (Enhancements has it).

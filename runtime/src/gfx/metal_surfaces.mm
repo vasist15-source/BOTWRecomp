@@ -1,6 +1,7 @@
 #include <set>
 #include <chrono>
 #include "mods/cemu_pack.h"
+#include "mods/graphic_packs.h"
 #include <tuple>
 #include <atomic>
 #include <cmath>
@@ -133,12 +134,14 @@ static float target_scale_rules(const Surface* s) {
         return true;
     }();
     (void)shadow_logged;
-    if (s->isDepth && s->slices > 1) return shadow ? shadow : res_scale();
+    // the Graphics pack's Shadows option ($shadowRes; its default follows the internal resolution)
+    const float packShadow = (float)graphic_packs::value("Graphics", "$shadowRes", res_scale());
+    if (s->isDepth && s->slices > 1) return shadow ? shadow : packShadow;
     // which targets follow the internal resolution: the sizes and formats of the BotW "Graphics" pack's
     // TextureRedefine rules (what Cemu scales; everything else keeps the console's size). Scaling every
     // target broke data targets the game reads by position (white water at 2x).
     // WWHD_SCALE_ALL_TARGETS=1: every target as before.
-    struct Rule { uint16_t w, h; std::initializer_list<uint16_t> formats; bool notLinearAligned; };
+    struct Rule { uint16_t w, h; std::initializer_list<uint16_t> formats; bool notLinearAligned, shadow = false; };
     static const Rule kRules[] = {
         {1280, 720, {0x001,0x005,0x007,0x019,0x01a,0x41a,0x80e,0x806,0x816,0x820}, true},
         {864, 480, {0x019}, false},
@@ -186,11 +189,11 @@ static float target_scale_rules(const Surface* s) {
         {500, 94, {0x01a}, false},
         {480, 32, {0x01a}, false},
         {464, 28, {0x01a}, false},
-        {768, 720, {0x005}, false},
-        {720, 720, {0x005}, false},
-        {384, 368, {0x005}, false},
-        {384, 360, {0x005}, false},
-        {360, 360, {0x005}, false},
+        {768, 720, {0x005}, false, true},
+        {720, 720, {0x005}, false, true},
+        {384, 368, {0x005}, false, true},
+        {384, 360, {0x005}, false, true},
+        {360, 360, {0x005}, false, true},
     };
     static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
     if (all) return res_scale();
@@ -198,7 +201,7 @@ static float target_scale_rules(const Surface* s) {
         if (r.w != s->width || r.h != s->height) continue;
         if (r.notLinearAligned && s->tileMode == 1) continue;  // tileModesExcluded = 0x001 (video playback)
         for (uint16_t f : r.formats)
-            if (f == s->format) return res_scale();
+            if (f == s->format) return r.shadow ? (shadow ? shadow : packShadow) : res_scale();
     }
     return 1.0f;
 }

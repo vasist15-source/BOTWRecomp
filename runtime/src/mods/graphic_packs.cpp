@@ -50,8 +50,21 @@ struct Loaded {
     std::vector<ShaderFile> shaders;
 };
 
-// categories the port has its own setting for (Settings > Graphics: 16x anisotropic filtering)
-bool hidden(const std::string& category) { return category == "Anisotropic Filtering"; }
+// options the port has its own setting for, or cannot apply: anisotropic filtering and internal
+// resolution (Settings > Graphics), aspect ratio and HUD modes (code patches), shadow draw distance
+// (no shader of the pack reads it)
+bool hidden(const std::string& category) {
+    for (const char* c : {"Anisotropic Filtering", "Resolution", "Aspect Ratio", "Ultrawide HUD Mode", "Square HUD Mode",
+                          "Shadow Draw Distance"})
+        if (category == c) return true;
+    return false;
+}
+
+// the internal resolution the pack shaders are made for: $width x $height (of $gameWidth x $gameHeight)
+float res_scale_now() {
+    float s = hostui::res_scale();
+    return s > 0 ? s : 1.0f;
+}
 
 // "$name" or "$name:int" = value
 void put_var(std::map<std::string, Var>& vars, const std::string& key, const std::string& value) {
@@ -146,6 +159,8 @@ std::string setting_key(const Pack& pack, const Category& category) { return "gr
 struct Active {
     std::map<std::string, std::string> choices;  // setting key -> preset
     std::map<std::tuple<uint64_t, uint64_t, bool>, std::string> shaders;
+    std::map<std::string, std::map<std::string, double>> values;  // pack -> resolved variables
+    float resScale = 1;
 };
 
 std::string format(double v, bool isInt) {
@@ -175,6 +190,7 @@ std::string expand(const char* text, const std::map<std::string, std::pair<doubl
 const Active& active() {
     static Active a = [] {
         Active a;
+        a.resScale = res_scale_now();
         for (auto& p : loaded()) {
             std::map<std::string, Var> vars = p.defaults;
             for (auto& cat : p.info.categories) {
@@ -183,6 +199,11 @@ const Active& active() {
                 for (auto& pr : p.presets)
                     if (pr.category == cat.name && pr.name == choice)
                         for (auto& [k, v] : pr.vars) vars[k] = v;
+            }
+            // the resolution is the port's own setting
+            if (vars.count("$width") && vars.count("$gameWidth") && vars.count("$height") && vars.count("$gameHeight")) {
+                vars["$width"].expr = "(" + vars["$gameWidth"].expr + ") * " + std::to_string(a.resScale);
+                vars["$height"].expr = "(" + vars["$gameHeight"].expr + ") * " + std::to_string(a.resScale);
             }
             // values may refer to each other: resolve in passes
             std::map<std::string, double> resolved;
@@ -200,6 +221,7 @@ const Active& active() {
             for (auto& [k, v] : vars)
                 if (!resolved.count(k)) LOG("[gpack] %s: variable %s = %s not resolved", p.info.id.c_str(), k.c_str(), v.expr.c_str());
             for (auto& s : p.shaders) a.shaders[{s.base, s.aux, s.vertex}] = expand(s.text, vals);
+            a.values[p.info.id] = resolved;
             std::string summary;
             for (auto& cat : p.info.categories) summary += " | " + cat.name + ": " + a.choices[setting_key(p.info, cat)];
             LOG("[gpack] %s: %zu shaders%s", p.info.id.c_str(), p.shaders.size(), summary.c_str());
@@ -233,6 +255,9 @@ void select(const Pack& pack, const Category& category, const std::string& prese
 }
 
 bool restart_needed() {
+    if (std::fabs(res_scale_now() - active().resScale) > 0.01f)
+        for (auto& [pack, vals] : active().values)
+            if (vals.count("$width")) return true;
     for (auto& p : packs())
         for (auto& c : p.categories) {
             auto it = active().choices.find(setting_key(p, c));
@@ -242,6 +267,13 @@ bool restart_needed() {
 }
 
 bool has_shaders() { return !active().shaders.empty(); }
+
+double value(const char* pack, const char* name, double fallback) {
+    auto p = active().values.find(pack);
+    if (p == active().values.end()) return fallback;
+    auto v = p->second.find(name);
+    return v == p->second.end() ? fallback : v->second;
+}
 
 bool has_base(uint64_t base, bool vertex) {
     for (auto& [key, src] : active().shaders)

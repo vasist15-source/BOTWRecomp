@@ -22,9 +22,11 @@ struct Pack {
 const std::vector<Pack>& packs();
 std::string selected(const Pack& pack, const Category& category);  // saved choice, or the default
 void select(const Pack& pack, const Category& category, const std::string& preset);
-bool restart_needed();  // a choice differs from the ones this session's shaders use
+bool restart_needed();  // a choice (or the internal resolution) differs from the one this session's shaders use
 
 bool has_shaders();
+// a pack variable as this session resolved it ("$shadowRes" of "Graphics"), or fallback
+double value(const char* pack, const char* name, double fallback);
 // a pack replaces some variant of this program (Cemu base hash): translate it with Cemu's legacy
 // pixel uniform layout (fragCoordScale always present), which the pack shaders were written against
 bool has_base(uint64_t base, bool vertex);
