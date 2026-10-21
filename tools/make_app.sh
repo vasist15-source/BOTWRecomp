@@ -42,6 +42,9 @@ cat > "$TMP/c/Info.plist" <<PL
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>GCSupportsControllerUserInteraction</key><true/>
+<key>LSApplicationCategoryType</key><string>public.app-category.action-games</string>
+<key>LSSupportsGameMode</key><true/>
+<key>GCSupportsGameMode</key><true/>
 </dict></plist>
 PL
 rm -rf "$APP"

@@ -829,6 +829,7 @@ class Installer:
                     "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
                     "GCSupportsControllerUserInteraction": True,
                     "LSApplicationCategoryType": "public.app-category.action-games",
+                    "LSSupportsGameMode": True, "GCSupportsGameMode": True,  # Game Mode in full screen (macOS 14+)
                     "BotWInstalledFrom": ROOT,
                 }, f)
             self.progress(0.5, "Signing")
