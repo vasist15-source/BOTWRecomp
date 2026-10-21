@@ -152,6 +152,8 @@ list(APPEND RUNTIME_SOURCES runtime/src/platform/touch_pad.cpp)  # Android on-sc
 if(APPLE)
   list(APPEND RUNTIME_SOURCES runtime/src/platform/https.mm)
   set_source_files_properties(runtime/src/platform/https.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  list(APPEND RUNTIME_SOURCES runtime/src/platform/app_launch.mm)  # the app bundle's start (Game Mode)
+  set_source_files_properties(runtime/src/platform/app_launch.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif(ANDROID)
   list(APPEND RUNTIME_SOURCES runtime/src/platform/https_android.cpp)
 elseif(WIN32)

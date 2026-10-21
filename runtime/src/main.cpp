@@ -18,6 +18,7 @@
 #include "mods/guest_mods.h"
 #include "mods/code_mods.h"
 #include "platform/host.h"
+#include "platform/app_launch.h"
 #ifdef _WIN32
 #include <timeapi.h>
 #endif
@@ -350,6 +351,9 @@ static void start_log_file(bool error = false) {
 extern "C" void synthetic_game_frame(Cpu*, PpcFunc);
 
 int main(int argc, char** argv) {
+#ifdef __APPLE__
+    app_bundle_launch(argc, argv);  // started from Breath of the Wild.app: the game's folders and log
+#endif
     mods::code::startup(argc, argv);
     apply_portable_mode();
     default_vulkan_cpu_paths();

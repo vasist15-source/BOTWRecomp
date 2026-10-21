@@ -1,7 +1,8 @@
 #!/bin/sh
 # usage: tools/make_app.sh [DEST]  -- bundle build/rt/wwhd as "Breath of the Wild.app" (default /Applications)
 # The app uses the same save (build/save), shader cache and dump as tools/run.sh; its log goes to
-# ~/Library/Logs/BotW/wwhd.log. The icon comes from the user's own dump (meta/iconTex.tga).
+# ~/Library/Logs/BotW/wwhd.log. wwhd is the bundle executable and finds them in Info.plist's BotWLaunch
+# (runtime/src/platform/app_launch.mm). The icon comes from the user's own dump (meta/iconTex.tga).
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-/Applications}"
@@ -10,14 +11,6 @@ DUMP="${BOTW_DUMP:-$HOME/Hermes/Wii U ROM}/The Legend of Zelda Breath of the Wil
 TMP="$(mktemp -d)"
 mkdir -p "$TMP/c/MacOS" "$TMP/c/Resources"
 cp "$ROOT/build/rt/wwhd" "$TMP/c/MacOS/wwhd"
-cat > "$TMP/c/MacOS/launch" <<SH
-#!/bin/sh
-mkdir -p "\$HOME/Library/Logs/BotW" "$ROOT/build/save"
-cd "$ROOT"
-exec "\$(dirname "\$0")/wwhd" --game "$DUMP [Update] [0005000e101c9400]" --base "$DUMP [Game] [00050000101c9400]" \\
-    --aoc "$DUMP [DLC] [0005000c101c9400]" --save "$ROOT/build/save" > "\$HOME/Library/Logs/BotW/wwhd.log" 2>&1
-SH
-chmod +x "$TMP/c/MacOS/launch"
 ICON="$DUMP [Game] [00050000101c9400]/meta/iconTex.tga"
 if [ -f "$ICON" ]; then
     mkdir -p "$TMP/i.iconset"
@@ -35,7 +28,7 @@ cat > "$TMP/c/Info.plist" <<PL
 <key>CFBundleName</key><string>Breath of the Wild</string>
 <key>CFBundleDisplayName</key><string>Breath of the Wild</string>
 <key>CFBundleIdentifier</key><string>local.botw-mac</string>
-<key>CFBundleExecutable</key><string>launch</string>
+<key>CFBundleExecutable</key><string>wwhd</string>
 <key>CFBundleIconFile</key><string>icon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>$(cd "$ROOT" && git rev-parse --short HEAD)</string>
@@ -45,6 +38,13 @@ cat > "$TMP/c/Info.plist" <<PL
 <key>LSApplicationCategoryType</key><string>public.app-category.action-games</string>
 <key>LSSupportsGameMode</key><true/>
 <key>GCSupportsGameMode</key><true/>
+<key>BotWLaunch</key><dict>
+<key>game</key><string>$DUMP [Update] [0005000e101c9400]</string>
+<key>base</key><string>$DUMP [Game] [00050000101c9400]</string>
+<key>aoc</key><string>$DUMP [DLC] [0005000c101c9400]</string>
+<key>save</key><string>$ROOT/build/save</string>
+<key>dir</key><string>$ROOT</string>
+</dict>
 </dict></plist>
 PL
 rm -rf "$APP"

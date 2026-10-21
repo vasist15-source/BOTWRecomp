@@ -14,7 +14,9 @@ library only, Python 3.9 (the Command Line Tools' /usr/bin/python3).
 
 Nothing from the game leaves the player's Mac: the generated code and the build live in
 ~/Library/Caches/BotW/installer, the app is written where the player chose, and the app reads the
-game, update, DLC and save from the paths in ~/Library/Application Support/BotW/install.plist.
+game, update, DLC and save from the paths in ~/Library/Application Support/BotW/install.plist
+(wwhd itself, runtime/src/platform/app_launch.mm: a launcher script would keep macOS from seeing the
+game's window, and so from starting Game Mode).
 """
 import argparse
 import hashlib
@@ -816,15 +818,12 @@ class Installer:
             os.makedirs(os.path.join(c, "MacOS"))
             os.makedirs(os.path.join(c, "Resources"))
             shutil.copy2(exe, os.path.join(c, "MacOS", "wwhd"))
-            with open(os.path.join(c, "MacOS", "launch"), "w") as f:
-                f.write(LAUNCHER)
-            os.chmod(os.path.join(c, "MacOS", "launch"), 0o755)
             if make_icon(os.path.join(paths["base"], "meta", "iconTex.tga"), os.path.join(c, "Resources", "icon.icns"), tmp):
                 self.log("Icon made from your dump's meta/iconTex.tga")
             with open(os.path.join(c, "Info.plist"), "wb") as f:
                 plistlib.dump({
                     "CFBundleName": "Breath of the Wild", "CFBundleDisplayName": "Breath of the Wild",
-                    "CFBundleIdentifier": BUNDLE_ID, "CFBundleExecutable": "launch", "CFBundleIconFile": "icon",
+                    "CFBundleIdentifier": BUNDLE_ID, "CFBundleExecutable": "wwhd", "CFBundleIconFile": "icon",
                     "CFBundlePackageType": "APPL", "CFBundleVersion": version(), "CFBundleShortVersionString": "1.5.0",
                     "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
                     "GCSupportsControllerUserInteraction": True,
@@ -916,30 +915,6 @@ def make_icon(tga, icns, tmp):
             subprocess.run(["/usr/bin/sips", "-z", str(s * scale), str(s * scale), png, "--out",
                             os.path.join(iconset, "icon_%dx%d%s.png" % (s, s, suffix))], capture_output=True)
     return subprocess.run(["/usr/bin/iconutil", "-c", "icns", iconset, "-o", icns], capture_output=True).returncode == 0
-
-
-# The app's entry point: reads the paths the installer wrote, then starts the game. Runs from the
-# log folder, so crash logs (captures/) and shader dumps land there and not in the bundle.
-LAUNCHER = r'''#!/bin/sh
-CFG="$HOME/Library/Application Support/BotW/install.plist"
-LOGS="$HOME/Library/Logs/BotW"
-get() { /usr/bin/plutil -extract "$1" raw -o - "$CFG" 2>/dev/null; }
-fail() {
-    /usr/bin/osascript -e "display alert \"Breath of the Wild can't start\" message \"$1\" as critical" >/dev/null 2>&1
-    exit 1
-}
-[ -f "$CFG" ] || fail "The game files are not set up. Open the Breath of the Wild installer and build the game again."
-BASE="$(get base)"; UPDATE="$(get update)"; DLC="$(get dlc)"; SAVE="$(get save)"
-[ -d "$BASE/content" ] || fail "The base game is not at $BASE anymore. Connect the drive it is on, or run the installer again and choose its new place."
-[ -d "$UPDATE/code" ] || fail "The update is not at $UPDATE anymore. Connect the drive it is on, or run the installer again and choose its new place."
-[ -n "$SAVE" ] || SAVE="$HOME/Library/Application Support/BotW/save"
-mkdir -p "$LOGS" "$SAVE"
-cd "$LOGS" || exit 1
-set -- --game "$UPDATE" --base "$BASE" --save "$SAVE" "$@"
-[ -n "$DLC" ] && [ -d "$DLC/content" ] && set -- "$@" --aoc "$DLC"
-[ -f "$LOGS/wwhd.log" ] && mv -f "$LOGS/wwhd.log" "$LOGS/wwhd.previous.log"
-exec "$(dirname "$0")/wwhd" "$@" > "$LOGS/wwhd.log" 2>&1
-'''
 
 
 # ---------------------------------------------------------------- the translator, run as a child process
