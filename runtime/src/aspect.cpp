@@ -487,7 +487,9 @@ extern "C" void site_02877150(Cpu*) {
     if (!aspect::original()) gx2::emit(gx2::OP_LAYOUT_CONTENT, {0});
 }
 namespace aspect {
-thread_local bool g_content_clip = false; // consumed only by the render command thread
+// set and read by whichever thread executes GX2 commands (the render thread; inline without it, under
+// the execution lock): a plain variable, no TLS lookup in the draw's scissor path
+static bool g_content_clip = false;
 void set_content_clip(bool clip) { g_content_clip = clip; }
 bool content_clip() { return g_content_clip; }
 }
