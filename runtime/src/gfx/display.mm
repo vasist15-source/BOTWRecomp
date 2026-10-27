@@ -718,9 +718,15 @@ void show_startup_notice(const std::string& title, const std::string& text) {
 // ---------------------------------------------------------------- composition
 static bool is_srgb(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm_sRGB || f == MTLPixelFormatRGBA8Unorm_sRGB; }
 
+// the picture's size at the full internal resolution (dynamic resolution renders it smaller; the layout stays)
+static float nominal_w(const Screen& s) { return s.tex ? float(s.tex.width) / s.dyn : 0.0f; }
+static float nominal_h(const Screen& s) { return s.tex ? float(s.tex.height) / s.dyn : 0.0f; }
+
 // draw `tex` into the target rectangle (pixels); src_linear: the image holds linear values (sRGB scan buffer)
+// dyn: the picture's dynamic resolution factor (Screen::dyn; below 1: always scaled filtered: integer
+// scaling becomes smooth, sharp scaling takes its sharpness from the picture's full size)
 static void draw_image(id<MTLRenderCommandEncoder> e, MTLPixelFormat fmt, float dw, float dh, id<MTLTexture> tex,
-                       bool src_linear, Box b, float alpha) {
+                       bool src_linear, Box b, float alpha, float dyn = 1.0f) {
     if (!tex || b.w <= 0 || b.h <= 0) return;
     float rect[4] = {b.x / dw, b.y / dh, b.w / dw, b.h / dh};
     bool blend = alpha < 0.999f;
@@ -732,7 +738,12 @@ static void draw_image(id<MTLRenderCommandEncoder> e, MTLPixelFormat fmt, float 
     p.conv = src_linear == dst_linear ? 0 : dst_linear ? 1 : 2;
     float scale = std::min(b.w / tex.width, b.h / tex.height);  // target pixels per source texel
     int filter = g_filter;
-    p.sharp = filter == kSmooth || scale <= 1.0f ? 1.0f : filter == kSharp ? scale : 1e4f;
+    float sharpScale = scale;
+    if (dyn < 1.0f) {
+        if (filter == kInteger) filter = kSmooth;
+        else if (filter == kSharp) sharpScale = std::min(b.w / (tex.width / dyn), b.h / (tex.height / dyn));
+    }
+    p.sharp = filter == kSmooth || sharpScale <= 1.0f ? 1.0f : filter == kSharp ? sharpScale : 1e4f;
     p.foot = scale < 1.0f ? 1.0f / scale : 1.0f;
     [e setVertexBytes:rect length:sizeof rect atIndex:0];
     [e setFragmentTexture:tex atIndex:0];
@@ -764,12 +775,12 @@ static void compose_tv(id<MTLTexture> target, const Layout& L) {
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     float dw = target.width, dh = target.height;
     MTLPixelFormat fmt = target.pixelFormat;
-    draw_image(e, fmt, dw, dh, R.tv.tex, R.tv.srgb, L.tv, 1.0f);
+    draw_image(e, fmt, dw, dh, R.tv.tex, R.tv.srgb, L.tv, 1.0f, R.tv.dyn);
     if (L.pip_on && R.drc.tex) {
         float op = L.drc_only ? 1.0f : g_pip_opacity.load(), bw = std::max(1.0f, roundf(L.pip.w / 200.0f));
         float frame[4] = {0, 0, 0, 0.6f * op};
         draw_solid(e, fmt, dw, dh, {L.pip.x - bw, L.pip.y - bw, L.pip.w + 2 * bw, L.pip.h + 2 * bw}, frame);
-        draw_image(e, fmt, dw, dh, R.drc.tex, R.drc.srgb, L.pip, op);
+        draw_image(e, fmt, dw, dh, R.drc.tex, R.drc.srgb, L.pip, op, R.drc.dyn);
         if(auto* draw=overlay::guesthud::gamepad_region(dw,dh,L.pip.x,L.pip.y,L.pip.w,L.pip.h,op)) {
             if(is_srgb(fmt))overlay::linearize_colors(draw,true);
             ImGui_ImplMetal_NewFrame(rp);
@@ -793,8 +804,8 @@ static void compose_drc(id<MTLTexture> target) {
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     time_render_pass(rp, __FILE_NAME__, __LINE__);
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    Layout L = layout(target.width, target.height, R.drc.tex.width, R.drc.tex.height, 0, 0, false);
-    draw_image(e, target.pixelFormat, target.width, target.height, R.drc.tex, R.drc.srgb, L.tv, 1.0f);
+    Layout L = layout(target.width, target.height, nominal_w(R.drc), nominal_h(R.drc), 0, 0, false);
+    draw_image(e, target.pixelFormat, target.width, target.height, R.drc.tex, R.drc.srgb, L.tv, 1.0f, R.drc.dyn);
     if (auto* draw = overlay::guesthud::gamepad_region(target.width,target.height,L.tv.x,L.tv.y,L.tv.w,L.tv.h,1)) {
         if (is_srgb(target.pixelFormat)) overlay::linearize_colors(draw, true);
         ImGui_ImplMetal_NewFrame(rp);
@@ -948,7 +959,7 @@ static void screenshot_screen(Screen& scr, const std::string& path, bool tv) {
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     time_render_pass(rp, __FILE_NAME__, __LINE__);
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    draw_image(e, t.pixelFormat, w, h, scr.tex, scr.srgb, Box{0, 0, (float)w, (float)h}, 1.0f);
+    draw_image(e, t.pixelFormat, w, h, scr.tex, scr.srgb, Box{0, 0, (float)w, (float)h}, 1.0f, scr.dyn);
     [e endEncoding];
     id<MTLBuffer> buf = [R.device newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
@@ -983,7 +994,7 @@ static void take_screenshot(const PresentPlan& P) {
 void present_screens() {
     sample_screens();
     CGSize ls = R.tv.layer ? R.tv.layer.drawableSize : CGSizeMake(0, 0);
-    PresentPlan P = display_plan(R.tv.tex != nil, R.tv.tex.width, R.tv.tex.height, R.drc.tex != nil, R.drc.tex.width, R.drc.tex.height,
+    PresentPlan P = display_plan(R.tv.tex != nil, nominal_w(R.tv), nominal_h(R.tv), R.drc.tex != nil, nominal_w(R.drc), nominal_h(R.drc),
                                  ls.width, ls.height, R.frame);
     Layout L;
     L.tv = P.tv;
@@ -1020,8 +1031,7 @@ void present_screens() {
     if (P.sim) {
         present_to_layer(R.tv, ^(id<MTLTexture> t) {
             CGSize ds = R.tv.layer.drawableSize;
-            compose_tv(t, layout(ds.width, ds.height, R.tv.tex.width, R.tv.tex.height, R.drc.tex ? R.drc.tex.width : 0,
-                                 R.drc.tex ? R.drc.tex.height : 0, pip, drc_only));
+            compose_tv(t, layout(ds.width, ds.height, nominal_w(R.tv), nominal_h(R.tv), nominal_w(R.drc), nominal_h(R.drc), pip, drc_only));
         });
     } else {
         present_to_layer(R.tv, ^(id<MTLTexture> t) { compose_tv(t, L); });
@@ -1043,7 +1053,7 @@ void present_screens() {
             p.insert(dot == std::string::npos ? p.size() : dot, "_drc");
             dump_texture(d, p.c_str(), true, false);
         }
-        display_log_present_dump(path, P, R.tv.tex.width, R.tv.tex.height);
+        display_log_present_dump(path, P, nominal_w(R.tv), nominal_h(R.tv));
     }
 }
 

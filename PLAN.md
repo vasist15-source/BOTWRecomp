@@ -65,6 +65,23 @@ GX2SetGPUFence, GX2SetEventCallback, nn_aoc (DLC list), nn_nfp (amiibo), OSGetTh
   renders**. About 290 draws/frame. Missing: music/SFX (only voice plays), plus the base-instance /
   query / depth-only GX2 calls above.
 
+### 2026-10-27: dynamic resolution (Metal)
+Ported from ZeldaWWHDRecomp d454eda + 8c8c383 (`runtime/src/dynres*`, test `dynres_test`). Settings >
+Graphics > Dynamic resolution: Off (default), Down to 75%, Down to 50%. Every half second the busy share
+(the per-frame GPU busy time metal_main.mm already measures) and the frame rate against the game's 30/60
+target decide: GPU-bound (missing the rate, busy > 90 %) steps one level down (1, 7/8, 3/4, 5/8, 1/2),
+room at the next level (< 80 % predicted) for two windows and the hold (2 s, doubling to 32 s after an
+undone step) steps up. BotW differences from upstream: only the targets our rules scale with the internal
+resolution take the factor (plus depth buffers matched to them, `Surface::dynMatched`, so colour and
+depth keep one size), never below 1x (at 1x the setting does nothing; at 1.5x the floor is 1.125x);
+shadow cascades, linear/readback targets and unscaled data targets keep their size. A change rescales
+every surface at once (as an internal resolution change does); each keeps its last two textures, so a
+step back reuses them. Pack shaders keep `$width/$height` of the full internal resolution (their
+texel-step offsets keep the same screen-space size). The layout uses the full-resolution size; a lowered
+picture is always presented filtered. Logs: `[dynres]` per change, `[gfx]` report line every 300 frames;
+`WWHD_DYNRES_MIN`, `WWHD_DYNRES_TEST_AT=f:factor`, `WWHD_DYNRES_TEST_BUDGET=f:ms`, `WWHD_DYNRES_LOG_FRAMES=1`.
+**UNTESTED** in game: Hateno/Kakariko at 2x, frame time, CPU %, hitch at a change, memory.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
