@@ -135,3 +135,18 @@ cube-array index fine; next: compare that shader's MSL with Cemu's GLSL / render
 foliage looks flat/bright; first-visit shader hitches; GPU ~30 ms/frame at 2x.
 Tools: F12 capture (draws.log, full-screen pass targets, their inputs and PS MSL), WWHD_PASS_DUMP,
 WWHD_FUNC_COUNT, WWHD_ORDER, WWHD_MSG_DUMP, WWHD_PROFILE=1.
+
+## Recompiler code-quality passes (2026-10-27)
+
+Ported from upstream ZeldaWWHDRecomp (4b5e2a0, 79ae761, e658359, 4af135f, 2e6c6d1, f0e6fcb; our
+tools/recomp and ppc.h were still byte-identical to the fork point, so they applied cleanly):
+guest registers in C locals (leaflocal.py: all 203,444 functions, 125,346 leaf + 78,098 with calls),
+condition-register liveness (crlive.py: 703,049 CR writers), cheaper fcmp/mfcr, paired-single fast
+path, static GQR0/1 (BotW writes only GQR2-5; 210,375 of its 211,416 paired loads/stores use GQR0),
+and recomp.py writes only changed files (regenerating identical code rebuilds nothing). BotW has no
+mffs/mcrfs/mtfsf at all, so dropping fcmp's FPSCR FPCC update is safe. probe_recomp.py turns the
+hook files off, so no function needs the plain form; save states only snapshot threads parked in HLE
+calls, after which the non-leaf form reloads every register.
+Game code __text 210.3 MB -> 139.9 MB. Switches when generating: WWHD_RECOMP_PLAIN=1 (all off,
+output byte-identical to before), WWHD_RECOMP_CRLIVE/LEAF/NONLEAF/GQR=0 each; checking build:
+WWHD_RECOMP_LEAF_POISON=1 WWHD_RECOMP_CR_CHECK=1 (aborts with "CR liveness: bit N read at ...").

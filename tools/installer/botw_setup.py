@@ -63,7 +63,7 @@ GEN_WEIGHT = 4.0  # compile time of a generated code file relative to a runtime 
 FUNCS_PER_FILE = 30000  # as tools/probe_recomp.py; build/gen of the dev checkout uses the same
 
 # rough durations on an M-series Mac with 10 cores, for the time estimate before a step reports progress
-EST_RECOMP = 35.0
+EST_RECOMP = 140.0  # with the code-quality passes (crlive.py, leaflocal.py); about 27 s without
 EST_COMPILE_CPU = 2600.0  # CPU seconds: the generated code ~2200, the runtime ~300, then the link
 
 

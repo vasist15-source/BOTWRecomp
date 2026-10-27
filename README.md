@@ -72,7 +72,8 @@ tools/make_app.sh ~/Desktop   # bundles that build as Breath of the Wild.app
 ## How it works
 
 - `tools/recomp/`: the PowerPC → C translator of ZeldaWWHDRecomp, run unchanged on `U-King.rpx`
-  (203,444 functions, about 690 MB of C).
+  (203,444 functions, about 1 GB of C), with upstream's code-quality passes (guest registers in C
+  locals, condition-register liveness; `WWHD_RECOMP_PLAIN=1` turns them off).
 - `runtime/`: the ZeldaWWHDRecomp runtime with this port's changes: Cafe OS (threads, scheduler,
   file system, saves, DLC), GX2 → Metal, audio (AX), input, H.264, the settings overlay.
 - `tools/installer/`: `botw_setup.py` (checks, translation, build, bundle) and the SwiftUI installer
