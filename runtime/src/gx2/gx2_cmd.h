@@ -45,12 +45,25 @@ enum Op : uint32_t {
     OP_WAIT_MEM,        // GX2SetGPUFence: address, mask, compare op, value; waits until (mem & mask) op value
     OP_QUERY_BEGIN,     // GX2QueryBegin: query address
     OP_QUERY_END,       // GX2QueryEnd: query address, generation (the result is reported per generation)
+    // host-only, never recorded: the uniform blocks of the next display-list call as submitted
+    // (submitted_uniforms.h; payload: Snapshot* as two words, none: no snapshot from here on)
+    OP_SUBMITTED_UNIFORMS,
     OP_COUNT
 };
 
 // emit a command (records into the active display list, or executes now)
 void emit(Op op, const uint32_t* payload, uint32_t n);
 inline void emit(Op op, std::initializer_list<uint32_t> payload) { emit(op, payload.begin(), (uint32_t)payload.size()); }
+
+// a uniform block bound by GX2Set*UniformBlock (noted for the display list being recorded)
+void note_uniform_block(uint32_t addr, uint32_t size);
+// render thread: the bytes the block at addr held when the display list being executed was submitted
+// (submitted_uniforms.h); nullptr: read guest memory. id: changes with every submission (0: none).
+const uint8_t* submitted_uniform_block(uint32_t addr, uint32_t size);
+uint64_t submitted_uniforms_id();
+// false while WWHD_GUEST_COPIES turns the copies of guest data the CPU rewrites off (0, or the off
+// windows of the =2 A/B): submitted uniform blocks here, Metal's rewritten vertex/uniform copies
+bool guest_copies_on();
 
 // register writes
 void set_reg(uint32_t reg, uint32_t value);
