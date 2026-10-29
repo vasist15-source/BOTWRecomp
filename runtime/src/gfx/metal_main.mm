@@ -4,6 +4,8 @@
 #include <pthread.h>
 #include <mach/mach_time.h>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include "perf_metrics.h"
 #include "gfx/capture_schedule.h"
 #include "savestate.h"
@@ -1091,6 +1093,21 @@ void with_autorelease_pool(void (*fn)()) {
 static std::atomic<uint64_t> g_frames_completed{0};
 static std::atomic<int64_t> g_frame_done_ns[256];
 uint64_t frames_completed() { return g_frames_completed; }
+// waiters for a frame (wait_frames_completed): the completion handler only takes the mutex when
+// someone sleeps on it
+static std::mutex g_frame_wait_mutex;
+static std::condition_variable g_frame_wait_cv;
+static std::atomic<int> g_frame_waiters{0};
+bool wait_frames_completed(uint64_t n, int64_t timeout_ns) {
+    if (g_frames_completed.load() >= n) return true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+    g_frame_waiters.fetch_add(1);
+    std::unique_lock<std::mutex> lk(g_frame_wait_mutex);
+    const bool reached = g_frame_wait_cv.wait_until(lk, deadline, [n] { return g_frames_completed.load() >= n; });
+    lk.unlock();
+    g_frame_waiters.fetch_sub(1);
+    return reached;
+}
 
 void cache_warm_step();
 
@@ -1159,6 +1176,10 @@ void swap() {
             uint64_t n = ++g_frames_completed;
             g_frame_done_ns[n & 255] = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (g_frame_waiters.load()) {
+                { std::lock_guard<std::mutex> lk(g_frame_wait_mutex); }  // a waiter between its check and its sleep
+                g_frame_wait_cv.notify_all();
+            }
         }];
         flush();
     }

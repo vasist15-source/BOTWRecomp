@@ -7,6 +7,7 @@
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
+#include <sys/resource.h>
 #include <condition_variable>
 #include <deque>
 // GX2 core: command execution, display lists, context states, draws, clears,
@@ -378,7 +379,7 @@ static void enqueue(Op op, const uint32* payload, uint32 n) {
 // block the game thread until the render thread has executed everything queued so far
 // debug: WWHD_SYNC_STATS=1 logs, every 5 s, how often each caller waited for the render thread to
 // catch up (render_sync) and for how long
-enum SyncSite { kSyncShutdown, kSyncFlip, kSyncDrawDone, kSyncVsyncUncapped, kSyncVsyncFlip, kSyncSaveState, kSyncCopySurface, kSyncSites };
+enum SyncSite { kSyncShutdown, kSyncFlip, kSyncDrawDone, kSyncVsyncUncapped, kSyncVsyncFlip, kSyncSaveState, kSyncCopySurface, kSyncVsyncFrame, kSyncSites };
 static void sync_stat(int site, std::chrono::steady_clock::duration waited) {
     static const bool on = getenv("WWHD_SYNC_STATS") != nullptr;
     if (!on) return;
@@ -391,7 +392,7 @@ static void sync_stat(int site, std::chrono::steady_clock::duration waited) {
     const auto now = std::chrono::steady_clock::now();
     if (now - t0 < std::chrono::seconds(5)) return;
     const double secs = std::chrono::duration<double>(now - t0).count();
-    static const char* names[kSyncSites] = {"shutdown", "flip", "DrawDone", "vsync-uncapped", "vsync-flip", "savestate", "CopySurface"};
+    static const char* names[kSyncSites] = {"shutdown", "flip", "DrawDone", "vsync-uncapped", "vsync-flip", "savestate", "CopySurface", "vsync-frame (GPU)"};
     char buf[400];
     int k = snprintf(buf, sizeof buf, "[gx2] render_sync per second:");
     for (int i = 0; i < kSyncSites; i++)
@@ -1457,12 +1458,69 @@ HLE(gx2, GX2GetEventCallback) {
     if (arg(c, 1)) st32(arg(c, 1), g_event_cb[type]);
     if (arg(c, 2)) st32(arg(c, 2), g_event_ud[type]);
 }
+// debug: WWHD_VSYNC_FENCE_POLL=1 makes the uncapped GX2WaitForVsync poll with a queue fence on every
+// call, as before; =2 alternates every 10 s and logs the process CPU and frame time of each window
+// (an A/B in one run: a fanless Mac's heat drifts too much between runs)
+static bool vsync_fence_poll() {
+    static const int mode = getenv("WWHD_VSYNC_FENCE_POLL") ? atoi(getenv("WWHD_VSYNC_FENCE_POLL")) : 0;
+    if (mode != 2) return mode == 1;
+    static std::mutex mu;
+    static auto windowStart = std::chrono::steady_clock::now();
+    static double cpuStart = 0;
+    static uint64_t flipsStart = 0;
+    static bool poll = false;
+    auto cpuSeconds = [] {
+        rusage ru{};
+        getrusage(RUSAGE_SELF, &ru);
+        return ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+    };
+    std::lock_guard<std::mutex> lk(mu);
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - windowStart).count();
+    if (secs < 10) return poll;
+    const double cpu = cpuSeconds();
+    uint64_t flips;
+    {
+        std::lock_guard<std::mutex> fl(g_flip_mutex);
+        flips = g_flip_count;
+    }
+    if (cpuStart)
+        LOG("[vsync-ab] %s: %.0f%% CPU, %.2f ms/frame (%.1f s)", poll ? "fence poll" : "frame wait",
+            100 * (cpu - cpuStart) / secs, flips > flipsStart ? 1000 * secs / (flips - flipsStart) : 0.0, secs);
+    poll = !poll;
+    windowStart = now;
+    cpuStart = cpu;
+    flipsStart = flips;
+    return poll;
+}
 HLE(gx2, GX2WaitForVsync) {
     if(uncapped_benchmark()) {
         BlockingScope b;
-        // The queue fence follows earlier swaps, whose presentation path waits
-        // for GPU completion. Never wait while holding the flip mutex.
-        render_sync(kSyncVsyncUncapped);
+        // Here a flip executes as soon as its frame's GPU work is done (update_flips), and BotW polls
+        // this 450-650 times a frame for it. So sleep until frames_completed() reaches the oldest
+        // pending swap (or one vsync passed): that implies the render thread executed the swap, so
+        // no queue fence is needed. With nothing pending, or a renderer that cannot wait for a
+        // frame, the fence: the earlier swaps' presentation path waits for GPU completion. Never
+        // wait while holding the flip mutex.
+        const bool fencePoll = vsync_fence_poll();
+        uint64_t frame = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_flip_mutex);
+            const uint64_t flips = g_flip_count;
+            update_flips();
+            if (g_flip_count != flips && !fencePoll) return;
+            if (!g_pending_flips.empty()) frame = g_pending_flips.front().swap;
+        }
+        if (frame && !fencePoll && render::can_wait_frames()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            render::wait_frames_completed(frame, 1000000000 / 60);
+            const auto waited = std::chrono::steady_clock::now() - t0;
+            sync_stat(kSyncVsyncFrame, waited);
+            if (rprof::enabled())
+                rprof::add_sync(rprof::kSyncFlip, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
+        } else {
+            render_sync(kSyncVsyncUncapped);
+        }
         std::lock_guard<std::mutex> lk(g_flip_mutex);
         update_flips();
         return;

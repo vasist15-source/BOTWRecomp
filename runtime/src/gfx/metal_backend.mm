@@ -46,6 +46,7 @@ const Backend& metal_backend() {
         b.set_frame_aspect = gfx::set_frame_aspect;
         b.target_aspect_factors = gfx::target_aspect_factors;
         b.frames_completed = gfx::frames_completed;
+        b.wait_frames_completed = gfx::wait_frames_completed;
         b.with_autorelease_pool = gfx::with_autorelease_pool;
         b.set_tv_format = gfx::set_tv_format;
         b.invalidate = gfx::invalidate;

@@ -63,6 +63,7 @@ void set_frame_aspect(float a);  // aspect ratio of the TV picture from the next
 // render thread: a target of this guest size is made wider/taller this frame (kx, ky != 1)
 bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky);
 uint64_t frames_completed();     // swaps whose GPU work has finished
+bool wait_frames_completed(uint64_t n, int64_t timeout_ns);  // any thread: sleep until frames_completed() >= n (false: timed out)
 void with_autorelease_pool(void (*fn)());  // render thread: drain Objective-C temporaries per batch
 void set_tv_format(uint32_t gx2Format, bool tv);  // GX2SetTVBuffer / GX2SetDRCBuffer
 void invalidate(uint32_t flags, uint32_t addr, uint32_t size);

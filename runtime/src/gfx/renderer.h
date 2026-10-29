@@ -40,6 +40,8 @@ struct Backend {
     void (*set_frame_aspect)(float a);
     bool (*target_aspect_factors)(uint32_t w, uint32_t h, float& kx, float& ky);
     uint64_t (*frames_completed)();
+    // any thread: sleep until frames_completed() >= n, at most timeout_ns (false: timed out). Optional.
+    bool (*wait_frames_completed)(uint64_t n, int64_t timeout_ns);
     void (*with_autorelease_pool)(void (*fn)());
     void (*set_tv_format)(uint32_t gx2Format, bool tv);
     void (*invalidate)(uint32_t flags, uint32_t addr, uint32_t size);
@@ -126,6 +128,8 @@ inline void peek_z(const uint32_t* cells, uint32_t words) { g_backend->peek_z(ce
 inline void set_frame_aspect(float a) { g_backend->set_frame_aspect(a); }
 inline bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) { return g_backend->target_aspect_factors(w, h, kx, ky); }
 inline uint64_t frames_completed() { return g_backend->frames_completed(); }
+inline bool can_wait_frames() { return g_backend->wait_frames_completed != nullptr; }
+inline bool wait_frames_completed(uint64_t n, int64_t timeout_ns) { return g_backend->wait_frames_completed(n, timeout_ns); }
 inline void with_autorelease_pool(void (*fn)()) { g_backend->with_autorelease_pool(fn); }
 inline void set_tv_format(uint32_t f, bool tv) { g_backend->set_tv_format(f, tv); }
 inline void invalidate(uint32_t flags, uint32_t addr, uint32_t size) { g_backend->invalidate(flags, addr, size); }
