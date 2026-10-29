@@ -414,10 +414,6 @@ add_executable(write_watch_test runtime/tools/write_watch_test.cpp runtime/src/w
 target_include_directories(write_watch_test PRIVATE runtime/src)
 target_compile_options(write_watch_test PRIVATE -UNDEBUG)
 target_link_libraries(write_watch_test PRIVATE Threads::Threads)
-# display-list uniform blocks as submitted (runtime/src/gx2/submitted_uniforms.h)
-add_executable(submitted_uniforms_test runtime/tools/submitted_uniforms_test.cpp)
-target_include_directories(submitted_uniforms_test PRIVATE runtime/src)
-target_compile_options(submitted_uniforms_test PRIVATE -UNDEBUG)
 # recompiled spin waits see other threads' stores (PPC_LOOP in runtime/include/ppc.h, issue #62):
 # built with the game code's flags
 if(NOT WIN32)
@@ -637,7 +633,6 @@ add_test(NAME language_sources COMMAND language_source_test)
 add_test(NAME interp_pacing COMMAND interp_pacing_test)
 add_test(NAME quit_prompt COMMAND quit_prompt_test)
 add_test(NAME write_watch COMMAND write_watch_test)
-add_test(NAME submitted_uniforms COMMAND submitted_uniforms_test)
 add_test(NAME buffer_cache COMMAND buffer_cache_test)
 add_test(NAME snapshot_caches COMMAND snapshot_cache_test)
 add_test(NAME pad_delivery COMMAND pad_delivery_test)

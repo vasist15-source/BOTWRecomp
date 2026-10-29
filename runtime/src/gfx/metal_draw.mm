@@ -252,9 +252,6 @@ static std::mutex g_pool_mutex;
 static std::vector<id<MTLBuffer>> g_pool_free;
 static std::vector<id<MTLBuffer>> g_pool_used;
 static id<MTLBuffer> g_pool_cur = nil;
-// bumped whenever the current chunk changes: a recycled chunk can come back as the same object, so
-// "still the current chunk" is a generation, not a pointer comparison
-static uint64_t g_pool_gen = 0;
 static uint32_t g_pool_pos = 0;
 constexpr uint32_t kPoolChunk = 8 << 20;
 
@@ -272,7 +269,6 @@ static Upload reserve(uint32_t size) {
                 break;
             }
         if (!g_pool_cur) g_pool_cur = [R.device newBufferWithLength:want options:MTLResourceStorageModeShared];
-        ++g_pool_gen;
         g_pool_pos = 0;
     }
     Upload u{g_pool_cur, g_pool_pos};
@@ -295,130 +291,6 @@ id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr) {
     return u.buf;
 }
 
-// Submitted uniform blocks (gx2/submitted_uniforms.h): uploaded once per submission and reused by
-// the draws of the call while the upload chunk they are in is still the current one (a retired
-// chunk is recycled when its command buffer completes)
-static uint64_t g_submitted_uploads, g_submitted_upload_bytes;
-static Upload submitted_upload(uint32_t addr, uint32_t size, const uint8_t* bytes) {
-    struct Item { uint32_t size; Upload u; };
-    static std::unordered_map<uint32_t, Item> items;
-    static uint64_t itemsFor = 0;
-    static uint64_t itemsChunk = ~0ull;  // g_pool_gen of the chunk the items are in
-    if (itemsFor != gx2::submitted_uniforms_id() || itemsChunk != g_pool_gen) {
-        items.clear();
-        itemsFor = gx2::submitted_uniforms_id();
-        itemsChunk = g_pool_gen;
-    }
-    auto it = items.find(addr);
-    if (it != items.end() && it->second.size == size) return it->second.u;
-    Upload u = upload(bytes, size);
-    g_submitted_uploads++;
-    g_submitted_upload_bytes += size;
-    if (itemsChunk != g_pool_gen) {  // the upload began a new chunk: the earlier items are in a retired one
-        items.clear();
-        itemsChunk = g_pool_gen;
-    }
-    items[addr] = {size, u};
-    return u;
-}
-
-// Vertex buffers and uniform blocks the CPU rewrites (ported from ZeldaWWHDRecomp a9e6d52, dc7575c).
-// Metal binds them straight from guest memory, and the GPU reads them when it runs, a frame or so
-// after the render thread recorded the draw; by then the game may already have written the next
-// frame's data into a dynamic buffer, so what a draw showed depended on GPU timing. A range is bound
-// from guest memory while the CPU never writes it after its first use (static meshes: no copy); once
-// a write to it is seen (write_watch.h), it is copied at record time, and that copy is reused by later
-// draws while the range is unchanged and its upload chunk is current. Without write tracking: as
-// before. (Uniform blocks of display lists use their submitted bytes, gx2/submitted_uniforms.h.)
-// BotW: ranges a stream-out draw writes are never copied (the GPU writes them, after the draw that
-// reads them was recorded: a copy would hold the previous results); ranges over
-// WWHD_METAL_COPY_MAX_KB (default 2048) and copies past WWHD_METAL_COPY_FRAME_MB a frame (default 48)
-// stay bound from guest memory, so a buffer the CPU writes all the time cannot flood the pool.
-// WWHD_METAL_VB_COPY=0 / WWHD_METAL_UBO_COPY=0 bind those from guest memory again (comparisons);
-// WWHD_GUEST_COPIES (gx2_core.cpp) turns both off together, or A/Bs them.
-enum GuestRangeKind { kRangeVertex, kRangeUniform, kRangeKinds };
-struct GuestRange {
-    uint64_t stamp = 0;          // write stamp when armed (static) or when copied (dynamic)
-    uint64_t checkedFrame = ~0ull, seq = 0;
-    bool dynamic = false;
-    Upload copy{nil, 0};
-    uint64_t copyGen = ~0ull;    // g_pool_gen of the chunk holding the copy
-    uint64_t soGen = 0;          // g_streamout_gen when `streamout` was worked out
-    bool streamout = false;      // overlaps a stream-out target: never copied
-};
-static std::unordered_map<uint64_t, GuestRange> g_guest_ranges[kRangeKinds];
-static uint64_t g_range_copy_bytes[kRangeKinds], g_range_copies[kRangeKinds], g_range_skipped[kRangeKinds];
-// stream-out targets seen, merged: start -> end (BotW writes hundreds of distinct bases in a few arenas)
-static std::map<uint32_t, uint32_t> g_streamout_ranges;
-static uint64_t g_streamout_gen = 1;  // bumped when the set grows
-static void note_streamout_range(uint32_t addr, uint32_t size) {
-    uint32_t end = addr + size;
-    auto it = g_streamout_ranges.upper_bound(addr);
-    if (it != g_streamout_ranges.begin()) {
-        auto p = std::prev(it);
-        if (p->second >= addr) {
-            if (p->second >= end) return;  // already covered
-            addr = p->first;
-            it = g_streamout_ranges.erase(p);
-        }
-    }
-    while (it != g_streamout_ranges.end() && it->first <= end) {
-        end = std::max(end, it->second);
-        it = g_streamout_ranges.erase(it);
-    }
-    g_streamout_ranges[addr] = end;
-    g_streamout_gen++;
-}
-static bool streamout_overlap(uint32_t addr, uint32_t size) {
-    auto it = g_streamout_ranges.lower_bound(addr + size);  // the ranges are disjoint: the one before decides
-    return it != g_streamout_ranges.begin() && std::prev(it)->second > addr;
-}
-static bool rewritten_copy(GuestRangeKind kind, uint32_t addr, uint32_t size, Upload& out) {
-    static const bool off[kRangeKinds] = {
-        getenv("WWHD_METAL_VB_COPY") && !atoi(getenv("WWHD_METAL_VB_COPY")),
-        getenv("WWHD_METAL_UBO_COPY") && !atoi(getenv("WWHD_METAL_UBO_COPY"))};
-    static const uint32_t maxRange = (getenv("WWHD_METAL_COPY_MAX_KB") ? (uint32_t)atoi(getenv("WWHD_METAL_COPY_MAX_KB")) : 2048) << 10;
-    static const uint64_t frameBudget = (getenv("WWHD_METAL_COPY_FRAME_MB") ? (uint64_t)atoi(getenv("WWHD_METAL_COPY_FRAME_MB")) : 48) << 20;
-    if (off[kind] || !gx2::guest_copies_on() || !wwatch::active() || !size || size > maxRange) return false;
-    // a direct-mapped cache in front of the map (its nodes never move): a few lookups per draw
-    const uint64_t key = (uint64_t)addr << 32 | size;
-    struct Slot { uint64_t key; GuestRange* r; };
-    static Slot cache[kRangeKinds][4096];
-    Slot& slot = cache[kind][(key * 0x9E3779B97F4A7C15ull) >> 52];
-    if (slot.key != key || !slot.r) slot = {key, &g_guest_ranges[kind][key]};
-    GuestRange& r = *slot.r;
-    if (!r.dynamic) {
-        if (r.checkedFrame == ~0ull) { r.stamp = wwatch::arm(addr, size); r.checkedFrame = R.frame; return false; }
-        if (r.checkedFrame == R.frame) return false;  // checked this frame
-        r.checkedFrame = R.frame;
-        if (!wwatch::written_since(addr, size, r.stamp)) return false;
-        r.dynamic = true;
-        r.copy = Upload{nil, 0};
-    }
-    if (r.soGen != g_streamout_gen) {  // only rewritten ranges are checked, once per change of the set
-        r.soGen = g_streamout_gen;
-        r.streamout = streamout_overlap(addr, size);
-    }
-    if (r.streamout) return false;
-    const uint64_t seq = wwatch::write_seq();
-    if (r.copy.buf && r.copyGen == g_pool_gen && (r.seq == seq || !wwatch::written_since(addr, size, r.stamp))) {
-        r.seq = seq;
-        out = r.copy;
-        return true;
-    }
-    static uint64_t budgetFrame = ~0ull, frameBytes = 0;
-    if (budgetFrame != R.frame) budgetFrame = R.frame, frameBytes = 0;
-    if (frameBytes + size > frameBudget) { g_range_skipped[kind]++; return false; }
-    frameBytes += size;
-    r.stamp = wwatch::arm(addr, size);  // arm before reading (write_watch.h)
-    r.seq = wwatch::write_seq();
-    out = r.copy = upload(mem::ptr(addr), size);
-    r.copyGen = g_pool_gen;
-    g_range_copy_bytes[kind] += size;
-    ++g_range_copies[kind];
-    return true;
-}
-
 // Buffers used so far, taken at a commit in submission order (render thread): they are recycled when
 // the committed command buffer completes (pool_attach, on whichever thread commits it)
 std::vector<id<MTLBuffer>>* pool_take_used() {
@@ -427,7 +299,6 @@ std::vector<id<MTLBuffer>>* pool_take_used() {
     if (g_pool_cur) {
         g_pool_used.push_back(g_pool_cur);
         g_pool_cur = nil;
-        ++g_pool_gen;
     }
     used->swap(g_pool_used);
     return used;
@@ -2006,13 +1877,7 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             for (auto& g : dec->list_remappedUniformEntries_bufferGroups) {
                 uint32_t addr = regs[blockBase + g.kcacheBankIdOffset / 4];
                 if (!addr) continue;
-                // a block of a display list: its bytes as submitted (gx2/submitted_uniforms.h);
-                // entries past the block's end still read guest memory, as before
-                const uint32_t blockSize = std::min<uint32_t>(regs[blockBase + g.kcacheBankIdOffset / 4 + 1] + 1, 0x10000);
-                const uint8_t* submitted = gx2::submitted_uniform_block(addr, blockSize);
-                for (auto& e : g.entries)
-                    memcpy(dst + e.mappedIndexOffset,
-                           submitted && e.indexOffset + 16 <= blockSize ? submitted + e.indexOffset : mem::ptr(addr + e.indexOffset), 16);
+                for (auto& e : g.entries) memcpy(dst + e.mappedIndexOffset, mem::ptr(addr + e.indexOffset), 16);
             }
             // F12 capture: the uniforms of vertex shaders that fetch textures (grass, terrain); [arraydraw] draws
             if ((capturing() && ((vertex && dec->textureUnitListCount > 0) ||
@@ -2081,10 +1946,8 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
     if (vertex && g_so.active && rm.tfStorageBindingPoint >= 0 && g_so.buf)
         bc_buffer(enc, true, g_so.buf, 0, rm.tfStorageBindingPoint);
 
-    // uniform blocks: our GPU runs a frame after the CPU built it, and games rewrite uniform memory
-    // between draws, so binding guest memory directly can show later values. Blocks of display lists
-    // use their submitted bytes, others are copied at record time once the CPU rewrites them
-    // (rewritten_copy); WWHD_SNAPSHOT copies every block.
+    // uniform blocks: snapshot at draw time. Our GPU runs a frame after the CPU built it, and games
+    // rewrite uniform memory between draws, so binding guest memory directly shows later values.
     uint32_t blockBase = vertex ? mmSQ_VTX_UNIFORM_BLOCK_START : mmSQ_PS_UNIFORM_BLOCK_START;
     for (int i = 0; i < 16; i++) {
         sint32 binding = rm.uniformBuffersBindingPoint[i];
@@ -2109,16 +1972,8 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             }
             DLOG("[draw]     ub%d data: %s", i, line.c_str());
         }
-        // a block of a display list: its bytes as submitted (gx2/submitted_uniforms.h), uploaded
-        // once per submission and upload pool chunk (guest memory is what the GPU reads later)
-        if (const uint8_t* submitted = gx2::submitted_uniform_block(addr, size)) {
-            Upload u = submitted_upload(addr, size, submitted);
-            bc_buffer(enc, vertex, u.buf, u.offset, binding);
-            continue;
-        }
-        Upload u;
-        if (g_snapshot || rewritten_copy(kRangeUniform, addr, size, u)) {
-            if (g_snapshot) u = upload(mem::ptr(addr), size);
+        if (g_snapshot) {
+            Upload u = upload(mem::ptr(addr), size);
             bc_buffer(enc, vertex, u.buf, u.offset, binding);
         } else {
             bc_buffer(enc, vertex, gb, off, binding);
@@ -3000,22 +2855,11 @@ void report_skips() {
     g_stat_hash_ms = g_stat_decode_ms = 0;
     g_stat_pass_splits = 0;
     LOG("[gfx] last 300 frames: %llu full texture checks (%.1f MiB hashed), %llu uploads, %llu invalidates marking %llu surfaces, "
-        "%llu page write faults, %llu pages protected",
+        "%llu texture page write faults, %llu pages protected",
         (unsigned long long)g_stat_full_checks, g_stat_hashed_bytes / 1048576.0, (unsigned long long)g_stat_uploads,
         (unsigned long long)g_stat_invalidates, (unsigned long long)g_stat_invalidated_surfaces, (unsigned long long)faults,
         (unsigned long long)protectedPages);
     g_stat_full_checks = g_stat_uploads = g_stat_invalidates = g_stat_invalidated_surfaces = g_stat_hashed_bytes = 0;
-    for (int k = 0; k < kRangeKinds; k++) {
-        size_t dynamicRanges = 0;
-        for (auto& [key, r] : g_guest_ranges[k]) dynamicRanges += r.dynamic;
-        LOG("[gfx] last 300 frames: %llu rewritten %s copies (%.1f MiB), %llu over the frame budget; %zu of %zu ranges rewritten by the CPU",
-            (unsigned long long)g_range_copies[k], k == kRangeVertex ? "vertex buffer" : "uniform block", g_range_copy_bytes[k] / 1048576.0,
-            (unsigned long long)g_range_skipped[k], dynamicRanges, g_guest_ranges[k].size());
-        g_range_copies[k] = g_range_copy_bytes[k] = g_range_skipped[k] = 0;
-    }
-    LOG("[gfx] last 300 frames: %llu submitted uniform block uploads (%.1f MiB); %zu stream-out ranges", (unsigned long long)g_submitted_uploads,
-        g_submitted_upload_bytes / 1048576.0, g_streamout_ranges.size());
-    g_submitted_uploads = g_submitted_upload_bytes = 0;
 }
 
 bool probe_draw_eligible(Surface* const* colors, const Surface* depth, Surface* const* sampled, int nSampled);
@@ -3354,8 +3198,8 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     rprof::mark(rprof::kRecord);
     rprof::UploadKind vertexUploads(rprof::kUpVertex);
 
-    // vertex buffers: read from guest memory directly while the CPU leaves them alone, copied at record
-    // time once it rewrites them (rewritten_copy); WWHD_SNAPSHOT copies every small one
+    // vertex buffers: small ones (UI, particles, dynamic geometry) are snapshotted like uniforms;
+    // large static meshes are read from guest memory directly
     static const uint32_t kSnapshotLimit = getenv("WWHD_VB_SNAPSHOT") ? (uint32_t)atoi(getenv("WWHD_VB_SNAPSHOT")) : 256 * 1024;
     for (auto& g : fs->bufferGroups) {
         uint32_t addr = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7];
@@ -3363,11 +3207,8 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         uint32_t off = 0;
         id<MTLBuffer> b = guest_buffer(addr, &off);
         if (!b) continue;
-        Upload u;
         if (g_snapshot && size <= kSnapshotLimit) {
-            u = upload(mem::ptr(addr), size);
-            bc_buffer(enc, true, u.buf, u.offset, GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex));
-        } else if (rewritten_copy(kRangeVertex, addr, size, u)) {
+            Upload u = upload(mem::ptr(addr), size);
             bc_buffer(enc, true, u.buf, u.offset, GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex));
         } else {
             bc_buffer(enc, true, b, off, GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex));
@@ -3391,7 +3232,6 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
                 // debug (WWHD_WRITE_TRAP): stream-out into the trapped range (GPU writes don't fault)
                 static const uint32_t trap = getenv("WWHD_WRITE_TRAP") ? (uint32_t)strtoul(getenv("WWHD_WRITE_TRAP"), nullptr, 16) : 0;
                 const uint32_t soSize = regs[mmVGT_STRMOUT_BUFFER_SIZE_0 + b * 4] << 2;
-                note_streamout_range(regs[mmVGT_STRMOUT_BUFFER_BASE_0 + b * 4] << 8, std::max<uint32_t>(soSize, 0x100));
                 if (trap && addr <= trap + 0x300 && trap < addr + std::max<uint32_t>(soSize, 0x10000))
                     LOG("[wtrap] stream-out VS %08X buffer %d %08X size %X count %u frame %llu", regs[mmSQ_PGM_START_VS] << 8, b, addr, soSize,
                         count, (unsigned long long)R.frame);

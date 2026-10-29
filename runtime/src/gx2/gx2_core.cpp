@@ -8,7 +8,6 @@
 #include <pthread/qos.h>
 #endif
 #include <sys/resource.h>
-#include <time.h>
 #include <condition_variable>
 #include <deque>
 // GX2 core: command execution, display lists, context states, draws, clears,
@@ -23,7 +22,6 @@
 
 #include "gx2.h"
 #include "gx2_cmd.h"
-#include "submitted_uniforms.h"
 #include "gx2_regs.h"
 #include "register_blocks.h"
 #include "gx2_texture_regs.h"
@@ -306,132 +304,6 @@ static thread_local Recording t_rec;
 
 static void execute_one(Op op, const uint32* p, uint32 n);
 
-// ---------------------------------------------------------------- copies of guest data the CPU rewrites
-// WWHD_GUEST_COPIES: 1 (default) display-list draws read their uniform blocks as submitted (below) and
-// Metal copies vertex buffers and uniform blocks the CPU rewrites at record time (metal_draw.mm,
-// rewritten_copy); 0 turns all of it off (draws read guest memory when the GPU runs them, as before);
-// 2 alternates every 10 s and logs process CPU, ms/frame and the render and GX2 threads' CPU per
-// frame for each window ([copies-ab]; an A/B in one run, heat drifts too much between runs)
-static int guest_copies_mode() {
-    static const int mode = getenv("WWHD_GUEST_COPIES") ? atoi(getenv("WWHD_GUEST_COPIES")) : 1;
-    return mode;
-}
-static std::atomic<bool> g_guest_copies{guest_copies_mode() != 0};
-bool guest_copies_on() { return g_guest_copies.load(std::memory_order_relaxed); }
-static std::atomic<int64_t> g_render_cpu_ns{0};  // render thread's CPU time at its last swap (A/B only)
-static std::atomic<uint64_t> g_submitted_bytes{0};  // submitted uniform bytes copied (A/B only)
-static int64_t thread_cpu_ns() {
-    timespec t{};
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
-    return int64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
-}
-static void guest_copies_ab() {  // the GX2 thread, once per swap
-    if (guest_copies_mode() != 2) return;
-    static uint64_t swaps = 0;
-    swaps++;
-    static auto windowStart = std::chrono::steady_clock::now();
-    static double cpuStart = 0;
-    static int64_t renderStart = 0, gx2Start = 0;
-    static uint64_t swapsStart = 0, bytesStart = 0;
-    const auto now = std::chrono::steady_clock::now();
-    const double secs = std::chrono::duration<double>(now - windowStart).count();
-    if (secs < 10) return;
-    rusage ru{};
-    getrusage(RUSAGE_SELF, &ru);
-    const double cpu = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
-    const int64_t render = g_render_cpu_ns.load(std::memory_order_relaxed), gx2 = thread_cpu_ns();
-    const uint64_t bytes = g_submitted_bytes.load(std::memory_order_relaxed);
-    const bool on = guest_copies_on();
-    if (cpuStart && swaps > swapsStart) {
-        const double frames = double(swaps - swapsStart);
-        LOG("[copies-ab] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, GX2 thread %.2f ms/frame, "
-            "submitted uniforms %.0f KB/frame (%.1f s)",
-            on ? "copies on " : "copies off", 100 * (cpu - cpuStart) / secs, 1000 * secs / frames, (render - renderStart) / 1e6 / frames,
-            (gx2 - gx2Start) / 1e6 / frames, (bytes - bytesStart) / 1024.0 / frames, secs);
-    }
-    g_guest_copies.store(!on, std::memory_order_relaxed);
-    windowStart = now;
-    cpuStart = cpu;
-    renderStart = render;
-    gx2Start = gx2;
-    swapsStart = swaps;
-    bytesStart = bytes;
-}
-
-// ---------------------------------------------------------------- submitted uniform blocks
-// (submitted_uniforms.h) WWHD_GX2_SUBMITTED_UNIFORMS=0 turns it off: draws in display lists then read
-// uniform blocks from guest memory whenever the render thread executes them (the old behaviour).
-static bool submitted_uniforms_on() {
-    static const bool on = [] {
-        const char* e = getenv("WWHD_GX2_SUBMITTED_UNIFORMS");
-        // only the Metal renderer reads the snapshots
-        const bool v = (!e || atoi(e) != 0) && guest_copies_mode() != 0 && !render::vulkan();
-        LOG("[gx2] display-list uniform blocks: %s", v ? "as submitted (default)" : "read when executed");
-        return v;
-    }();
-    return on;
-}
-static submitted::DisplayListIndex g_dl_index;
-// the blocks bound and lists called while this thread records a display list (t_rec)
-static thread_local std::vector<submitted::Range> t_rec_blocks;
-static thread_local std::vector<uint32> t_rec_calls;
-static std::mutex g_snap_mutex;
-static std::vector<submitted::Snapshot*> g_snap_free;
-static std::atomic<uint64_t> g_snap_ids{0};  // submitting threads
-static submitted::Snapshot* g_snap_active = nullptr;  // render thread
-
-void note_uniform_block(uint32 addr, uint32 size) {
-    if (t_rec.start && submitted_uniforms_on()) t_rec_blocks.push_back({addr, size});
-}
-const uint8_t* submitted_uniform_block(uint32 addr, uint32 size) {
-    return g_snap_active ? g_snap_active->find(addr, size) : nullptr;
-}
-uint64_t submitted_uniforms_id() { return g_snap_active ? g_snap_active->id() : 0; }
-static bool snapshot_readable(uint32 addr, uint32 size) {
-    const uint64_t end = uint64_t(addr) + size + submitted::Snapshot::kTail;
-    auto in = [&](uint64_t lo, uint64_t hi) { return addr >= lo && end <= hi; };
-    return in(mem::kMem2Start, mem::kMem2End) || in(mem::kRuntimeStart, mem::kRuntimeEnd) ||
-           in(mem::kMem1, uint64_t(mem::kMem1) + mem::kMem1Size) || in(mem::kFgBucket, uint64_t(mem::kFgBucket) + mem::kFgBucketSize);
-}
-// a display-list call from the command stream: its blocks as they are now go with it
-static submitted::Snapshot* submit_snapshot(uint32 list, uint32 size) {
-    if (!submitted_uniforms_on() || !guest_copies_on()) return nullptr;
-    static thread_local std::vector<submitted::Range> ranges;
-    ranges.clear();
-    if (!g_dl_index.blocks(list, size, ranges) || ranges.empty()) return nullptr;
-    submitted::Snapshot* s = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_snap_mutex);
-        if (!g_snap_free.empty()) { s = g_snap_free.back(); g_snap_free.pop_back(); }
-    }
-    if (!s) s = new submitted::Snapshot;
-    const uint64_t id = g_snap_ids.fetch_add(1, std::memory_order_relaxed) + 1;
-    const size_t bytes = s->build(id, ranges, [](uint32 a) { return (const uint8_t*)mem::ptr(a); }, snapshot_readable);
-    if (guest_copies_mode() == 2) g_submitted_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    // debug: WWHD_GX2_SUBMITTED_STATS=1 logs the copies made, every 1000 submissions
-    static const bool stats = getenv("WWHD_GX2_SUBMITTED_STATS") != nullptr;
-    if (stats) {
-        static std::mutex mu;
-        static uint64_t n = 0, blocks = 0, total = 0;
-        std::lock_guard<std::mutex> lk(mu);
-        blocks += s->blocks();
-        total += bytes;
-        if (++n % 1000 == 0) {
-            LOG("[gx2] submitted uniforms: %llu submissions, last 1000: %.1f blocks and %.1f KB each; %zu lists indexed",
-                (unsigned long long)n, blocks / 1000.0, total / 1000.0 / 1024, g_dl_index.size());
-            blocks = total = 0;
-        }
-    }
-    return s;
-}
-static void set_active_snapshot(submitted::Snapshot* s) {  // render thread
-    if (g_snap_active) {
-        std::lock_guard<std::mutex> lk(g_snap_mutex);
-        g_snap_free.push_back(g_snap_active);
-    }
-    g_snap_active = s;
-}
-
 // ---------------------------------------------------------------- render thread
 // Like the real GPU, command execution runs asynchronously to the game: GX2 calls append to a
 // queue that a render thread turns into Metal work. WWHD_NO_RENDER_THREAD=1 executes inline.
@@ -682,9 +554,6 @@ static void execute_op(Op op, const uint32* p, uint32 n);
 static void execute_one(Op op, const uint32* p, uint32 n) {
     rprof::Op kind;
     switch (op) {
-    case OP_SUBMITTED_UNIFORMS:
-        set_active_snapshot(n >= 2 ? (submitted::Snapshot*)(uintptr_t(p[0]) | (uint64_t(p[1]) << 32)) : nullptr);
-        return;
     case OP_CALL: execute_op(op, p, n); return;
     case OP_SET_REGS: case OP_SET_PROJ_REGS: kind = rprof::kOpRegs; break;
     case OP_DRAW: case OP_DRAW_INDEXED: kind = rprof::kOpDraw; rprof::classify_draw(); break;
@@ -702,10 +571,7 @@ static void execute_one(Op op, const uint32* p, uint32 n) {
     const uint64_t started = rprof::op_begin(kind);
     execute_op(op, p, n);
     rprof::op_end(kind, started);
-    if (op == OP_SWAP) {
-        rprof::frame_end(n >= 2 && p[1]);
-        if (guest_copies_mode() == 2) g_render_cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
-    }
+    if (op == OP_SWAP) rprof::frame_end(n >= 2 && p[1]);
 }
 
 static void execute_op(Op op, const uint32* p, uint32 n) {
@@ -1215,14 +1081,9 @@ HLE(gx2, GX2GetContextStateDisplayList) {
 HLE(gx2, GX2BeginDisplayListEx) {
     t_rec.start = t_rec.pos = arg(c, 0);
     t_rec.end = arg(c, 0) + arg(c, 1);
-    t_rec_blocks.clear();
-    t_rec_calls.clear();
 }
 HLE(gx2, GX2EndDisplayList) {
     uint32 size = t_rec.pos - t_rec.start;
-    if (submitted_uniforms_on() && t_rec.start) g_dl_index.publish(t_rec.start, size, t_rec_blocks, t_rec_calls);
-    t_rec_blocks.clear();
-    t_rec_calls.clear();
     t_rec = Recording{};
     ret(c, size);
 }
@@ -1231,24 +1092,11 @@ HLE(gx2, GX2GetCurrentDisplayList) {
     if (arg(c, 1)) st32(arg(c, 1), t_rec.start ? t_rec.end - t_rec.start : 0);
     ret(c, t_rec.start != 0);
 }
-// A list called while another is recorded runs with that one (its blocks are noted for it); a call
-// from the command stream takes the blocks of the list as they are now with it (submitted_uniforms.h).
-static void call_display_list(uint32 list, uint32 size) {
-    if (t_rec.start) {
-        if (submitted_uniforms_on()) t_rec_calls.push_back(list);
-        emit(OP_CALL, {list, size});
-        return;
-    }
-    submitted::Snapshot* s = submit_snapshot(list, size);
-    if (s) emit_host(OP_SUBMITTED_UNIFORMS, {uint32(uintptr_t(s)), uint32(uint64_t(uintptr_t(s)) >> 32)});
-    emit(OP_CALL, {list, size});
-    if (s) emit_host(OP_SUBMITTED_UNIFORMS, {});
-}
-HLE(gx2, GX2CallDisplayList) { call_display_list(arg(c, 0), arg(c, 1)); }
+HLE(gx2, GX2CallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 // a copy into the command stream: run where it stands (our display lists are op lists, not PM4)
-HLE(gx2, GX2CopyDisplayList) { call_display_list(arg(c, 0), arg(c, 1)); }
+HLE(gx2, GX2CopyDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 HLE(gx2, GX2SetDefaultState) { set_default_state(); }
-HLE(gx2, GX2DirectCallDisplayList) { call_display_list(arg(c, 0), arg(c, 1)); }
+HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 
 // ---------------------------------------------------------------- draws
 HLE(gx2, GX2DrawEx) { emit(OP_DRAW, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)}); }
@@ -1454,7 +1302,6 @@ HLE(gx2, GX2SwapScanBuffers) {
         if (watch && g_swap_count > 3600) std::call_once(started, [] { std::thread(freeze_watchdog).detach(); });
     }
     perf::game_frame();  // the overlay's Game CPU: this thread's CPU time per submitted frame
-    guest_copies_ab();
     // save states are taken and loaded here: the thread that submits frames calls this once a frame from
     // the same place (Wind Waker's per-frame hook, savestate.cpp's anchor, never runs in BotW)
     ss::service(c);
@@ -1851,6 +1698,4 @@ void gx2_ss_load(ss::Reader& r) {
         g_count_offset = (int64_t)guest_swaps - (int64_t)g_swap_count;
     }
     render::ss_reset();  // the renderer forgets surface contents and shader memos (Vulkan)
-    g_dl_index.clear();  // lists recorded before the load say nothing about the loaded ones
-    set_active_snapshot(nullptr);
 }
