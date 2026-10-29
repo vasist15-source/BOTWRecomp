@@ -1,3 +1,4 @@
+#include <array>
 #include <map>
 #include <thread>
 #include <deque>
@@ -17,6 +18,7 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 #include "graphic_pack_hash.h"
+#include "gfx/shader_linkage.h"
 #include "mods/graphic_packs.h"
 #include "gfx/sampler_lod_bias.h"
 #include "gx2/gx2.h"
@@ -40,6 +42,8 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include <zlib.h>
 
 LatteDecompilerShader* FinishDecompiledShader(LatteDecompilerOutput_t& decompilerOutput);
+Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N& texUnitWord1,
+                                                      const Latte::LATTE_SQ_TEX_RESOURCE_WORD4_N& texUnitWord4);
 LatteFetchShader* LatteShaderRecompiler_createFetchShader(LatteFetchShader::CacheHash fsHash, uint32* contextRegister,
                                                            uint32* fsProgramCode, uint32 fsProgramSize);
 
@@ -217,13 +221,21 @@ static uint64_t hash_bytes(const void* data, size_t n, uint64_t h = 0x9E3779B97F
     return h ^ (h >> 29);
 }
 
+// What a program's first translation showed: the same for every register state, since it comes from
+// its instructions (the texture units its fetches name, the parameters its exports write)
+struct ProgramUse {
+    uint32_t units = 0x3FFFF;  // texture units it samples (all 18 until known)
+    uint32_t exports = 0;      // vertex shaders: the parameters it exports (outputParameterMask)
+    bool known = false;
+};
+
 // shader programs rarely change in place: cache their hash per address, revalidated once per frame
 struct ProgramHash {
     uint32_t size;
     uint64_t hash;
     uint64_t frame;
-    uint64_t maskKey = 0;  // the key unitMask was learned for (get_shader_uncached: skips the locked lookup)
-    uint32_t unitMask = 0x3FFFF;
+    uint64_t useKey = 0;  // the program `use` was learned for (program_use: skips the locked lookup)
+    struct ProgramUse use;
 };
 static std::unordered_map<uint32_t, ProgramHash> g_program_hashes;
 static ProgramHash* g_program_hash_last = nullptr;  // the entry of the latest program_hash call
@@ -747,7 +759,18 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
 static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t base, uint32_t addr,
                              uint32_t size, bool async);
 static std::mutex g_used_units_mu;  // also guards the translation time counters
-static std::unordered_map<uint64_t, uint32_t> g_used_units;  // program -> texture units it samples (stage_state_hash)
+static std::unordered_map<uint64_t, ProgramUse> g_program_uses;  // program -> its use (first translation)
+static size_t g_translations = 0;  // shaders translated (render thread)
+// the use of the program whose base key (program_hash ^ stage) this is, if a translation showed it
+static ProgramUse program_use(uint64_t base) {
+    ProgramHash* ph = g_program_hash_last;  // program_hash's entry for this program
+    if (ph && ph->useKey == base) return ph->use;
+    std::lock_guard<std::mutex> lk(g_used_units_mu);
+    auto it = g_program_uses.find(base);
+    if (it == g_program_uses.end()) return {};
+    if (ph) { ph->useKey = base; ph->use = it->second; }
+    return it->second;
+}
 static dispatch_queue_t translate_queue() {  // shader translation: draws wait on it
     static dispatch_queue_t q = dispatch_queue_create_with_target("wwhd.translate", DISPATCH_QUEUE_CONCURRENT,
                                                                    dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
@@ -760,11 +783,13 @@ static dispatch_queue_t pipeline_queue() {  // pipeline builds: issued after tra
 }
 
 static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
-    // nothing shader-relevant changed since the previous draw: same shader
-    struct Last { uint64_t gen = 0, frame = ~0ull, fsKey = 0; Shader* s = nullptr; };
+    // nothing shader-relevant changed since the previous draw: same shader. The draw sets the
+    // primitive type without a register write (no generation bump); vertex keys read it (points, rects)
+    struct Last { uint64_t gen = 0, frame = ~0ull, fsKey = 0; uint32_t prim = 0; Shader* s = nullptr; };
     static Last last[2];
     Last& L = last[vertex ? 0 : 1];
-    if (L.gen == g_shader_state_gen && L.frame == R.frame && (!vertex || L.fsKey == fsKey)) {
+    const uint32_t prim = vertex ? regs[REGADDR::VGT_PRIMITIVE_TYPE] & 0x3F : 0;
+    if (L.gen == g_shader_state_gen && L.frame == R.frame && (!vertex || (L.fsKey == fsKey && L.prim == prim))) {
         // debug: WWHD_VERIFY_SHADER_GEN=1 recomputes the lookup anyway and logs a register filter that missed a change
         static const bool verify = getenv("WWHD_VERIFY_SHADER_GEN") != nullptr;
         if (verify) {
@@ -777,7 +802,7 @@ static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* f
         return L.s;
     }
     Shader* s = get_shader_uncached(regs, vertex, fs, fsKey);
-    L = Last{g_shader_state_gen, R.frame, fsKey, s};
+    L = Last{g_shader_state_gen, R.frame, fsKey, prim, s};
     return s;
 }
 
@@ -821,28 +846,14 @@ static void retry_failed_compile(Shader* s, bool now = false) {
     compile_msl(s, s->dec->strBuf_shaderSource->c_str(), s->key);
 }
 
-static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
-    uint32_t addr = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
-    uint32_t size = regs[(vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS) + 1] << 3;
-    if (!addr || !size) return nullptr;
-    uint64_t key = program_hash(addr, size) ^ (vertex ? 0x1111 : 0x2222);
-    uint64_t base = key;
-    // texture units this program samples, known after its first translation (see stage_state_hash);
-    // once learned it never changes, so the program's hash entry keeps it
-    ProgramHash* ph = g_program_hash_last;
-    uint32_t unitMask = 0x3FFFF;
-    if (ph && ph->maskKey == base) {
-        unitMask = ph->unitMask;
-    } else {
-        std::lock_guard<std::mutex> lk(g_used_units_mu);
-        auto uu = g_used_units.find(base);
-        if (uu != g_used_units.end()) {
-            unitMask = uu->second;
-            if (ph) { ph->maskKey = base; ph->unitMask = unitMask; }
-        }
-    }
-    key = stage_state_hash(regs, key ^ (unitMask == 0x3FFFF ? 0 : 0x5EED0001u),
-                           vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask, vertex ? fs : nullptr);
+// the wide key (stage_state_hash): the shader keys before the narrow ones, still the name a shader
+// recipe's state resolves to in caches written before them. unitMask: the texture units the program
+// samples (all 18 until its first translation is known)
+static uint64_t wide_key(const uint32_t* regs, bool vertex, const LatteFetchShader* fs, uint64_t fsKey, uint64_t base,
+                         uint32_t unitMask) {
+    uint64_t key = stage_state_hash(regs, base ^ (unitMask == 0x3FFFF ? 0 : 0x5EED0001u),
+                                    vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS, unitMask,
+                                    vertex ? fs : nullptr);
     if (vertex) key ^= fsKey * 31;
     if (vertex && regs[mmVGT_STRMOUT_EN]) {  // stream out: the decompiler emits buffer writes with these strides
         // only the four stride registers (+4 apart): the buffer bases and write offsets between them
@@ -851,6 +862,13 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         for (int b = 0; b < 4; b++) strides[b] = regs[mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4];
         key = hash_bytes(strides, sizeof strides, key ^ 0x5717E0u);
     }
+    return key;
+}
+
+// WWHD_MTL_WIDE_SHADER_KEYS=1: one translation per wide key, as before the narrow keys (for comparisons)
+static Shader* get_shader_wide(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey, uint64_t base,
+                               uint32_t addr, uint32_t size, uint32_t unitMask) {
+    const uint64_t key = wide_key(regs, vertex, fs, fsKey, base, unitMask);
     auto it = g_shaders.find(key);
     if (it != g_shaders.end()) {
         // debug: WWHD_VERIFY_KEY=1 (with WWHD_KEEP_MSL=1) translates a lookup that hit an existing shader again and
@@ -914,6 +932,7 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     s->noPosition = vertex && !((const LatteContextRegister*)regs)->IsRasterizationEnabled();
     s->key = key;
     g_shaders[key] = s;
+    g_translations++;
     // new shaders during play are translated on worker threads, so a burst (entering a new area: hundreds
     // in one frame) runs on all cores instead of stalling the render thread; a draw whose shader is still
     // translating waits within the compile budget (wait_compiled), then is skipped for that frame.
@@ -932,6 +951,247 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         return s;
     }
     translate_shader(s, regs, vertex, fs, base, addr, size, false);
+    return s;
+}
+
+// ---------------------------------------------------------------- narrow shader keys
+// Two levels, as ZeldaWWHDRecomp's (ba509f2, after its Vulkan renderer; linkage words shared in
+// gfx/shader_linkage.h), plus what this port's MSL translation and graphic packs read:
+// - linkage: the program, the fetch shader (its key has the vertex strides, which choose between
+//   vertex-descriptor and manual fetch) and gfx::gather_shader_linkage (with graphic-pack shaders, the
+//   words their names hash: the whole VTE word, rect primitives); for vertex shaders also the whole PS
+//   input table (VertexOut declares every PS input, written or not), whether rasterization is enabled
+//   and rect emulation; for pixel shaders whether the depth buffer is active (the analyzer drops a
+//   depth export without it).
+// - variant: per texture unit the program samples, its dimension and integer format; for vertex
+//   shaders, per exported parameter its semantic id and the PS input it lands in, and the stream-out
+//   strides while stream out is on; for pixel shaders the data type of each colour buffer the shader
+//   mask enables (graphic packs: all eight) and, per sampled unit, the colour buffers it could read
+//   through framebuffer fetch (fetch_candidates). Units and exports come from the program's first
+//   translation (ProgramUse).
+// Render-target formats of targets the shader doesn't write or read, samplers (depth compare comes
+// from the instruction) and the vertex shader's export table in pixel-shader keys are not in the key:
+// the wide key had them, and every pairing and render target made a new translation. A shader is
+// named by its narrow key in the recipe files (Shader::key); replaying a record also maps the wide key
+// of its state to the shader, so caches and head starts written with wide keys keep resolving their
+// pipelines. WWHD_MTL_SHADER_KEY_VERIFY=1 translates again once per new wide key that the narrow key
+// gives an existing shader and compares the MSL and the binding metadata ("[gfx shader key]
+// VIOLATION"); WWHD_MTL_WIDE_SHADER_KEYS=1 brings back the wide key. gx2's register class table
+// (gx2/register_class.h) bumps the shader state generation for every register these words read.
+static LatteDecompilerShader* translate_msl(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t base, uint32_t addr,
+                                            uint32_t size);
+static uint64_t g_key_checks = 0, g_key_violations = 0;
+static std::unordered_set<uint64_t> g_verified_wide;
+
+static bool wide_shader_keys() {
+    static const bool on = [] { const char* e = getenv("WWHD_MTL_WIDE_SHADER_KEYS"); return e && *e && strcmp(e, "0"); }();
+    return on;
+}
+static bool key_verify() {
+    static const bool on = [] { const char* e = getenv("WWHD_MTL_SHADER_KEY_VERIFY"); return e && *e && strcmp(e, "0"); }();
+    return on;
+}
+
+static uint64_t linkage_key(const uint32_t* regs, bool vertex, const LatteFetchShader* fs, uint64_t seed) {
+    std::array<uint32_t, kShaderLinkageWords + 1 + GPU7_PS_MAX_INPUTS + 1> words;
+    size_t n = gather_shader_linkage(regs, vertex, fs, graphic_packs::has_shaders(), words.data());
+    const auto& lcr = *(const LatteContextRegister*)regs;
+    if (vertex) {
+        n += gather_ps_input_table(regs, words.data() + n);
+        words[n++] = (lcr.IsRasterizationEnabled() ? 1u : 0u) | (UseRectEmulation(lcr) ? 2u : 0u);
+    } else {
+        words[n++] = LatteMRT::GetActiveDepthBufferMask(lcr) ? 1u : 0u;
+    }
+    return hash_bytes(words.data(), n * 4, seed);
+}
+
+// The colour buffers active for a pixel shader writing `outputs` (LatteMRT::GetActiveColorBufferMask,
+// which starts from the shader's written outputs).
+static uint32_t active_color_buffers(const LatteContextRegister& lcr, const uint32_t* regs, uint32_t outputs) {
+    if (lcr.CB_COLOR_CONTROL.get_SPECIAL_OP() == Latte::LATTE_CB_COLOR_CONTROL::E_SPECIALOP::DISABLE) return 0;
+    const uint32_t channels = lcr.CB_TARGET_MASK.get_MASK();
+    const uint32_t scissorW = lcr.PA_SC_GENERIC_SCISSOR_BR.get_BR_X(), scissorH = lcr.PA_SC_GENERIC_SCISSOR_BR.get_BR_Y();
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(outputs & (1u << i)) || !((channels >> (i * 4)) & 0xF) || regs[mmCB_COLOR0_BASE + i] == 0) continue;
+        const uint32_t size = regs[mmCB_COLOR0_SIZE + i];
+        const uint32_t pitch = ((size & 0x3FF) + 1) << 3, height = ((((size >> 10) & 0xFFFFF) + 1) << 6) / pitch;
+        if (pitch < scissorW || height < scissorH) continue;
+        mask |= 1u << i;
+    }
+    return mask;
+}
+// The colour buffers a pixel shader's texture unit could read through framebuffer fetch: those the
+// analyzer matches (LatteDecompilerAnalyzer.cpp, "check if textures are used as render targets": same
+// address, format and tile mode, of a 2D single-mip texture) among the active colour buffers of every
+// output the shader mask enables. The analyzer takes the first match among the outputs the program
+// writes, which follow from the program and the shader mask (both in the key): this mask decides it.
+static uint32_t fetch_candidates(const LatteContextRegister& lcr, const uint32_t* regs, uint32_t active, uint32_t unit) {
+    const auto& tex = lcr.SQ_TEX_START_PS[unit];
+    const uint32_t physAddr = tex.word2.get_BASE_ADDRESS() << 8;
+    if (!physAddr || !active || tex.word0.get_DIM() != Latte::E_DIM::DIM_2D || tex.word5.get_LAST_LEVEL() != 0) return 0;
+    const auto format = LatteTexture_ReconstructGX2Format(tex.word1, tex.word4);
+    const uint32_t tileMode = (uint32_t)tex.word0.get_TILE_MODE();
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < 8; i++)
+        if ((active & (1u << i)) && (regs[mmCB_COLOR0_BASE + i] & 0xFFFFFF00) == physAddr &&
+            LatteMRT::GetColorBufferFormat(i, lcr) == format && ((regs[mmCB_COLOR0_INFO + i] >> 8) & 0xF) == tileMode)
+            m |= 1u << i;
+    return m;
+}
+
+static uint64_t variant_key(const uint32_t* regs, bool vertex, const ProgramUse& use, uint64_t linkage) {
+    std::array<uint32_t, LATTE_NUM_MAX_TEX_UNITS + 32 + 4 + 1> words;
+    size_t n = 0;
+    const auto& lcr = *(const LatteContextRegister*)regs;
+    const uint32_t texBase = vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+    uint32_t active = 0;
+    if (!vertex) {
+        // colour outputs the shader mask enables (graphic packs: every target's type is in their names)
+        uint32_t enabled = 0;
+        for (uint32_t i = 0; i < 8; i++)
+            if ((regs[mmCB_SHADER_MASK] >> (4 * i)) & 0xF) enabled |= 1u << i;
+        const uint32_t typed = graphic_packs::has_shaders() ? 0xFF : enabled;
+        uint32_t types = 0;
+        for (uint32_t i = 0; i < 8; i++)
+            if (typed & (1u << i)) types |= (uint32_t)GetColorBufferDataType(i, lcr) << (2 * i);
+        words[n++] = types;
+        active = active_color_buffers(lcr, regs, enabled);
+    }
+    for (uint32_t m = use.units & 0x3FFFF; m; m &= m - 1) {
+        const uint32_t unit = __builtin_ctz(m);
+        const uint32_t* w = regs + texBase + unit * 7;
+        // dimension (sampler type) and NUM_FORMAT_ALL == INT (integer sampler); analyzer.cpp
+        uint32_t word = (w[0] & 7) | (((w[4] >> 8) & 3) == 1 ? 8u : 0u);
+        if (!vertex) word |= fetch_candidates(lcr, regs, active, unit) << 8;
+        words[n++] = word;
+    }
+    if (vertex) {
+        // per exported parameter its semantic id and the PS input it lands in (location, flat,
+        // noperspective), as _emitVSOutputs resolves it against the PS input table
+        if (use.exports) {
+            const uint32_t control0 = regs[mmSPI_PS_IN_CONTROL_0];
+            const uint32_t inputs = std::min<uint32_t>(control0 & 0x3F, GPU7_PS_MAX_INPUTS);
+            const uint32_t position = (control0 >> 8) & 1 ? (control0 >> 10) & 0x1F : 0xFFFFFFFFu;
+            for (uint32_t i = 0; i < 32; ++i) {
+                if (!(use.exports & (1u << i))) continue;
+                const uint32_t semantic = (regs[mmSPI_VS_OUT_ID_0 + i / 4] >> (8 * (i % 4))) & 0xFF;
+                uint32_t word = 0x7F000000u | semantic;  // no PS input (the export still names its semantic)
+                for (uint32_t f = 0; f < inputs; ++f) {
+                    if (f == position) continue;
+                    const uint32_t control = regs[mmSPI_PS_INPUT_CNTL_0 + f];
+                    if ((control & 0xFF) != semantic) continue;
+                    word = 0x80000000u | semantic | (f << 8) | (control & (1u << 10) ? 1u << 16 : 0) | (control & (1u << 12) ? 1u << 17 : 0);
+                    break;
+                }
+                words[n++] = word;
+            }
+        }
+        if (regs[mmVGT_STRMOUT_EN])
+            for (uint32_t buffer = 0; buffer < 4; ++buffer) words[n++] = regs[mmVGT_STRMOUT_VTX_STRIDE_0 + buffer * 4];
+    }
+    return hash_bytes(words.data(), n * 4, linkage ^ 0xC2B2AE3D27D4EB4Full);
+}
+
+// verify mode: the shared shader against a translation under the current registers
+static void verify_key(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint32_t addr, uint32_t size, uint64_t base,
+                       uint64_t wide, const Shader* shared) {
+    if (shared->tstate.load(std::memory_order_acquire) == CS_PENDING || !shared->dec) return;  // still translating: next time
+    if (!g_verified_wide.insert(wide).second) return;
+    g_key_checks++;
+    LatteDecompilerShader* ref = translate_msl(regs, vertex, fs, base, addr, size);
+    const LatteDecompilerShader* a = shared->dec;
+    const char* why = nullptr;
+    if (!ref) why = "translation failed now";
+    else if (strcmp(ref->strBuf_shaderSource->c_str(), a->strBuf_shaderSource->c_str())) why = "MSL differs";
+    else if (memcmp(&ref->resourceMapping, &a->resourceMapping, sizeof a->resourceMapping)) why = "resource mapping differs";
+    else if (memcmp(ref->textureRenderTargetIndex, a->textureRenderTargetIndex, sizeof a->textureRenderTargetIndex) ||
+             memcmp(ref->textureUnitDim, a->textureUnitDim, sizeof a->textureUnitDim) ||
+             memcmp(ref->textureIsIntegerFormat, a->textureIsIntegerFormat, sizeof a->textureIsIntegerFormat) ||
+             memcmp(ref->textureUsesDepthCompare, a->textureUsesDepthCompare, sizeof a->textureUsesDepthCompare) ||
+             memcmp(ref->textureUnitSamplerAssignment, a->textureUnitSamplerAssignment, sizeof a->textureUnitSamplerAssignment) ||
+             ref->textureUnitListCount != a->textureUnitListCount ||
+             memcmp(ref->textureUnitList, a->textureUnitList, sizeof a->textureUnitList))
+        why = "texture metadata differs";
+    else if (ref->pixelColorOutputMask != a->pixelColorOutputMask || ref->depthMask != a->depthMask ||
+             ref->outputParameterMask != a->outputParameterMask)
+        why = "output metadata differs";
+    else {
+        const auto &u = ref->uniform, &v = a->uniform;
+        if (u.loc_remapped != v.loc_remapped || u.loc_uniformRegister != v.loc_uniformRegister ||
+            u.count_uniformRegister != v.count_uniformRegister || u.loc_windowSpaceToClipSpaceTransform != v.loc_windowSpaceToClipSpaceTransform ||
+            u.loc_alphaTestRef != v.loc_alphaTestRef || u.loc_pointSize != v.loc_pointSize || u.loc_fragCoordScale != v.loc_fragCoordScale ||
+            memcmp(u.loc_framebufferFetchSize, v.loc_framebufferFetchSize, sizeof u.loc_framebufferFetchSize) ||
+            u.uniformRangeSize != v.uniformRangeSize || u.list_ufTexRescale.size() != v.list_ufTexRescale.size() ||
+            ref->list_remappedUniformEntries_register.size() != a->list_remappedUniformEntries_register.size() ||
+            ref->list_remappedUniformEntries_bufferGroups.size() != a->list_remappedUniformEntries_bufferGroups.size())
+            why = "uniform layout differs";
+    }
+    if (why) {
+        g_key_violations++;
+        LOG("[gfx shader key] VIOLATION %s %08X wide %016llx (shared %016llx): %s", vertex ? "vs" : "ps", addr,
+            (unsigned long long)wide, (unsigned long long)shared->key, why);
+    }
+    if (ref) {
+        delete ref->strBuf_shaderSource;
+        delete ref;
+    }
+}
+
+static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
+    const uint32_t addr = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
+    const uint32_t size = regs[(vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS) + 1] << 3;
+    if (!addr || !size) return nullptr;
+    const uint64_t base = program_hash(addr, size) ^ (vertex ? 0x1111 : 0x2222);
+    ProgramUse use = program_use(base);
+    if (wide_shader_keys()) return get_shader_wide(regs, vertex, fs, fsKey, base, addr, size, use.units);
+    const uint64_t linkage = linkage_key(regs, vertex, fs, base ^ (vertex ? fsKey * 31 : 0));
+    // a program's first translation shows its units and exports, which the variant words need; until
+    // then (or when it failed) the linkage names its shader
+    uint64_t key = use.known ? variant_key(regs, vertex, use, linkage) : linkage;
+    auto it = g_shaders.find(key);
+    if (it != g_shaders.end()) {
+        Shader* shared = it->second;
+        // replayed records name shaders by their wide key: map it to the shader this state shares
+        if (g_cache_replaying || key_verify()) {
+            const uint64_t wide = wide_key(regs, vertex, fs, fsKey, base, use.units);
+            g_shaders.emplace(wide, shared);
+            if (key_verify() && !g_cache_replaying && wide != shared->key) verify_key(regs, vertex, fs, addr, size, base, wide, shared);
+        }
+        return shared;
+    }
+    const uint64_t wide = wide_key(regs, vertex, fs, fsKey, base, use.units);
+
+    auto* s = new Shader();
+    s->noPosition = vertex && !((const LatteContextRegister*)regs)->IsRasterizationEnabled();
+    s->key = key;
+    g_translations++;
+    // new shaders during play are translated on worker threads, so a burst (entering a new area: hundreds
+    // in one frame) runs on all cores instead of stalling the render thread; a draw whose shader is still
+    // translating waits within the compile budget (wait_compiled), then is skipped for that frame.
+    // Cache replay stays synchronous. WWHD_SYNC_TRANSLATE=1: translate in place (the old way).
+    static const bool asyncTranslate = !getenv("WWHD_SYNC_TRANSLATE");
+    // a program's first translation is made here: it tells which texture units the program samples and
+    // which parameters it exports, and every later variant's key depends on that. Later variants (the
+    // many) go to the workers.
+    if (asyncTranslate && !g_cache_replaying && !g_defer_compiles && use.known) {
+        g_shaders[key] = s;
+        cache_record_shader(regs, vertex);
+        s->tstate = CS_PENDING;
+        auto snap = std::make_shared<std::vector<uint32_t>>(regs, regs + 0x10000);  // the render thread moves on
+        dispatch_async(translate_queue(), ^{
+            translate_shader(s, snap->data(), vertex, fs, base, addr, size, true);
+        });
+        return s;
+    }
+    translate_shader(s, regs, vertex, fs, base, addr, size, false);
+    if (!use.known && s->dec) {
+        // learned now: the shader's name is its variant key (a failed translation stays under the linkage)
+        use = program_use(base);
+        if (use.known) s->key = key = variant_key(regs, vertex, use, linkage);
+    }
+    g_shaders[key] = s;  // (the recipe was recorded by translate_shader)
+    if (g_cache_replaying) g_shaders.emplace(wide, s);
     return s;
 }
 
@@ -1017,20 +1277,21 @@ static std::string graphic_pack_source(const LatteDecompilerShader& d, const uin
     }
     return src;
 }
-static void apply_graphic_pack(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint32_t addr, uint32_t size) {
-    if (!s->dec || !s->dec->strBuf_shaderSource) return;
+static void apply_graphic_pack(LatteDecompilerShader* dec, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint32_t addr,
+                               uint32_t size) {
+    if (!dec || !dec->strBuf_shaderSource) return;
     const char* stage = vertex ? "vs" : "ps";
     uint64_t base = 0, aux = 0;
-    const std::string src = graphic_pack_source(*s->dec, regs, vertex, fs, addr, size, base, aux);
+    const std::string src = graphic_pack_source(*dec, regs, vertex, fs, addr, size, base, aux);
     if (src.empty()) return;
-    const std::string ours = s->dec->strBuf_shaderSource->c_str();
+    const std::string ours = dec->strBuf_shaderSource->c_str();
     if (pack_interface(src) != pack_interface(ours)) {
         LOG("[gpack] %s %016llx_%016llx: interface differs from this port's translation, not replaced\n  pack: %s\n  ours: %s",
             stage, (unsigned long long)base, (unsigned long long)aux, pack_interface(src).c_str(), pack_interface(ours).c_str());
         return;
     }
-    s->dec->strBuf_shaderSource->reset();
-    s->dec->strBuf_shaderSource->add(std::string_view(src));
+    dec->strBuf_shaderSource->reset();
+    dec->strBuf_shaderSource->add(std::string_view(src));
     LOG("[gpack] %s %016llx_%016llx replaced (shader %08X)", stage, (unsigned long long)base, (unsigned long long)aux, addr);
 }
 
@@ -1044,50 +1305,20 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
         ~Publish() { if (async) compile_done(s->tstate, s->state.load() == CS_FAILED && !s->dec ? CS_FAILED : CS_READY); }
     } publish{s, async};
     double t0 = now_ms();
-    LatteShader_UpdatePSInputs((uint32*)regs);
-    LatteDecompilerOptions opt;
-    // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: black letter in the Rito
-    // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
-    static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
-    opt.strictMul = strictMul;
-    opt.useTFViaSSBO = true;  // stream out (BotW): the vertex shader writes guest memory through sb (see StreamoutDraw)
-    if (!vertex && graphic_packs::has_shaders())
-        opt.legacyGraphicPackUniforms = graphic_packs::has_base(cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr), false);
-    opt.emulateSamplerLodBias = true;  // Metal samplers have no LOD bias: the shader adds it (gfx/sampler_lod_bias.h)
-    LatteDecompilerOutput_t out{};
-    auto translate = [&] {
-        out = LatteDecompilerOutput_t{};
-        if (vertex)
-            LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
-        else
-            LatteDecompiler_DecompilePixelShader(base, (uint32*)regs, mem::ptr(addr), size, opt, &out);
-        return out.shader && !out.shader->hasError && out.shader->strBuf_shaderSource;
-    };
-    bool ok = translate();
-    if (ok && graphic_packs::has_shaders() &&
-        std::any_of(std::begin(out.uniformOffsetsVK.offset_texLodBias), std::end(out.uniformOffsetsVK.offset_texLodBias),
-                    [](sint32 o) { return o >= 0; })) {
-        uint64_t packBase, packAux;
-        if (!graphic_pack_source(*out.shader, regs, vertex, fs, addr, size, packBase, packAux).empty()) {
-            // a graphic pack replaces this shader: translate it as Cemu does, so its interface matches
-            delete out.shader->strBuf_shaderSource;
-            delete out.shader;
-            opt.emulateSamplerLodBias = false;
-            ok = translate();
-        }
-    }
-    if (!ok) {
+    s->dec = translate_msl(regs, vertex, fs, base, addr, size);
+    if (!s->dec) {
         LOG("[gfx] %s shader %08X failed to translate", vertex ? "vertex" : "pixel", addr);
         s->state = CS_FAILED;
         return;
     }
-    s->dec = FinishDecompiledShader(out);
-    apply_graphic_pack(s, regs, vertex, fs, addr, size);
     {
-        uint32_t m = 0;
-        for (int u = 0; u < s->dec->textureUnitListCount; u++) m |= 1u << s->dec->textureUnitList[u];
+        ProgramUse use;
+        use.units = 0;
+        for (int u = 0; u < s->dec->textureUnitListCount; u++) use.units |= 1u << s->dec->textureUnitList[u];
+        use.exports = vertex ? s->dec->outputParameterMask : 0;
+        use.known = true;
         std::lock_guard<std::mutex> lk(g_used_units_mu);
-        g_used_units.emplace(base, m);  // the first translation's units (later ones don't replace them)
+        g_program_uses.emplace(base, use);  // the first translation's (later ones don't replace it)
     }
     if (!async) cache_record_shader(regs, vertex);
     double t1 = now_ms();
@@ -1131,6 +1362,47 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
     }
     static std::atomic<uint32_t> count{0};
     if (++count % 100 == 0) LOG("[gfx] %u shaders translated", count.load());
+}
+
+// GX2 program -> MSL, graphic pack replacement applied; nullptr if the translation failed. Any thread.
+static LatteDecompilerShader* translate_msl(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t base, uint32_t addr,
+                                            uint32_t size) {
+    LatteShader_UpdatePSInputs((uint32*)regs);
+    LatteDecompilerOptions opt;
+    // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: black letter in the Rito
+    // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
+    static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
+    opt.strictMul = strictMul;
+    opt.useTFViaSSBO = true;  // stream out (BotW): the vertex shader writes guest memory through sb (see StreamoutDraw)
+    if (!vertex && graphic_packs::has_shaders())
+        opt.legacyGraphicPackUniforms = graphic_packs::has_base(cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr), false);
+    opt.emulateSamplerLodBias = true;  // Metal samplers have no LOD bias: the shader adds it (gfx/sampler_lod_bias.h)
+    LatteDecompilerOutput_t out{};
+    auto translate = [&] {
+        out = LatteDecompilerOutput_t{};
+        if (vertex)
+            LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
+        else
+            LatteDecompiler_DecompilePixelShader(base, (uint32*)regs, mem::ptr(addr), size, opt, &out);
+        return out.shader && !out.shader->hasError && out.shader->strBuf_shaderSource;
+    };
+    bool ok = translate();
+    if (ok && graphic_packs::has_shaders() &&
+        std::any_of(std::begin(out.uniformOffsetsVK.offset_texLodBias), std::end(out.uniformOffsetsVK.offset_texLodBias),
+                    [](sint32 o) { return o >= 0; })) {
+        uint64_t packBase, packAux;
+        if (!graphic_pack_source(*out.shader, regs, vertex, fs, addr, size, packBase, packAux).empty()) {
+            // a graphic pack replaces this shader: translate it as Cemu does, so its interface matches
+            delete out.shader->strBuf_shaderSource;
+            delete out.shader;
+            opt.emulateSamplerLodBias = false;
+            ok = translate();
+        }
+    }
+    if (!ok) return nullptr;
+    LatteDecompilerShader* dec = FinishDecompiledShader(out);
+    apply_graphic_pack(dec, regs, vertex, fs, addr, size);
+    return dec;
 }
 
 // ---------------------------------------------------------------- conversions
@@ -1191,7 +1463,7 @@ struct Pipeline {
 static std::unordered_map<uint64_t, Pipeline*> g_pipelines;
 // for the hitch log (metal_main.mm): shader and pipeline work so far
 void compile_counters(size_t* shaders, size_t* pipelines, double* decompileMs, double* mslMs) {
-    *shaders = g_shaders.size();
+    *shaders = g_translations;
     *pipelines = g_pipelines.size();
     *decompileMs = g_t_decompile;
     *mslMs = g_t_msl;
@@ -2616,9 +2888,9 @@ static void cache_load() {
             uint64_t fsKey = 0;
             LatteFetchShader* fs = vertex ? get_fetch_shader(regs.data(), &fsKey) : nullptr;
             if (vertex && !fs) continue;
-            const size_t before = g_shaders.size();
+            const size_t before = g_translations;
             get_shader_uncached(regs.data(), vertex, fs, fsKey);
-            if (g_shaders.size() > before) keepShaders.push_back(Rec{{hdr[0], hdr[1], hdr[2]}, std::move(comp)});
+            if (g_translations > before) keepShaders.push_back(Rec{{hdr[0], hdr[1], hdr[2]}, std::move(comp)});
             shaders++;
         }
         fclose(f);
@@ -2637,10 +2909,26 @@ static void cache_load() {
                 bool ok = true;
                 for (auto& rec : keepShaders)
                     ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 && fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
-                for (auto& [r, rec] : keepPipelines)
-                    if (g_shaders.count(r.vsKey) && g_shaders.count(r.psKey) && g_fetch.count(r.fsKey))
-                        ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 &&
-                             fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
+                // pipelines name their shaders as the shaders are named now: a recipe naming a wide key (a cache
+                // from before the narrow keys) may name a shader whose own recipe was dropped as a duplicate
+                std::unordered_set<uint64_t> written;
+                for (auto& [r, rec] : keepPipelines) {
+                    auto vi = g_shaders.find(r.vsKey), pi = g_shaders.find(r.psKey);
+                    if (vi == g_shaders.end() || pi == g_shaders.end() || !g_fetch.count(r.fsKey)) continue;
+                    PipelineRecipe named = r;
+                    named.vsKey = vi->second->key;
+                    named.psKey = pi->second->key;
+                    if (!written.insert(hash_bytes(&named, sizeof named)).second) continue;  // the same pipeline
+                    if (named.vsKey != r.vsKey || named.psKey != r.psKey) {
+                        uLongf csize = compressBound(sizeof named);
+                        rec.comp.resize(csize);
+                        if (compress2(rec.comp.data(), &csize, (const Bytef*)&named, sizeof named, 6) != Z_OK) continue;
+                        rec.comp.resize(csize);
+                        rec.hdr[1] = sizeof named;
+                        rec.hdr[2] = (uint32_t)csize;
+                    }
+                    ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 && fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
+                }
                 ok = fclose(o) == 0 && ok;
                 if (ok && rename(tmp.c_str(), path.c_str()) == 0)
                     LOG("[gfx] shader cache compacted: %zu of %zu records kept (%zu shaders, %zu pipelines)", kept, records,
@@ -2657,10 +2945,11 @@ static void cache_load() {
     if (shaders || pipelines) {
         size_t srcBytes = 0, programs = 0;
         std::unordered_set<uint64_t> bases;
+        std::unordered_set<const Shader*> seen;  // g_shaders also maps wide keys to the shaders they share
         for (auto& [k, sh] : g_shaders)
-            if (sh && sh->dec && sh->dec->strBuf_shaderSource) srcBytes += sh->dec->strBuf_shaderSource->getLen();
-        LOG("[gfx] shader cache: replayed %zu shaders, %zu pipelines queued (%.0f ms) from %s; %.0f MiB of shader source held",
-            shaders, pipelines, now_ms() - t0, path.c_str(), srcBytes / 1048576.0);
+            if (sh && sh->dec && sh->dec->strBuf_shaderSource && seen.insert(sh).second) srcBytes += sh->dec->strBuf_shaderSource->getLen();
+        LOG("[gfx] shader cache: replayed %zu shaders (%zu translations), %zu pipelines queued (%.0f ms) from %s; %.0f MiB of shader source held",
+            shaders, g_translations, pipelines, now_ms() - t0, path.c_str(), srcBytes / 1048576.0);
         (void)programs;
         (void)bases;
     }
@@ -2839,8 +3128,11 @@ void report_skips() {
         if (g_skip[i]) n += snprintf(buf + n, sizeof buf - n, " %s=%llu", kSkipNames[i], (unsigned long long)g_skip[i]);
     if (n) LOG("[gfx] skipped draws:%s", buf);
     if (g_streamout_draws) LOG("[gfx] stream-out draws so far: %llu (%llu without a render target)", (unsigned long long)g_streamout_draws, (unsigned long long)g_streamout_notarget);
-    LOG("[gfx] %zu shaders, %zu pipelines; ms decompile %.0f, msl %.0f, pipeline %.0f", g_shaders.size(), g_pipelines.size(),
+    LOG("[gfx] %zu shaders (%zu names), %zu pipelines; ms decompile %.0f, msl %.0f, pipeline %.0f", g_translations, g_shaders.size(), g_pipelines.size(),
         g_t_decompile, g_t_msl, g_t_pipeline);
+    if (g_key_checks)
+        LOG("[gfx shader key] %llu wide keys verified, %llu violations", (unsigned long long)g_key_checks,
+            (unsigned long long)g_key_violations);
     if (g_must_run_waits)
         LOG("[gfx] draws that waited for their compile (targets not redrawn every frame): %llu, %.0f ms in all",
             (unsigned long long)g_must_run_waits, g_must_run_wait_ms);

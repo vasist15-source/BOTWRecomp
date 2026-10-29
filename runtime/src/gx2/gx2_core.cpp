@@ -24,6 +24,8 @@
 #include "gx2_cmd.h"
 #include "gx2_regs.h"
 #include "register_blocks.h"
+#include "register_class.h"
+#include "thread_identity.h"
 #include "gx2_texture_regs.h"
 #ifdef WWHD_HAS_VULKAN
 #include "shader_key_dirty.h"
@@ -55,104 +57,80 @@ uint32* regs() { return g_regs; }
 // addresses and rewrites of an identical value don't count.
 extern "C" { uint64_t g_shader_state_gen = 1; }
 
-static bool shader_irrelevant(uint32 reg) {
+// shader_irrelevant_reg (register_class.h); WWHD_VK_SHADER_ADDRESS_MEMO=1 (Vulkan) adds the texture
+// address words, which bind_stage resolves freshly
+static bool shader_address_memo() {
 #ifdef WWHD_HAS_VULKAN
-    // Vulkan resolves texture addresses freshly in bind_stage. These words do
-    // not participate in shader translation; keep Metal's broader dirty gate.
-    static const bool addressMemo = [] {
-        const char* e = getenv("WWHD_VK_SHADER_ADDRESS_MEMO");
-        return render::vulkan() && e && !strcmp(e, "1");
-    }();
-    if (addressMemo)
-        for (uint32 base : {uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS),
-                            uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS),
-                            uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_GS)})
-            if (reg >= base && reg < base + 7 * 18) {
-                uint32 word = (reg - base) % 7;
-                if (word == 2 || word == 3) return true;
-            }
-#endif
-    if (reg >= mmSQ_ALU_CONSTANT0_0 && reg < mmSQ_ALU_CONSTANT0_0 + 0x1000) return true;
-    for (uint32 base : {(uint32)mmSQ_VTX_UNIFORM_BLOCK_START, (uint32)mmSQ_PS_UNIFORM_BLOCK_START, (uint32)mmSQ_GS_UNIFORM_BLOCK_START})
-        if (reg >= base && reg < base + 7 * 16) return true;
-    if (reg >= mmSQ_VTX_ATTRIBUTE_BLOCK_START && reg < mmSQ_VTX_ATTRIBUTE_BLOCK_START + 7 * 16) {
-        uint32 w = (reg - mmSQ_VTX_ATTRIBUTE_BLOCK_START) % 7;
-        return w != 2;  // word 2 holds the stride
-    }
+    const char* e = getenv("WWHD_VK_SHADER_ADDRESS_MEMO");
+    return render::vulkan() && e && !strcmp(e, "1");
+#else
     return false;
+#endif
 }
-// Metal: whether a texture or sampler register write can change a shader key (metal_draw.mm's
-// stage_state_hash reads, for texture units 0-17 of the vertex and pixel stages: the type and format
-// bits, and whether the texture's address is a bound colour buffer; for their samplers, the
-// depth-compare bits). Draws rebind textures constantly, and every rebind used to make the next draw
-// recompute both shader keys (~9% of the render thread in busy scenes). WWHD_SHADER_KEY_ALL_TEX=1:
-// every texture write counts, as before.
-static bool metal_key_changes(uint32 reg, uint32 old, uint32 val) {
-    static const bool all = getenv("WWHD_SHADER_KEY_ALL_TEX") != nullptr;
-    if (all) return true;
-    for (uint32 base : {uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS), uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS)}) {
-        if (reg < base || reg >= base + 7 * 160) continue;
-        const uint32 unit = (reg - base) / 7, word = (reg - base) % 7;
-        if (unit >= 18) return false;
-        switch (word) {
-        case 0: return ((old ^ val) & 7) != 0;
-        case 1: return ((old ^ val) & 0x3F00000) != 0;
-        case 4: return ((old ^ val) & 0x300) != 0;
-        case 2: {  // framebuffer fetch: the address against the bound colour buffers (as stage_state_hash)
-            auto fb = [](uint32 w2) {
-                const uint32 b = w2 << 8;
-                if (!b) return 0u;
-                for (uint32 i = 0; i < 8; i++)
-                    if (b == (g_regs[mmCB_COLOR0_BASE + i] & ~0xFFu)) return i + 1;
-                return 0u;
-            };
-            return fb(old) != fb(val);
-        }
-        default: return false;  // mip address, swizzle/LOD words
-        }
+
+// ---------------------------------------------------------------- register classes
+// register_class.h: per-register tables built on the first register command (the renderer is chosen by
+// then), with the switches the apply paths read, so they are not looked up per write. Metal: whether a
+// register write can change a shader key (metal_key_changes_ref). Draws rebind textures constantly, and
+// every rebind used to make the next draw recompute both shader keys (~9% of the render thread in busy
+// scenes); viewport, scissor, blend and stencil changes did the same. WWHD_SHADER_KEY_ALL_TEX=1: every
+// shader-relevant write counts; WWHD_SHADER_KEY_ALL_REGS=1: every register outside the texture units.
+static RegisterClasses g_reg_classes;
+static const uint8* const g_reg_class = g_reg_classes.cls;
+static bool g_reg_tables_ready = false;
+static bool g_classify = false;  // the render-thread profiler's draw classifier (rprof::classify_on())
+#ifdef WWHD_HAS_VULKAN
+static ShaderKeyBits g_vk_key_bits;   // vulkan_shader_key_mask with WWHD_VK_SHADER_KEY_DIRTY=1
+static bool g_fused_small = false;    // Vulkan: the per-word path for writes of up to 16 words
+static bool g_key_dirty = false;      // WWHD_VK_SHADER_KEY_DIRTY=1 (Vulkan)
+static bool g_collect_stats = false;  // WWHD_VK_STATS (Vulkan)
+#else
+static constexpr bool g_collect_stats = false;
+#endif
+
+static void build_reg_tables() {
+    MetalKeyOptions o;
+    const char* wide = getenv("WWHD_MTL_WIDE_SHADER_KEYS");
+    o.wideKeys = wide && strcmp(wide, "0");
+    o.allTex = getenv("WWHD_SHADER_KEY_ALL_TEX") != nullptr;
+    o.allRegs = getenv("WWHD_SHADER_KEY_ALL_REGS") != nullptr;
+    g_reg_classes.build(shader_address_memo(), o, [](uint32 r) { return rprof::fast_class_reg(r); });
+    g_classify = rprof::classify_on();
+#ifdef WWHD_HAS_VULKAN
+    const char* e = getenv("WWHD_VK_FUSE_SMALL_REGS");
+    // Enabled by default; explicit zero retains the original bulk path.
+    g_fused_small = render::vulkan() && (!e || strcmp(e, "0") != 0);
+    e = getenv("WWHD_VK_SHADER_KEY_DIRTY");
+    g_key_dirty = render::vulkan() && e && !strcmp(e, "1");
+    g_collect_stats = render::vulkan() && getenv("WWHD_VK_STATS") != nullptr;
+    if (g_key_dirty) g_vk_key_bits.build(vulkan_shader_key_mask);
+#endif
+    g_reg_tables_ready = true;
+}
+static inline void ensure_reg_tables() {
+    if (__builtin_expect(!g_reg_tables_ready, 0)) build_reg_tables();
+}
+static inline void classify_reg(uint8 cls, uint32 reg) {  // render-thread profiler's draw classifier
+    if (cls & kRcProfFast) rprof::g_reg_dirty |= 1;
+    else rprof::note_other_reg(reg);
+}
+// a write (old != value) can change a shader key
+static inline bool key_changes(uint32 reg, uint32 old, uint32 value) {
+    if (g_reg_class[reg] & kRcShaderIrrelevant) return false;
+#ifdef WWHD_HAS_VULKAN
+    if (render::vulkan()) return !g_key_dirty || g_vk_key_bits.changed(reg, old, value);
+#endif
+    return g_reg_classes.metal_key_changes(reg, old, value, g_regs);
+}
+
+// register writes copy a few words mostly (display lists set registers in groups of 1-7): short ones
+// are copied inline instead of calling memcpy
+static inline void copy_words(uint32* d, const uint32* v, uint32 n) {
+    if (n > 8) {
+        memcpy(d, v, n * 4);
+        return;
     }
-    if (reg >= uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_GS) && reg < uint32(REGADDR::SQ_TEX_RESOURCE_WORD0_N_GS) + 7 * 160)
-        return false;  // geometry shaders aren't translated
-    if (reg >= uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0) && reg < uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0) + 3 * 18 * 3) {
-        const uint32 word = (reg - uint32(REGADDR::SQ_TEX_SAMPLER_WORD0_0)) % 3;
-        return word == 0 && ((old ^ val) & 0xF8000000) != 0;
-    }
-    // everything else: only the registers the shader key reads (metal_draw.mm get_shader_uncached and
-    // stage_state_hash). Viewport, scissor, blend, stencil and the like changed on most draws and made
-    // every draw recompute both keys. WWHD_SHADER_KEY_ALL_REGS=1: every register counts, as before.
-    static const bool allRegs = getenv("WWHD_SHADER_KEY_ALL_REGS") != nullptr;
-    if (allRegs) return true;
-    static const std::vector<bool> keyRegs = [] {
-        std::vector<bool> k(kNumRegs);
-        auto add = [&](uint32 first, uint32 count) { for (uint32 r = first; r < first + count && r < kNumRegs; r++) k[r] = true; };
-        add(mmSQ_PGM_START_VS, 2);
-        add(mmSQ_PGM_START_PS, 2);
-        add(mmSQ_PGM_START_FS, 2);
-        add(mmVGT_STRMOUT_EN, 1);
-        for (uint32 b = 0; b < 4; b++) add(mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4, 1);
-        add(mmSQ_VTX_SEMANTIC_0, 32);
-        add(mmSPI_VS_OUT_ID_0, 10);
-        add(mmSPI_VS_OUT_CONFIG, 1);
-        add(mmPA_CL_VS_OUT_CNTL, 1);
-        add(mmSPI_PS_IN_CONTROL_0, 2);
-        add(mmSPI_PS_INPUT_CNTL_0, 32);
-        add(uint32(REGADDR::SQ_CONFIG), 1);
-        add(mmCB_SHADER_MASK, 1);
-        add(mmCB_SHADER_CONTROL, 1);
-        add(mmDB_SHADER_CONTROL, 1);
-        add(mmSPI_INPUT_Z, 1);
-        add(uint32(REGADDR::SX_ALPHA_TEST_CONTROL), 1);
-        add(uint32(REGADDR::PA_CL_VTE_CNTL), 1);
-        add(uint32(REGADDR::PA_CL_CLIP_CNTL), 1);
-        add(uint32(REGADDR::PA_SU_SC_MODE_CNTL), 1);  // both faces culled: rasterization off
-        add(uint32(REGADDR::CB_COLOR_CONTROL), 1);
-        add(uint32(REGADDR::CB_TARGET_MASK), 1);
-        add(mmCB_COLOR0_INFO, 8);
-        add(mmCB_COLOR0_BASE, 8);
-        add(uint32(REGADDR::DB_DEPTH_CONTROL), 1);
-        return k;
-    }();
-    return reg < kNumRegs && keyRegs[reg];
+    for (uint32 i = 0; i < n; ++i) d[i] = v[i];
 }
 // debug: WWHD_GEN_STATS=1 logs, every 20000 bumps, which registers bumped the shader generation
 static void note_gen_bump(uint32 reg) {
@@ -178,35 +156,27 @@ ShaderKeyDirtyStats shader_key_dirty_stats() { return shaderKeyDirtyStats; }
 
 #ifdef WWHD_HAS_VULKAN
 static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
-    static const bool keyDirty = [] {
-        const char* e = getenv("WWHD_VK_SHADER_KEY_DIRTY");
-        return e && !strcmp(e, "1");
-    }();
-    static const bool collectStats = getenv("WWHD_VK_STATS") != nullptr;
-    const bool classify = rprof::classify_on();
+    const bool keyDirty = g_key_dirty, collectStats = g_collect_stats, classify = g_classify;
     bool changed = false, baselineBump = false, actualBump = false;
     uint64_t maskedWords = 0;
     for (uint32 i = 0; i < n; ++i) {
         const uint32 reg = first + i, value = v[i], old = g_regs[reg];
         if (old != value) {
+            const uint8 cls = g_reg_class[reg];
             changed = true;
-            if (classify) {
-                if (rprof::fast_class_reg(reg)) rprof::g_reg_dirty |= 1;
-                else rprof::note_other_reg(reg);
-            }
-            if ((collectStats || !actualBump) && !shader_irrelevant(reg)) {
+            if (classify) classify_reg(cls, reg);
+            if ((collectStats || !actualBump) && !(cls & kRcShaderIrrelevant)) {
                 baselineBump = true;
-                uint32 mask;
-                if (keyDirty && vulkan_shader_key_mask(reg, mask) && !((old ^ value) & mask)) {
+                if (keyDirty && !g_vk_key_bits.changed(reg, old, value)) {
                     if (collectStats) ++maskedWords;
                 } else actualBump = true;
             }
             g_regs[reg] = value;
         }
-        // Shadow can differ even when registers already match: draw mutates
-        // primitive type directly, and context setup initializes only shadow.
-        if (g_shadow) g_shadow[reg] = value;
     }
+    // Shadow can differ even when registers already match: draw mutates
+    // primitive type directly, and context setup initializes only shadow.
+    if (g_shadow && g_shadow != v) copy_words(&g_shadow[first], v, n);
     if (actualBump) ++g_shader_state_gen;
     if (changed && collectStats) {
         ++shaderKeyDirtyStats.changedBatches;
@@ -220,41 +190,41 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
 
 static void apply_regs(uint32 first, const uint32* v, uint32 n) {
     if (first >= kNumRegs || n > kNumRegs - first) return;
+    ensure_reg_tables();
     g_register_blocks.touch(first, n);
+    // ALU constants (uniform registers, most of the register traffic): shader-irrelevant and a
+    // buffer/constant word for the draw classifier, nothing to decide per word: compare and copy.
+    // (Not with WWHD_VK_STATS, which counts these batches too.)
+    if (first >= mmSQ_ALU_CONSTANT0_0 && first + n <= mmSQ_ALU_CONSTANT0_0 + 0x1000 && !g_collect_stats) {
+        uint32* d = &g_regs[first];
+        if (memcmp(d, v, n * 4) != 0) {
+            if (g_classify) rprof::g_reg_dirty |= 1;
+            copy_words(d, v, n);
+        }
+        if (g_shadow && g_shadow != v) copy_words(&g_shadow[first], v, n);
+        return;
+    }
 #ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
-    static const bool fusedSmall = [] {
-        const char* e = getenv("WWHD_VK_FUSE_SMALL_REGS");
-        // Enabled by default; explicit zero retains the original bulk path.
-        return render::vulkan() && (!e || strcmp(e, "0") != 0);
-    }();
-    if (fusedSmall && n <= 16) {
+    if (g_fused_small && n <= 16) {
         apply_small_regs(first, v, n);
         return;
     }
 #endif
     if (memcmp(&g_regs[first], v, n * 4) != 0) {
-        if (rprof::classify_on())  // draw classifier (render_prof.h)
+        if (g_classify)  // draw classifier (render_prof.h)
             for (uint32 i = 0; i < n; i++)
-                if (g_regs[first + i] != v[i]) {
-                    if (rprof::fast_class_reg(first + i)) rprof::g_reg_dirty |= 1;
-                    else rprof::note_other_reg(first + i);
-                }
+                if (g_regs[first + i] != v[i]) classify_reg(g_reg_class[first + i], first + i);
 #ifdef WWHD_HAS_VULKAN
-        static const bool keyDirty = [] {
-            const char* value = getenv("WWHD_VK_SHADER_KEY_DIRTY");
-            return render::vulkan() && value && !strcmp(value, "1");
-        }();
-        static const bool collectStats = render::vulkan() && getenv("WWHD_VK_STATS") != nullptr;
-        if(keyDirty || collectStats) {
+        if(g_key_dirty || g_collect_stats) {
+            const bool collectStats = g_collect_stats;
             bool baselineBump = false, actualBump = false;
             uint64_t maskedWords = 0;
             for(uint32 i = 0; i < n; ++i) {
                 uint32 reg = first + i;
-                if(g_regs[reg] == v[i] || shader_irrelevant(reg)) continue;
+                if(g_regs[reg] == v[i] || (g_reg_class[reg] & kRcShaderIrrelevant)) continue;
                 baselineBump = true;
-                uint32 mask;
-                if(keyDirty && vulkan_shader_key_mask(reg, mask) && !((g_regs[reg] ^ v[i]) & mask)) {
+                if(g_key_dirty && !g_vk_key_bits.changed(reg, g_regs[reg], v[i])) {
                     if(collectStats) ++maskedWords;
                 } else actualBump = true;
                 if(actualBump && !collectStats) break;
@@ -271,36 +241,79 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
         } else
 #endif
         {
-            // one pass over the changed span: the shader-generation check (constants and uniform/attribute
-            // block words skip it by table) and only the changed words copied
-            static uint8_t keyReg[kNumRegs];
-            static const bool keyRegInit = [] {
-                for (uint32 r = 0; r < kNumRegs; r++) keyReg[r] = !shader_irrelevant(r);
-                return true;
-            }();
-            (void)keyRegInit;
+            // one pass over the changed span: the shader-generation check (by table) and only the
+            // changed words copied
             uint32 lo = 0;
             while (g_regs[first + lo] == v[lo]) lo++;  // memcmp found a difference
             uint32 hi = n - 1;
             while (g_regs[first + hi] == v[hi]) hi--;
-            bool bumped = false;
-            for (uint32 i = lo; i <= hi && !bumped; i++)
-                if (g_regs[first + i] != v[i] && keyReg[first + i] && metal_key_changes(first + i, g_regs[first + i], v[i])) {
+            for (uint32 i = lo; i <= hi; i++)
+                if (g_regs[first + i] != v[i] && key_changes(first + i, g_regs[first + i], v[i])) {
                     g_shader_state_gen++;
                     note_gen_bump(first + i);
-                    bumped = true;
+                    break;
                 }
-            memcpy(&g_regs[first + lo], v + lo, (hi - lo + 1) * 4);
+            copy_words(&g_regs[first + lo], v + lo, hi - lo + 1);
         }
     }
-    if (g_shadow && g_shadow != v) memcpy(&g_shadow[first], v, n * 4);
+    if (g_shadow && g_shadow != v) copy_words(&g_shadow[first], v, n);
 }
 
 // ---------------------------------------------------------------- display list recording
-struct Recording {
+// Display lists being recorded: one slot per recording thread, found by the thread's identity
+// (pthread_self) instead of a thread_local, which cost a TLS lookup on every emit of every thread. A
+// slot is written only by its owner; an emit while no thread records skips the scan. Ported from
+// ZeldaWWHDRecomp bde7fb1 (idea from the GreenNaugahyde Android fork v0.9.5).
+struct alignas(64) Recording {
     uint32 start = 0, pos = 0, end = 0;
 };
-static thread_local Recording t_rec;
+constexpr int kMaxRecorders = 64;
+alignas(64) static std::atomic<uintptr_t> g_rec_owner[kMaxRecorders];
+static Recording g_recs[kMaxRecorders];
+alignas(64) static std::atomic<int> g_recording{0};  // slots in use
+static std::atomic<int> g_rec_slots{0};               // slots ever claimed (the scan's end)
+static inline Recording* find_rec(uintptr_t id) {
+    for (int i = 0, n = g_rec_slots.load(std::memory_order_relaxed); i < n; i++)
+        if (g_rec_owner[i].load(std::memory_order_relaxed) == id) return &g_recs[i];
+    return nullptr;
+}
+// the display list this thread is recording, or nullptr
+static inline Recording* recording() {
+    if (!g_recording.load(std::memory_order_relaxed)) return nullptr;
+    return find_rec(thread_identity());
+}
+static Recording* claim_rec() {
+    const uintptr_t id = thread_identity();
+    if (Recording* r = find_rec(id)) return r;
+    for (int i = 0; i < kMaxRecorders; i++) {
+        uintptr_t free = 0;
+        if (g_rec_owner[i].compare_exchange_strong(free, id)) {
+            int n = g_rec_slots.load();
+            while (n < i + 1 && !g_rec_slots.compare_exchange_weak(n, i + 1)) {}
+            g_recording++;
+            return &g_recs[i];
+        }
+    }
+    LOG("[gx2] too many threads recording display lists");
+    return nullptr;
+}
+static void release_rec(Recording* r) {
+    *r = Recording{};
+    g_rec_owner[r - g_recs].store(0);
+    g_recording--;
+}
+// a command of `words` words (header included) goes into the recording display list: where it is
+// written, or nullptr if it doesn't fit (dropped)
+static inline uint32* record_space(Recording* rec, uint32 words) {
+    const uint32 bytes = 4 * words;
+    if (rec->pos + bytes > rec->end) {
+        LOG("[gx2] display list overflow at %08X", rec->start);
+        return nullptr;
+    }
+    uint32* w = (uint32*)mem::ptr(rec->pos);
+    rec->pos += bytes;
+    return w;
+}
 
 static void execute_one(Op op, const uint32* p, uint32 n);
 
@@ -363,9 +376,12 @@ static void render_thread_main() {
     }
 }
 
-static void enqueue(Op op, const uint32* payload, uint32 n) {
+static void start_render_thread() {
     static std::once_flag once;
     std::call_once(once, [] { std::thread([] { exception_report::boundary("GX2 render thread", render_thread_main); }).detach(); });
+}
+static void enqueue(Op op, const uint32* payload, uint32 n) {
+    start_render_thread();
     bool wake;
     {
         std::lock_guard<std::mutex> lk(g_q_mutex);
@@ -374,6 +390,18 @@ static void enqueue(Op op, const uint32* payload, uint32 n) {
         wake = g_q_waiting;
     }
     if (wake) g_q_cv.notify_one();  // after unlocking: the woken render thread would block on the mutex at once
+}
+static void enqueue_regs(uint32 first, const uint32* values, uint32 count) {  // OP_SET_REGS {first, values...}
+    start_render_thread();
+    bool wake;
+    {
+        std::lock_guard<std::mutex> lk(g_q_mutex);
+        g_q_pending.push_back(OP_SET_REGS | ((count + 1) << 8));
+        g_q_pending.push_back(first);
+        g_q_pending.insert(g_q_pending.end(), values, values + count);
+        wake = g_q_waiting;
+    }
+    if (wake) g_q_cv.notify_one();
 }
 
 // block the game thread until the render thread has executed everything queued so far
@@ -428,16 +456,11 @@ static void render_sync(int site = kSyncShutdown) {
 
 static std::atomic<uint64_t> g_draws_executed{0};  // render thread; the frame-rate code tells loading screens apart
 void emit(Op op, const uint32* payload, uint32 n) {
-    if (t_rec.start) {
-        uint32 bytes = 4 * (n + 1);
-        if (t_rec.pos + bytes > t_rec.end) {
-            LOG("[gx2] display list overflow at %08X", t_rec.start);
-            return;
+    if (Recording* rec = recording(); rec && rec->start) {
+        if (uint32* w = record_space(rec, n + 1)) {
+            w[0] = op | (n << 8);
+            memcpy(w + 1, payload, n * 4);
         }
-        uint32* w = (uint32*)mem::ptr(t_rec.pos);
-        w[0] = op | (n << 8);
-        memcpy(w + 1, payload, n * 4);
-        t_rec.pos += bytes;
         return;
     }
     if (g_render_thread) {
@@ -473,11 +496,24 @@ void checkpoint_vulkan_caches() {
 
 void set_regs(uint32 first, const uint32* values, uint32 count) {
     if (!count) return;
-    static thread_local std::vector<uint32> buf;
-    buf.resize(count + 1);
+    // the command is the first register and the values: written in place (no staging copy)
+    const uint32 n = count + 1;
+    if (Recording* rec = recording(); rec && rec->start) {
+        if (uint32* w = record_space(rec, n + 1)) {
+            w[0] = OP_SET_REGS | (n << 8);
+            w[1] = first;
+            memcpy(w + 2, values, count * 4);
+        }
+        return;
+    }
+    if (g_render_thread) {
+        enqueue_regs(first, values, count);
+        return;
+    }
+    std::vector<uint32> buf(n);  // WWHD_NO_RENDER_THREAD (debug)
     buf[0] = first;
     memcpy(&buf[1], values, count * 4);
-    emit(OP_SET_REGS, buf.data(), count + 1);
+    emit(OP_SET_REGS, buf.data(), n);
 }
 void set_reg(uint32 reg, uint32 value) { emit(OP_SET_REGS, {reg, value}); }
 
@@ -509,19 +545,8 @@ static void set_context(uint32 ctx) {
     g_shadow = it->second.data();
     // Draw writes primitive type without updating the context shadow.
     g_register_blocks.touch(uint32(REGADDR::VGT_PRIMITIVE_TYPE), 1);
-    if (g_register_blocks.restore(g_regs, g_shadow, [](uint32 reg, uint32 old, uint32 value) {
-        if (shader_irrelevant(reg)) return false;
-        if (!render::vulkan() && !metal_key_changes(reg, old, value)) return false;
-#ifdef WWHD_HAS_VULKAN
-        static const bool keyDirty = [] {
-            const char* e = getenv("WWHD_VK_SHADER_KEY_DIRTY");
-            return render::vulkan() && e && !strcmp(e, "1");
-        }();
-        uint32 mask;
-        if (keyDirty && vulkan_shader_key_mask(reg, mask)) return ((old ^ value) & mask) != 0;
-#endif
-        return true;
-    })) ++g_shader_state_gen;
+    ensure_reg_tables();
+    if (g_register_blocks.restore(g_regs, g_shadow, key_changes)) ++g_shader_state_gen;
     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
 }
 
@@ -1079,18 +1104,26 @@ HLE(gx2, GX2GetContextStateDisplayList) {
 
 // ---------------------------------------------------------------- display lists
 HLE(gx2, GX2BeginDisplayListEx) {
-    t_rec.start = t_rec.pos = arg(c, 0);
-    t_rec.end = arg(c, 0) + arg(c, 1);
+    if (Recording* rec = claim_rec()) {
+        rec->start = rec->pos = arg(c, 0);
+        rec->end = arg(c, 0) + arg(c, 1);
+        if (!rec->start) release_rec(rec);  // as before: a null list records nothing
+    }
 }
 HLE(gx2, GX2EndDisplayList) {
-    uint32 size = t_rec.pos - t_rec.start;
-    t_rec = Recording{};
+    uint32 size = 0;
+    if (Recording* rec = recording()) {
+        size = rec->pos - rec->start;
+        release_rec(rec);
+    }
     ret(c, size);
 }
 HLE(gx2, GX2GetCurrentDisplayList) {
-    if (arg(c, 0)) st32(arg(c, 0), t_rec.start);
-    if (arg(c, 1)) st32(arg(c, 1), t_rec.start ? t_rec.end - t_rec.start : 0);
-    ret(c, t_rec.start != 0);
+    const Recording* rec = recording();
+    const uint32 start = rec ? rec->start : 0;
+    if (arg(c, 0)) st32(arg(c, 0), start);
+    if (arg(c, 1)) st32(arg(c, 1), start ? rec->end - rec->start : 0);
+    ret(c, start != 0);
 }
 HLE(gx2, GX2CallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 // a copy into the command stream: run where it stands (our display lists are op lists, not PM4)
@@ -1252,7 +1285,7 @@ HLE(gx2, GX2CopySurface) {
     // OSBlockMoves it back and frees it at once; executed later on the render thread, the copy
     // wrote into the freed memory after the heap had reused it (boot crash: agl shader program
     // array 21EFE28C, program 0's +0x7c zeroed). Not for display lists (they run when called).
-    if (!t_rec.start) {
+    if (Recording* rec = recording(); !rec || !rec->start) {
         BlockingScope b;
         render_sync(kSyncCopySurface);
     }

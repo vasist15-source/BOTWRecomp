@@ -136,6 +136,24 @@ foliage looks flat/bright; first-visit shader hitches; GPU ~30 ms/frame at 2x.
 Tools: F12 capture (draws.log, full-screen pass targets, their inputs and PS MSL), WWHD_PASS_DUMP,
 WWHD_FUNC_COUNT, WWHD_ORDER, WWHD_MSG_DUMP, WWHD_PROFILE=1.
 
+### 2026-10-27: GX2 register classes, Metal narrow shader keys (ported from ZeldaWWHDRecomp)
+- Register writes (upstream bde7fb1): one class byte and Metal key mask per register (`gx2/register_class.h`)
+  instead of range walks per written word, an inline path for ALU constants, display-list recording slots
+  found by `pthread_self` instead of `thread_local`, shader-bind and uniform temporaries on the stack.
+  `register_class_test` checks the tables against the reference functions.
+- Shader keys (upstream ba509f2, `gfx/shader_linkage.h`): linkage + variant key, with units and VS exports
+  from the program's first translation. Pixel-shader keys no longer hold the VS export table, render-target
+  formats the shader doesn't write or read, or sampler depth-compare bits. Framebuffer fetch is keyed
+  exactly (address, format, tile mode, active targets), and graphic packs add what their names hash.
+  Recipes name shaders by the narrow key; replay also maps the old wide key, and compaction renames
+  pipeline recipes, so old caches and the head start still resolve.
+- Found: the old key hashed texture word 1 bits 20-25 (DEPTH) as the "format"; the data format is 26-31.
+- Switches: `WWHD_MTL_SHADER_KEY_VERIFY=1` (retranslate per new wide key, log `[gfx shader key] VIOLATION`),
+  `WWHD_MTL_WIDE_SHADER_KEYS=1` (old keys). Not measured yet (the user skipped it):
+  `measure_keys.sh` in the side-session notes folder compares before/after binaries from empty caches.
+- First run with an old cache compacts it; the compacted file names pipelines by narrow keys, which an
+  older build drops (it would rebuild those pipelines on demand).
+
 ### 2026-10-30: sampler LOD bias applied, cube map index fix (from upstream WWHD)
 
 Metal samplers ignore the GX2 LOD bias; BotW sets -1 level on its textures, so everything sampled a

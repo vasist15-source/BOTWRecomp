@@ -12,6 +12,7 @@
 // button (latest_report()). WWHD_PROFILE=0 turns the profiler off.
 #pragma once
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 
 namespace rprof {
@@ -65,7 +66,15 @@ void add_idle(uint64_t ns);                 // render thread waiting for command
 extern uint32_t g_reg_dirty;  // bit 0: buffer/constant registers changed, bit 1: other registers changed
 void note_other_reg(uint32_t reg);          // a non-buffer register changed value
 void classify_draw();                       // at each draw: count its class, clear g_reg_dirty
-bool fast_class_reg(uint32_t reg);          // ALU constants, uniform-block and vertex-buffer words
+// ALU constants, uniform-block and vertex-buffer words (gx2 looks this up in its register class table)
+inline bool fast_class_reg(uint32_t reg) {
+    // RegDefines.h: mmSQ_ALU_CONSTANT0_0 0xC000; mmSQ_TEX_RESOURCE_WORD0 0xE000 + 0x7E0 (VS uniform
+    // blocks), + 0x250 (PS), + 0xCB0 (GS), + 0x8C0 (vertex attribute buffers), 7 words each
+    if (reg >= 0xC000 && reg < 0xC000 + 0x1000) return true;
+    for (uint32_t base : {0xE7E0u, 0xE250u, 0xECB0u, 0xE8C0u})
+        if (reg >= base && reg < base + 7 * 16) return true;  // includes the vertex stride (pipeline-only)
+    return false;
+}
 bool classify_on();  // the draw classifier (WWHD_DRAW_CLASSES=1): a check of every changed register word
 
 // shader translations: called by the Vulkan renderer for each new variant (shaders.cpp)
