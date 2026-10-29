@@ -135,3 +135,12 @@ cube-array index fine; next: compare that shader's MSL with Cemu's GLSL / render
 foliage looks flat/bright; first-visit shader hitches; GPU ~30 ms/frame at 2x.
 Tools: F12 capture (draws.log, full-screen pass targets, their inputs and PS MSL), WWHD_PASS_DUMP,
 WWHD_FUNC_COUNT, WWHD_ORDER, WWHD_MSG_DUMP, WWHD_PROFILE=1.
+
+### 2026-10-30: sampler LOD bias applied, cube map index fix (from upstream WWHD)
+
+Metal samplers ignore the GX2 LOD bias; BotW sets -1 level on its textures, so everything sampled a
+mip blurrier than on the Wii U. The translated shaders now add it (per-draw `texNLodBias` in the
+support buffer, gfx/sampler_lod_bias.h); shaders a graphic pack replaces are translated without it.
+SET_CUBEMAP_INDEX on a non-cube unit now declares its index. Hateno 1.5x, 60 fps mode, in-run A/B:
+16.70 ms/frame, 297 % CPU with the bias vs 16.99 ms/frame, 327 % without; 0 shader failures,
+graphic packs replaced as before. Switches: WWHD_LOD_BIAS=off|ab, WWHD_LOD_BIAS_LOG=1.
