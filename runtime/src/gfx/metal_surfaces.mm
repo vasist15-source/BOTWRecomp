@@ -17,6 +17,7 @@
 #include "metal.h"
 
 #include "runtime.h"
+#include "dynres.h"
 #include "write_watch.h"
 #define XXH_INLINE_ALL
 #include "../../third_party/xxhash/xxhash.h"
@@ -59,6 +60,11 @@ static void rescale_all_surfaces();
 static void clear_surface_to_zero(Surface* t);
 static float g_aspect_kx_latched();
 static float g_aspect_ky_latched();
+// dynamic resolution (dynres.h): render thread, the factor of the internal resolution for this frame.
+// Exactly 1 while off, so every size comes out as before.
+static float g_dyn_frame = 1.0f;
+static bool g_spares_held = false;  // some surface keeps textures in Surface::spares
+static void release_spares();
 float res_scale() { return g_res_frame; }
 void set_res_scale(float f) {
     g_res_requested = std::clamp(f, 1.0f, 4.0f);
@@ -79,12 +85,15 @@ void latch_res_scale() {
     }();
     for (auto& [f, v] : at)
         if (R.frame == f) set_res_scale(v);
-    const float before = g_res_frame, kx = g_aspect_kx_latched(), ky = g_aspect_ky_latched();
+    const float before = g_res_frame, dynBefore = g_dyn_frame, kx = g_aspect_kx_latched(), ky = g_aspect_ky_latched();
     g_res_frame = g_res_requested.load(std::memory_order_relaxed);
     latch_aspect();
+    g_dyn_frame = dynres::latch(R.frame, g_res_frame);
+    if (!dynres::on() && g_spares_held) release_spares();  // off: the kept textures go
     // every surface made at the old factor follows at once: one left at the old factor (sampled, not
     // drawn to since) can no longer be synced with its related surfaces and keeps stale contents
-    if (g_res_frame != before || kx != g_aspect_kx_latched() || ky != g_aspect_ky_latched()) rescale_all_surfaces();
+    if (g_res_frame != before || g_dyn_frame != dynBefore || kx != g_aspect_kx_latched() || ky != g_aspect_ky_latched())
+        rescale_all_surfaces();
 }
 
 // ---------------------------------------------------------------- aspect ratio
@@ -122,9 +131,23 @@ static bool screen_shaped(const Surface* s) {
 // shadow edges at 2x in v0.2.6-v0.2.8 came mainly from the missing mip chains the game's
 // shadow-mask softening samples (restored in v0.2.9); since then both sizes give practically the
 // same soft edges, the larger maps only a hair crisper.
-static float target_scale_rules(const Surface* s);
-static float target_scale(const Surface* s) { return std::max(target_scale_rules(s), s->minScale); }
-static float target_scale_rules(const Surface* s) {
+// Dynamic resolution (dynres.h) multiplies the factor of the targets that follow the internal
+// resolution (and of the depth buffers matched to them), never below 1x: the targets that keep the
+// console's size are copied to and from them at the same scale at 1x (same_scale). Single-layer only:
+// the shadow cascades (depth arrays, and the pack's shadow-sized rules) keep their factor, as do the
+// targets no rule scales and linear ones (the game reads them back: 1x1 probes, the 3x3 exposure, the
+// 8x8 ... 512x512 squares; none matches a rule today). *dyn: the dynamic factor in the result.
+static float target_scale_rules(const Surface* s, bool* follows = nullptr);
+static float target_scale(const Surface* s, float* dyn = nullptr) {
+    bool follows = false;
+    const float base = std::max(target_scale_rules(s, &follows), s->minScale);
+    float d = 1.0f;
+    if (g_dyn_frame != 1.0f && (follows || s->dynMatched) && s->slices == 1 && !s->fmt.compressed && s->tileMode > 1 && base > 1.0f)
+        d = std::max(1.0f, base * g_dyn_frame) / base;
+    if (dyn) *dyn = d;
+    return base * d;
+}
+static float target_scale_rules(const Surface* s, bool* follows) {
     uint32_t width,height;
     if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
     if (s->fmt.compressed) return 1.0f;
@@ -196,12 +219,18 @@ static float target_scale_rules(const Surface* s) {
         {360, 360, {0x005}, false, true},
     };
     static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
-    if (all) return res_scale();
+    if (all) {
+        if (follows) *follows = true;
+        return res_scale();
+    }
     for (const Rule& r : kRules) {
         if (r.w != s->width || r.h != s->height) continue;
         if (r.notLinearAligned && s->tileMode == 1) continue;  // tileModesExcluded = 0x001 (video playback)
         for (uint16_t f : r.formats)
-            if (f == s->format) return r.shadow ? (shadow ? shadow : packShadow) : res_scale();
+            if (f == s->format) {
+                if (follows) *follows = !r.shadow;
+                return r.shadow ? (shadow ? shadow : packShadow) : res_scale();
+            }
     }
     return 1.0f;
 }
@@ -225,7 +254,7 @@ static void target_aspect(const Surface* s, float& kx, float& ky) {
     ky = on ? g_aspect_ky : 1.0f;
 }
 
-static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, float scale, float ax = 1.0f, float ay = 1.0f) {
+static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, float scale, float ax = 1.0f, float ay = 1.0f, float dyn = 1.0f) {
     bool is1D = type == MTLTextureType1D || type == MTLTextureType1DArray;
     uint32_t pw = s->width, ph = s->height;
     // volumes keep the guest size (they are sampled as lookup tables, not shown)
@@ -235,6 +264,7 @@ static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, float scale,
     } else {
         scale = 1.0f;
         ax = ay = 1.0f;
+        dyn = 1.0f;
     }
     if (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) ph = pw;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
@@ -253,6 +283,7 @@ static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, float scale,
     if (t) {
         if (is1D) s->mips = 1;
         s->scale = scale;
+        s->dyn = dyn;
         s->ax = ax;
         s->ay = ay;
         s->sx = (float)pw / s->width;
@@ -263,19 +294,39 @@ static id<MTLTexture> make_texture(Surface* s, MTLTextureType type, float scale,
 
 // a render target made at another factor (the setting changed, or a CPU texture now rendered to):
 // reallocate it at the current one, keeping its contents (filtered)
+// Dynamic resolution: a render target changing scale keeps its previous texture (dynres::kSpares of them,
+// the most recent first: the levels it came from, as the controller steps one level at a time), and a
+// change back to a kept scale takes it again instead of creating a texture: no allocation while the scale
+// moves between recent levels. Off: none are kept.
 static Surface* rescale(Surface* s) {
-    float want = target_scale(s), ax, ay;
+    float dyn, want = target_scale(s, &dyn), ax, ay;
     target_aspect(s, ax, ay);
     if ((s->scale == want && s->ax == ax && s->ay == ay) || !s->tex || s->tex.textureType == MTLTextureType3D) return s;
+    const auto t0 = std::chrono::steady_clock::now();
     id<MTLTexture> old = s->tex;
-    float osx = s->sx, osy = s->sy, oscale = s->scale, oax = s->ax, oay = s->ay;
-    id<MTLTexture> t = make_texture(s, old.textureType, want, ax, ay);
-    if (!t) { s->sx = osx; s->sy = osy; s->scale = oscale; s->ax = oax; s->ay = oay; return s; }
+    const Surface::Kept was{old, s->scale, s->dyn, s->ax, s->ay, s->sx, s->sy};
+    const bool keep = dynres::on();
+    if (!keep) s->spares.clear();
+    id<MTLTexture> t = nil;
+    for (size_t i = 0; keep && i < s->spares.size(); i++) {
+        const Surface::Kept& k = s->spares[i];
+        if (k.scale != want || k.ax != ax || k.ay != ay || k.tex.textureType != old.textureType) continue;
+        t = k.tex;
+        s->scale = k.scale; s->dyn = k.dyn; s->ax = k.ax; s->ay = k.ay; s->sx = k.sx; s->sy = k.sy;
+        s->spares.erase(s->spares.begin() + i);
+        break;
+    }
+    const bool reused = t != nil;
+    if (!t) {
+        t = make_texture(s, old.textureType, want, ax, ay, dyn);
+        if (!t) { s->scale = was.scale; s->dyn = was.dyn; s->ax = was.ax; s->ay = was.ay; s->sx = was.sx; s->sy = was.sy; return s; }
+    }
     end_encoder();
-    // every level: a new texture's memory is undefined (NaN in float formats), and later passes that
-    // blend into a level keep a NaN forever (the bloom mip chain: black lower screen after a switch)
     s->tex = t;
-    clear_surface_to_zero(s);
+    // every level of a new texture: its memory is undefined (NaN in float formats), and later passes that
+    // blend into a level keep a NaN forever (the bloom mip chain: black lower screen after a switch).
+    // A kept texture holds an earlier picture instead, and the copy below covers what is used of it.
+    if (!reused) clear_surface_to_zero(s);
     g_resample_why = "rescale";
     const uint32_t layers = old.textureType == MTLTextureType3D ? 1 : (uint32_t)layer_count(old);
     const NSUInteger levels = std::min(old.mipmapLevelCount, t.mipmapLevelCount);
@@ -293,10 +344,18 @@ static Surface* rescale(Surface* s) {
         }
     }
     g_resample_why = nullptr;
+    if (keep) {
+        s->spares.insert(s->spares.begin(), was);
+        if (s->spares.size() > size_t(dynres::kSpares)) s->spares.resize(dynres::kSpares);
+        g_spares_held = true;
+        if (reused) dynres::count_reused();
+        else dynres::count_created();
+        dynres::note_rescale(!reused, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     forget_texture_views();
     if (getenv("WWHD_LOG_RESCALE"))
-        LOG("[gfx] rescaled %08X %ux%u fmt %X to %lux%lu", s->addr, s->width, s->height, s->format, (unsigned long)t.width,
-            (unsigned long)t.height);
+        LOG("[gfx] rescaled %08X %ux%u fmt %X to %lux%lu (%s)", s->addr, s->width, s->height, s->format, (unsigned long)t.width,
+            (unsigned long)t.height, reused ? "kept texture" : "new texture");
     return s;
 }
 
@@ -305,14 +364,23 @@ static Surface* rescale(Surface* s) {
 // Metal needs matching sizes, and the draw ran without depth (no depth test or write; BotW's water
 // surface never reached the depth buffer at 2x: white water). The depth buffer follows the colour
 // target's factor from then on. Only when its guest size covers the colour target's.
+// Dynamic resolution: the factors compared are without it (scale / dyn), and a depth buffer matched to a
+// colour target that follows it follows it too (dynMatched), so the two keep the same size at every level.
 Surface* match_depth_scale(Surface* depth, const Surface* color) {
     if (!depth || !color || depth->width < color->width || depth->height < color->height) return depth;
-    if (color->scale <= depth->scale || depth->minScale >= color->scale) return depth;
-    depth->minScale = color->scale;
+    const float colorBase = color->scale / color->dyn;
+    bool follows = false;
+    target_scale_rules(color, &follows);
+    const bool raise = colorBase > depth->scale / depth->dyn && depth->minScale < colorBase;
+    const bool join = (follows || color->dynMatched) && color->slices == 1 && !depth->dynMatched;
+    if (!raise && !join) return depth;
+    if (raise) depth->minScale = colorBase;
+    if (join) depth->dynMatched = true;
     static int logged = 0;
     if (logged++ < 20)
-        LOG("[gfx] depth %08X %ux%u f%X scaled %gx to match colour %08X %ux%u f%X", depth->addr, depth->width, depth->height,
-            depth->format, color->scale, color->addr, color->width, color->height, color->format);
+        LOG("[gfx] depth %08X %ux%u f%X scaled %gx to match colour %08X %ux%u f%X%s", depth->addr, depth->width, depth->height,
+            depth->format, std::max(colorBase, depth->minScale), color->addr, color->width, color->height, color->format,
+            join ? " (and its dynamic resolution)" : "");
     return rescale(depth);
 }
 
@@ -506,13 +574,23 @@ std::vector<std::unique_ptr<Surface>> g_graveyard;    // deleted this frame, fre
 
 static void rescale_all_surfaces() {
     size_t n = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     for (Surface* t : g_all) {
         if (t->deleted) continue;
         id<MTLTexture> before = t->tex;
         rescale(t);
         n += t->tex != before;
     }
-    LOG("[gfx] %zu surfaces reallocated for internal resolution %gx", n, res_scale());
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (g_dyn_frame != 1.0f || dynres::on())
+        LOG("[gfx] %zu surfaces rescaled for internal resolution %gx, dynamic %gx (%.2f ms)", n, res_scale(), g_dyn_frame, ms);
+    else
+        LOG("[gfx] %zu surfaces reallocated for internal resolution %gx", n, res_scale());
+}
+// dynamic resolution turned off: the textures kept for other scales go
+static void release_spares() {
+    for (Surface* t : g_all) t->spares.clear();
+    g_spares_held = false;
 }
 
 static void view_lookup_add(TexView* v, uint32_t baseMip = 0, uint32_t baseSlice = 0) {
@@ -1110,7 +1188,8 @@ static void clear_surface_to_zero(Surface* t) {
 }
 
 static TexView* create_surface(uint32_t dim, uint32_t addr, uint32_t mipAddr, uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-                               uint32_t pitch, uint32_t mips, uint32_t swizzle, uint32_t tileMode, bool isDepth, float minScale = 0.0f) {
+                               uint32_t pitch, uint32_t mips, uint32_t swizzle, uint32_t tileMode, bool isDepth, float minScale = 0.0f,
+                               bool dynMatched = false) {
     auto up = std::make_unique<Surface>();
     Surface* t = up.get();
     t->addr = addr;
@@ -1126,12 +1205,15 @@ static TexView* create_surface(uint32_t dim, uint32_t addr, uint32_t mipAddr, ui
     t->tileMode = tileMode;
     t->isDepth = isDepth;
     t->minScale = minScale;
+    t->dynMatched = dynMatched;
     t->fmt = format_info(format, isDepth);
     if ((Latte::E_DIM)dim == Latte::E_DIM::DIM_3D) t->mips = std::min(t->mips, 1u + (uint32_t)std::log2((double)std::max({t->width, t->height, t->slices})));
     else t->mips = std::min(t->mips, 1u + (uint32_t)std::log2((double)std::max(t->width, t->height)));
     float ax, ay;
     target_aspect(t, ax, ay);
-    t->tex = make_texture(t, texture_type_for(t), target_scale(t), ax, ay);
+    float dyn;
+    const float scale = target_scale(t, &dyn);
+    t->tex = make_texture(t, texture_type_for(t), scale, ax, ay, dyn);
     if (!t->tex) {
         LOG("[gfx] cannot create %ux%ux%u texture (format %X, pixel %lu, mips %u)", t->width, t->height, t->slices, t->format,
             (unsigned long)t->fmt.pixel, t->mips);
@@ -1225,7 +1307,7 @@ static bool recreate_bigger(Surface* t, uint32_t mipAddr, uint32_t newMips, uint
     else if ((Latte::E_DIM)dim == Latte::E_DIM::DIM_1D && newDepth > 1) dim = (uint32_t)Latte::E_DIM::DIM_1D_ARRAY;
     end_encoder();
     TexView* v = create_surface(dim, t->addr, mipAddr, t->format, t->width, t->height, newDepth, t->pitch, newMips, t->swizzle, t->tileMode, t->isDepth,
-                                t->minScale);
+                                t->minScale, t->dynMatched);
     if (!v) return false;
     Surface* n = v->tex;
     if (n->mips < newMips || n->slices < newDepth) {  // could not grow (size limits): keep the old one

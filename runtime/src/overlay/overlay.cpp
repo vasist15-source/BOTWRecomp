@@ -60,6 +60,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../screenshot.h"
 #include "../render_prof.h"
 #include "../perf_metrics.h"
+#include "../dynres.h"
 #include "../build_info.h"
 #include "../report_header.h"
 
@@ -566,6 +567,7 @@ std::string performance_report() {
     snprintf(frame, sizeof frame, "FPS %.1f (average %.1f), frame %.2f ms (worst %.2f), average game frames/s %.1f\n",
              U.fps, g_average.fps, sum / 120.0f, worst, g_average.logic);
     std::string report = std::string(frame) + perf::summary();
+    if (!render::vulkan()) report += dynres::status() + "\n";
 #ifdef __ANDROID__
     report += android_telemetry() + "\n";
 #endif
@@ -641,6 +643,25 @@ void tab_graphics() {
         if (i) ImGui::SameLine();
         float s = scales[i];
         if (radio(names[i], std::fabs(cur - s) < 0.01f)) post_changed([s] { hostui::set_res_scale(s); });
+    }
+
+    if (!render::vulkan()) {  // the Metal renderer's (dynres.h)
+        heading("Dynamic resolution");
+        static const float mins[] = {0.0f, 0.75f, 0.5f};
+        static const char* const dnames[] = {"Off##dynres", "Down to 75%##dynres", "Down to 50%##dynres"};
+        const float dm = dynres::min_factor();
+        for (int i = 0; i < 3; i++) {
+            if (i) ImGui::SameLine();
+            const float m = mins[i];
+            if (radio(dnames[i], std::fabs(dm - m) < 0.01f, !dynres::min_from_env()))
+                post_changed([m] { dynres::set_min(m); hostui::set("dynResMin", m > 0 ? std::to_string(m) : "0"); });
+        }
+        help("Lowers the internal resolution while the graphics chip cannot keep up with the frame rate, down to\n"
+             "the chosen share of it (never below 1x, 1280x720), and raises it again when there is room. The\n"
+             "picture is softer while it is lower; the HUD and the window layout stay as they are. Helps at 1.5x\n"
+             "and above where the graphics chip is the limit (villages at 2x); when the processor is the limit,\n"
+             "the resolution stays.");
+        if (dynres::on()) note("%s", dynres::status().c_str());
     }
 
     heading("Effects");
@@ -1390,6 +1411,7 @@ void perf_window(bool menu_open) {
         ImGui::TextUnformatted(perf::summary().c_str());
         ImGui::PlotLines("##ft", U.frame_ms, 120, U.frame_i, nullptr, 0.0f, 50.0f, ImVec2(220, 36));
         ImGui::TextDisabled("%s  %gx  %s", render::api_name(render::active()), hostui::res_scale(), interp::mode_name());
+        if (dynres::on() && !render::vulkan()) ImGui::TextDisabled("%s", dynres::status().c_str());
         if (float share = interp::paced_drawn_share(); share >= 0)
             ImGui::TextDisabled("in-between frames drawn: %.0f%%", share * 100.0f);
     }
@@ -1589,6 +1611,8 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
             hostui::post([pro = v == "1"] { hostui::set_pro_controller(pro); });
         // the saved rumble choice (WWHD_RUMBLE wins)
         if (!rumble::env_override() && hostui::get("rumble", v)) rumble::set_enabled(v != "0");
+        // the saved dynamic resolution (WWHD_DYNRES_MIN wins)
+        if (!dynres::min_from_env() && hostui::get("dynResMin", v)) dynres::set_min(strtof(v.c_str(), nullptr));
         // (no saved aspect ratio: the wider pictures need Wind Waker's camera hooks)
         // the saved gyro settings (WWHD_GYRO overrides the source)
         hostui::post([] { load_gyro(); });

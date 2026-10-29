@@ -22,6 +22,7 @@
 #include "gx2_texture_regs.h"
 #include "metal.h"
 #include "write_watch.h"
+#include "dynres.h"
 extern "C" uint64_t wwhd_query_counts(uint64_t* conditional);  // gx2_core.cpp
 #include "runtime.h"
 #include "input.h"
@@ -134,6 +135,7 @@ static void finish_gpu_frame() {
     ++g_gpu_frames;
     if (ns > g_gpu_max_ns) g_gpu_max_ns = ns;
     perf::gpu_frame(f.busy * 1e3);
+    dynres::gpu_busy(f.busy * 1e9);  // dynamic resolution's GPU busy share (dynres.h; ignored while off)
     // WWHD_PROFILE=1: frames over 30 ms busy (or 40 ms first start to last end) are logged, to line up with [hitch]
     static const bool diagnostic = [] { const char* p = getenv("WWHD_PROFILE"); return p && !strcmp(p, "1"); }();
     if (diagnostic && (f.busy > 0.030 || f.end - f.first > 0.040))
@@ -882,15 +884,29 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
     // the image as rendered (internal resolution); the present pass scales it to the window
     const uint32_t level = v->firstMip;
     NSUInteger w = std::max<NSUInteger>(s->tex.width >> level, 1), h = std::max<NSUInteger>(s->tex.height >> level, 1);
-    if (!scr.tex || scr.tex.width != w || scr.tex.height != h || scr.tex.pixelFormat != s->tex.pixelFormat) {
-        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->tex.pixelFormat
-                                                                                     width:w
-                                                                                    height:h
-                                                                                 mipmapped:NO];
-        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;  // render target: mod overlays
-        d.storageMode = MTLStorageModePrivate;
-        scr.tex = [R.device newTextureWithDescriptor:d];
+    auto fits = [&](id<MTLTexture> t) { return t.width == w && t.height == h && t.pixelFormat == s->tex.pixelFormat; };
+    if (!scr.tex || !fits(scr.tex)) {
+        // dynamic resolution (dynres.h): the scan textures of the previous sizes are kept for the next change
+        id<MTLTexture> kept = nil;
+        if (dynres::on()) {
+            for (auto it = scr.scanSpares.begin(); it != scr.scanSpares.end(); ++it)
+                if (fits(*it)) { kept = *it; scr.scanSpares.erase(it); break; }
+            if (scr.tex) scr.scanSpares.insert(scr.scanSpares.begin(), scr.tex);
+            if (scr.scanSpares.size() > size_t(dynres::kSpares)) scr.scanSpares.resize(dynres::kSpares);
+        }
+        if (kept) scr.tex = kept;
+        else {
+            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->tex.pixelFormat
+                                                                                         width:w
+                                                                                        height:h
+                                                                                     mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;  // render target: mod overlays
+            d.storageMode = MTLStorageModePrivate;
+            scr.tex = [R.device newTextureWithDescriptor:d];
+        }
     }
+    if (!dynres::on() && !scr.scanSpares.empty()) scr.scanSpares.clear();
+    scr.dyn = s->dyn;  // the layout uses the size at the full internal resolution
     id<MTLBlitCommandEncoder> b = TIMED_BLIT();
     [b copyFromTexture:s->tex sourceSlice:s->tex.textureType == MTLTextureType3D ? 0 : v->firstSlice sourceLevel:level
           sourceOrigin:MTLOriginMake(0, 0, s->tex.textureType == MTLTextureType3D ? v->firstSlice : 0)
@@ -1279,6 +1295,11 @@ void swap() {
             LOG("[gfx] frame %llu, %llu draws so far, GPU busy %.2f ms/frame (max %.2f, first start to last end %.2f), "
                 "render thread CPU %.2f ms/frame", (unsigned long long)R.frame, (unsigned long long)R.drawCount,
                 busy, busyMax, span, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0);
+            if (dynres::on()) {
+                const dynres::Stats st = dynres::stats();
+                LOG("[gfx] %s; targets at a change: %llu kept textures taken, %llu new", dynres::status().c_str(),
+                    (unsigned long long)st.reused, (unsigned long long)st.created);
+            }
         }
         lastCpu = cpu;
         enc_report();
