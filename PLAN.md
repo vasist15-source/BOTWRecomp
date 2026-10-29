@@ -179,3 +179,18 @@ support buffer, gfx/sampler_lod_bias.h); shaders a graphic pack replaces are tra
 SET_CUBEMAP_INDEX on a non-cube unit now declares its index. Hateno 1.5x, 60 fps mode, in-run A/B:
 16.70 ms/frame, 297 % CPU with the bias vs 16.99 ms/frame, 327 % without; 0 shader failures,
 graphic packs replaced as before. Switches: WWHD_LOD_BIAS=off|ab, WWHD_LOD_BIAS_LOG=1.
+
+## Recompiler code-quality passes (2026-10-27)
+
+Ported from upstream ZeldaWWHDRecomp (4b5e2a0, 79ae761, e658359, 4af135f, 2e6c6d1, f0e6fcb; our
+tools/recomp and ppc.h were still byte-identical to the fork point, so they applied cleanly):
+guest registers in C locals (leaflocal.py: all 203,444 functions, 125,346 leaf + 78,098 with calls),
+condition-register liveness (crlive.py: 703,049 CR writers), cheaper fcmp/mfcr, paired-single fast
+path, static GQR0/1 (BotW writes only GQR2-5; 210,375 of its 211,416 paired loads/stores use GQR0),
+and recomp.py writes only changed files (regenerating identical code rebuilds nothing). BotW has no
+mffs/mcrfs/mtfsf at all, so dropping fcmp's FPSCR FPCC update is safe. probe_recomp.py turns the
+hook files off, so no function needs the plain form; save states only snapshot threads parked in HLE
+calls, after which the non-leaf form reloads every register.
+Game code __text 210.3 MB -> 139.9 MB. Switches when generating: WWHD_RECOMP_PLAIN=1 (all off,
+output byte-identical to before), WWHD_RECOMP_CRLIVE/LEAF/NONLEAF/GQR=0 each; checking build:
+WWHD_RECOMP_LEAF_POISON=1 WWHD_RECOMP_CR_CHECK=1 (aborts with "CR liveness: bit N read at ...").
