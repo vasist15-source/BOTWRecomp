@@ -18,6 +18,7 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 #include "graphic_pack_hash.h"
 #include "mods/graphic_packs.h"
+#include "gfx/sampler_lod_bias.h"
 #include "gx2/gx2.h"
 #include "render_prof.h"
 #include "gx2/gx2_cmd.h"
@@ -28,10 +29,12 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "util/helpers/StringBuf.h"
 
 #include <condition_variable>
+#include <unordered_set>
 #include <mutex>
 #include <set>
 #include <cstdarg>
 #include <ctime>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -991,26 +994,34 @@ static std::string pack_interface(const std::string& src) {
     }
     return out;
 }
-static void apply_graphic_pack(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint32_t addr, uint32_t size) {
-    if (!graphic_packs::has_shaders() || !s->dec || !s->dec->strBuf_shaderSource || (vertex && !fs)) return;
-    const char* stage = vertex ? "vs" : "ps";
-    uint64_t base = cemu_pack_hash::base(mem::ptr(addr), size, regs, vertex, fs), aux;
+// the replacement source a graphic pack has for this translation (empty: none), named base_aux
+static std::string graphic_pack_source(const LatteDecompilerShader& d, const uint32_t* regs, bool vertex, LatteFetchShader* fs,
+                                       uint32_t addr, uint32_t size, uint64_t& base, uint64_t& aux) {
+    if (!graphic_packs::has_shaders() || (vertex && !fs)) return {};
+    base = cemu_pack_hash::base(mem::ptr(addr), size, regs, vertex, fs);
     std::string src;
     if (vertex) {
         // the Metal hash; the Graphics pack's vertex shaders were named with an older Cemu: also the Vulkan one
         const uint64_t vulkanBase = base;
-        aux = cemu_pack_hash::auxiliary(*s->dec, regs, true);
+        aux = cemu_pack_hash::auxiliary(d, regs, true);
         src = graphic_packs::shader_source(base = pack_vs_base(vulkanBase, regs, fs), aux, true);
         if (getenv("WWHD_GPACK_LOG"))
             LOG("[gpack] vs %016llx_%016llx (vulkan %016llx)", (unsigned long long)base, (unsigned long long)aux,
                 (unsigned long long)vulkanBase);
         if (src.empty()) src = graphic_packs::shader_source(base = vulkanBase, aux, true);
     } else {
-        aux = pack_ps_aux(*s->dec, regs);
+        aux = pack_ps_aux(d, regs);
         if (getenv("WWHD_GPACK_LOG")) LOG("[gpack] ps %016llx_%016llx", (unsigned long long)base, (unsigned long long)aux);
         src = graphic_packs::shader_source(base, aux, false);
-        if (src.empty()) src = graphic_packs::shader_source(base, aux = pack_ps_aux(*s->dec, regs, false), false);
+        if (src.empty()) src = graphic_packs::shader_source(base, aux = pack_ps_aux(d, regs, false), false);
     }
+    return src;
+}
+static void apply_graphic_pack(Shader* s, const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint32_t addr, uint32_t size) {
+    if (!s->dec || !s->dec->strBuf_shaderSource) return;
+    const char* stage = vertex ? "vs" : "ps";
+    uint64_t base = 0, aux = 0;
+    const std::string src = graphic_pack_source(*s->dec, regs, vertex, fs, addr, size, base, aux);
     if (src.empty()) return;
     const std::string ours = s->dec->strBuf_shaderSource->c_str();
     if (pack_interface(src) != pack_interface(ours)) {
@@ -1042,12 +1053,30 @@ static void translate_shader(Shader* s, const uint32_t* regs, bool vertex, Latte
     opt.useTFViaSSBO = true;  // stream out (BotW): the vertex shader writes guest memory through sb (see StreamoutDraw)
     if (!vertex && graphic_packs::has_shaders())
         opt.legacyGraphicPackUniforms = graphic_packs::has_base(cemu_pack_hash::base(mem::ptr(addr), size, regs, false, nullptr), false);
+    opt.emulateSamplerLodBias = true;  // Metal samplers have no LOD bias: the shader adds it (gfx/sampler_lod_bias.h)
     LatteDecompilerOutput_t out{};
-    if (vertex)
-        LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
-    else
-        LatteDecompiler_DecompilePixelShader(base, (uint32*)regs, mem::ptr(addr), size, opt, &out);
-    if (!out.shader || out.shader->hasError || !out.shader->strBuf_shaderSource) {
+    auto translate = [&] {
+        out = LatteDecompilerOutput_t{};
+        if (vertex)
+            LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
+        else
+            LatteDecompiler_DecompilePixelShader(base, (uint32*)regs, mem::ptr(addr), size, opt, &out);
+        return out.shader && !out.shader->hasError && out.shader->strBuf_shaderSource;
+    };
+    bool ok = translate();
+    if (ok && graphic_packs::has_shaders() &&
+        std::any_of(std::begin(out.uniformOffsetsVK.offset_texLodBias), std::end(out.uniformOffsetsVK.offset_texLodBias),
+                    [](sint32 o) { return o >= 0; })) {
+        uint64_t packBase, packAux;
+        if (!graphic_pack_source(*out.shader, regs, vertex, fs, addr, size, packBase, packAux).empty()) {
+            // a graphic pack replaces this shader: translate it as Cemu does, so its interface matches
+            delete out.shader->strBuf_shaderSource;
+            delete out.shader;
+            opt.emulateSamplerLodBias = false;
+            ok = translate();
+        }
+    }
+    if (!ok) {
         LOG("[gfx] %s shader %08X failed to translate", vertex ? "vertex" : "pixel", addr);
         s->state = CS_FAILED;
         return;
@@ -1514,13 +1543,7 @@ static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = fals
     if (aniso) d.maxAnisotropy = std::min(1u << aniso, 16u);
     if (g_aniso_force && mip != 0 && d.minFilter == MTLSamplerMinMagFilterLinear && (uint32_t)w0.get_DEPTH_COMPARE_FUNCTION() == 0)
         d.maxAnisotropy = 16;
-    {   // Metal samplers have no LOD bias (the Vulkan renderer sets mipLodBias): log the values the game uses
-        const int bias = (int)w1.get_LOD_BIAS();
-        static std::set<int> seen;
-        if (bias && seen.insert(bias).second)
-            LOG("[gfx] sampler with LOD bias %d (%.2f levels) not applied (min filter %u, mip filter %u)", bias, bias / 64.0f,
-                (uint32_t)w0.get_XY_MIN_FILTER(), mip);
-    }
+    // no LOD bias here: Metal samplers can't apply it, the shader adds it (gfx/sampler_lod_bias.h)
     d.lodMinClamp = w1.get_MIN_LOD() / 64.0f;
     d.lodMaxClamp = w1.get_MAX_LOD() / 64.0f;
     uint32_t border = (uint32_t)w0.get_BORDER_COLOR_TYPE();
@@ -1720,6 +1743,35 @@ static inline void bc_bytes(id<MTLRenderCommandEncoder> enc, bool vertex, const 
     q_bytes(vertex, data, (uint32_t)n, i);
 }
 
+// whether shaders add the sampler LOD bias (gfx/sampler_lod_bias.h). WWHD_LOD_BIAS=ab alternates every
+// 10 s and logs the process CPU and frame time of each window (an A/B in one run: a fanless Mac's heat
+// drifts too much between runs)
+static bool lod_bias_on() {
+    using namespace gfx::sampler_lod_bias;
+    if (mode() != Mode::AB) return mode() == Mode::Shader;
+    static std::mutex mu;
+    static auto windowStart = std::chrono::steady_clock::now();
+    static double cpuStart = 0;
+    static uint64_t framesStart = 0;
+    static bool on = true;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - windowStart).count();
+    if (secs < 10) return on;
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    const double cpu = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+    const uint64_t frames = gfx::frames_completed();
+    if (cpuStart)
+        LOG("[lod-bias-ab] %s: %.0f%% CPU, %.2f ms/frame (%.1f s)", on ? "bias" : "no bias", 100 * (cpu - cpuStart) / secs,
+            frames > framesStart ? 1000 * secs / (frames - framesStart) : 0.0, secs);
+    on = !on;
+    windowStart = now;
+    cpuStart = cpu;
+    framesStart = frames;
+    return on;
+}
+
 static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
     float texScale[18][2];
@@ -1771,6 +1823,20 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         if (!tex) tex = null_texture(type);
         const uint32_t* sw = &regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3];
         id<MTLSamplerState> smp = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
+        // WWHD_LOD_BIAS_LOG=1: each distinct texture/sampler pair with a LOD bias, once (gfx/sampler_lod_bias.h)
+        static const bool logBias = getenv("WWHD_LOD_BIAS_LOG") != nullptr;
+        if (logBias && gfx::sampler_lod_bias::raw(sw[1]) != 0) {
+            static std::mutex mu;
+            static std::unordered_set<uint64_t> seen;
+            const uint32_t pgm = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
+            const uint32_t seenKey[5] = {pgm, (uint32_t)unit, sw[0], sw[1], tw[2]};
+            std::lock_guard<std::mutex> lk(mu);
+            if (seen.insert(hash_bytes(seenKey, sizeof seenKey)).second)
+                LOG("[lod bias] %s %08X tex%u %08X %ux%u fmt %X mips %u smp %08X %08X bias %+.4f%s", vertex ? "VS" : "PS", pgm, unit,
+                    tw[2] << 8, s ? s->width : 0, s ? s->height : 0, s ? s->format : 0, s ? s->mips : 0, sw[0], sw[1],
+                    gfx::sampler_lod_bias::levels(sw[1]),
+                    unit < 18 && dec->uniform.loc_texLodBias[unit] >= 0 ? "" : " (not applied: no filtered sample with a level of detail)");
+        }
         if (binding >= MAX_MTL_SAMPLERS) {  // past Metal's 16 sampler slots: the shader reads it from a table
             if (binding - MAX_MTL_SAMPLERS < LATTE_NUM_MAX_TEX_UNITS) extraSamplers[binding - MAX_MTL_SAMPLERS] = smp.gpuResourceID;
             extraCount = std::max<uint32_t>(extraCount, binding - MAX_MTL_SAMPLERS + 1);
@@ -1853,6 +1919,15 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             bool ok = e.texUnit < 18;
             at(e.uniformLocation)[0] = ok ? texScale[e.texUnit][0] : 1.0f;
             at(e.uniformLocation)[1] = ok ? texScale[e.texUnit][1] : 1.0f;
+        }
+        // the sampler's LOD bias, which Metal samplers can't apply (gfx/sampler_lod_bias.h)
+        for (int t = 0, on = -1; t < 18; t++) {
+            if (dec->uniform.loc_texLodBias[t] < 0) continue;
+            if (on < 0) on = lod_bias_on();
+            const uint32_t samplerIdx = dec->textureUnitSamplerAssignment[t];
+            const bool add = on && samplerIdx < 18;
+            *at(dec->uniform.loc_texLodBias[t]) =
+                add ? gfx::sampler_lod_bias::host(regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 1]) : 0.0f;
         }
         for (int t = 0; t < 18; t++) {
             if (dec->uniform.loc_framebufferFetchSize[t] < 0) continue;

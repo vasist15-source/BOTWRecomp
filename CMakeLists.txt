@@ -349,6 +349,13 @@ foreach(test register_blocks scheduler_tick full_state_header)
 endforeach()
 target_link_libraries(scheduler_tick_test PRIVATE Threads::Threads)
 
+# GX2 sampler LOD bias decode (runtime/src/gfx/sampler_lod_bias.h)
+add_executable(sampler_lod_bias_test runtime/tools/sampler_lod_bias_test.cpp)
+target_include_directories(sampler_lod_bias_test PRIVATE runtime/src)
+target_link_libraries(sampler_lod_bias_test PRIVATE cemu_latte)
+target_compile_options(sampler_lod_bias_test PRIVATE -UNDEBUG "SHELL:-include \"${CEMU_DIR}/cemu_shim.h\"")
+add_test(NAME sampler_lod_bias COMMAND sampler_lod_bias_test)
+
 add_executable(portable_state_test runtime/tools/portable_state_test.cpp runtime/src/portable_state.cpp)
 target_include_directories(portable_state_test PRIVATE runtime/src)
 target_compile_options(portable_state_test PRIVATE -UNDEBUG)

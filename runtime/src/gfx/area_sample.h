@@ -80,6 +80,16 @@ inline int rewrite(std::string& src, uint32_t units, bool msl) {
         "    for (float j = 0.5; j < k.y; j += 1.0)\n"
         "        for (float i = 0.5; i < k.x; i += 1.0) sum += t.sample(s, uv + (float2(i, j) - 0.5 * k) * step);\n"
         "    return sum / (k.x * k.y);\n"
+        "}\n"
+        "// with the sampler's LOD bias (runtime/src/gfx/sampler_lod_bias.h)\n"
+        "static float4 wwhd_area_sample(texture2d<float> t, sampler s, float2 scale, float2 uv, bias lodBias) {\n"
+        "    float2 k = ceil(scale - 0.001);\n"
+        "    if (k.x <= 1.0 && k.y <= 1.0) return t.sample(s, uv, lodBias);\n"
+        "    float2 step = scale / (float2(t.get_width(), t.get_height()) * k);\n"
+        "    float4 sum = float4(0.0);\n"
+        "    for (float j = 0.5; j < k.y; j += 1.0)\n"
+        "        for (float i = 0.5; i < k.x; i += 1.0) sum += t.sample(s, uv + (float2(i, j) - 0.5 * k) * step, lodBias);\n"
+        "    return sum / (k.x * k.y);\n"
         "}\n";
     static const char* const kGlsl =
         "// area-sampled tap for upscaled render targets (runtime/src/gfx/area_sample.h)\n"
@@ -90,6 +100,16 @@ inline int rewrite(std::string& src, uint32_t units, bool msl) {
         "    vec4 sum = vec4(0.0);\n"
         "    for (float j = 0.5; j < k.y; j += 1.0)\n"
         "        for (float i = 0.5; i < k.x; i += 1.0) sum += texture(t, uv + (vec2(i, j) - 0.5 * k) * step);\n"
+        "    return sum / (k.x * k.y);\n"
+        "}\n"
+        "// with the sampler's LOD bias (runtime/src/gfx/sampler_lod_bias.h)\n"
+        "vec4 wwhdAreaSample(sampler2D t, vec2 scale, vec2 uv, float lodBias) {\n"
+        "    vec2 k = ceil(scale - 0.001);\n"
+        "    if (k.x <= 1.0 && k.y <= 1.0) return texture(t, uv, lodBias);\n"
+        "    vec2 step = scale / (vec2(textureSize(t, 0)) * k);\n"
+        "    vec4 sum = vec4(0.0);\n"
+        "    for (float j = 0.5; j < k.y; j += 1.0)\n"
+        "        for (float i = 0.5; i < k.x; i += 1.0) sum += texture(t, uv + (vec2(i, j) - 0.5 * k) * step, lodBias);\n"
         "    return sum / (k.x * k.y);\n"
         "}\n";
     src.insert(src.find(msl ? "fragment FragmentOut main0" : "void main("), msl ? kMsl : kGlsl);
