@@ -620,10 +620,15 @@ void tab_graphics() {
         ImGui::SameLine();
         if (radio("60 fps", t == 60)) post_changed([] { gx2::set_fps_target(60); });
         ImGui::SameLine();
+        if (radio("90 fps", t == 90)) post_changed([] { gx2::set_fps_target(90); });
+        ImGui::SameLine();
+        if (radio("120 fps", t == 120)) post_changed([] { gx2::set_fps_target(120); });
+        ImGui::SameLine();
         if (radio("Uncapped", t == 0)) post_changed([] { gx2::set_fps_target(0); });
         help("Above 30 fps the game's own frame-time scaling follows the real frame time, so it keeps its\n"
              "normal speed at any frame rate (and no longer slows down when frames take longer than 1/30 s,\n"
-             "down to 20 fps). Uncapped: as many frames as this computer can draw, without vsync.");
+             "down to 20 fps). 90/120 fps use host pacing without vsync. Sensitive cutscenes temporarily lower the cap.\n"
+             "Uncapped: as many frames as this computer can draw, without vsync.");
     }
     // debug only, not saved (gx2::uncapped)
     bool unc;

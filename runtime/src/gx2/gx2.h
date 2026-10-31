@@ -25,12 +25,12 @@ LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fet
 // Not saved.
 bool uncapped();
 void set_uncapped(bool on);
-// BotW frame rate (gx2_core.cpp): 30 (the game's own cap), 60, or 0 (no cap; up to fps_limit()). Above
+// BotW frame rate (gx2_core.cpp): 30 (the game's own cap), 60, 90, 120, or 0 (no cap; up to fps_limit()). Above
 // 30 the game's 30 fps fence is lifted and its frame-time scaling (ksys::VFR interval ratio) follows
-// the measured frame time, so the game keeps real-time speed. WWHD_FPS=60|0 at start-up.
+// the measured frame time, so the game keeps real-time speed. WWHD_FPS=30|60|90|120|0 at start-up.
 int fps_target();
 void set_fps_target(int fps);
-bool present_unsynced();  // presentation does not wait for the display (uncapped, or no fps cap)
+bool present_unsynced();  // presentation does not wait for the display (90/120, uncapped, or no fps cap)
 bool fps_pacing();        // above 30 fps and in gameplay: the 30 fps fence and vsync pacing are lifted
 }  // namespace gx2
 

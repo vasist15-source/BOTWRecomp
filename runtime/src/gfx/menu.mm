@@ -284,6 +284,8 @@ void install_menu(NSWindow* tv) {
     add(g, @"Edge smoothing, FXAA (8)", @selector(toggleFxaa:), @"8");
     add(g, @"Frame rate: 30 fps (original)", @selector(setFps:), @"", 30);
     add(g, @"Frame rate: 60 fps (6)", @selector(setFps:), @"6", 60);
+    add(g, @"Frame rate: 90 fps", @selector(setFps:), @"", 90);
+    add(g, @"Frame rate: 120 fps", @selector(setFps:), @"", 120);
     add(g, @"Frame rate: uncapped (7)", @selector(setFps:), @"7", 0);
     [g addItem:[NSMenuItem separatorItem]];
     add(g, @"Take Screenshot (F10)", @selector(screenshot:), @"").toolTip =
