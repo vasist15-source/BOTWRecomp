@@ -987,3 +987,69 @@ if(WIN32 AND SDL3_FOUND)
     endforeach()
   endif()
 endif()
+
+# Espresso NI single-precision underflow, including the camera refinement regression.
+add_executable(float_mode_test runtime/tools/float_mode_test.cpp runtime/src/espresso_fp.c)
+target_include_directories(float_mode_test PRIVATE runtime/include)
+target_compile_options(float_mode_test PRIVATE -UNDEBUG -ffp-contract=off)
+add_test(NAME float_mode COMMAND float_mode_test)
+
+# Exercise signed ADPCM offsets through the production HLE and decoder.
+add_executable(ax_resume_offset_test runtime/tools/ax_resume_offset_test.cpp)
+target_include_directories(ax_resume_offset_test PRIVATE runtime/src runtime/include)
+target_compile_options(ax_resume_offset_test PRIVATE -UNDEBUG)
+target_link_libraries(ax_resume_offset_test PRIVATE Threads::Threads)
+add_test(NAME ax_resume_offset COMMAND ax_resume_offset_test)
+
+# Tests extracting real functions from a user's generated v208 code are opt-in.
+# No generated game source or data is checked in. The fixtures use POSIX mmap.
+option(BOTW_GUEST_TESTS "Build offline v208 guest-function regressions" OFF)
+if(BOTW_GUEST_TESTS AND UNIX)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(BOTW_JPEG_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/botw_jpeg_fixture.c)
+  add_custom_command(OUTPUT ${BOTW_JPEG_FIXTURE}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/jpeg_fixture.py ${GEN_DIR} ${BOTW_JPEG_FIXTURE}
+    DEPENDS tools/jpeg_fixture.py ${GEN_SOURCES} VERBATIM)
+  add_executable(botw_jpeg_test runtime/tools/botw_jpeg_test.cpp runtime/src/botw_jump.c
+    runtime/src/espresso_fp.c ${BOTW_JPEG_FIXTURE})
+  target_include_directories(botw_jpeg_test PRIVATE runtime/include)
+  target_compile_options(botw_jpeg_test PRIVATE -UNDEBUG -ffp-contract=off)
+  set(BOTW_JPEG_TEST_DATA "" CACHE FILEPATH "Locally extracted v208 .rodata for JPEG regression")
+  if(BOTW_JPEG_TEST_DATA)
+    add_test(NAME botw_jpeg COMMAND botw_jpeg_test ${BOTW_JPEG_TEST_DATA})
+  endif()
+endif()
+
+add_executable(fps_limiter_test runtime/tools/fps_limiter_test.cpp)
+target_compile_options(fps_limiter_test PRIVATE -UNDEBUG)
+add_test(NAME fps_limiter COMMAND fps_limiter_test)
+if(BOTW_GUEST_TESTS AND UNIX)
+  foreach(kind timing loading fps)
+    set(fixture ${CMAKE_CURRENT_BINARY_DIR}/botw_${kind}_fixture.c)
+    add_custom_command(OUTPUT ${fixture}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/${kind}_fixture.py ${GEN_DIR} ${fixture}
+      DEPENDS tools/${kind}_fixture.py tools/botw_fps_patches.py ${GEN_SOURCES} VERBATIM)
+    set(extra)
+    if(NOT kind STREQUAL "loading")
+      list(APPEND extra runtime/src/botw_timing.cpp runtime/src/espresso_fp.c)
+    endif()
+    if(kind STREQUAL "fps")
+      list(APPEND extra runtime/src/botw_cutscene.cpp)
+    endif()
+    add_executable(botw_${kind}_test runtime/tools/botw_${kind}_test.cpp ${extra} ${fixture})
+    target_include_directories(botw_${kind}_test PRIVATE runtime/include)
+    target_compile_options(botw_${kind}_test PRIVATE -UNDEBUG -ffp-contract=off)
+    add_test(NAME botw_${kind} COMMAND botw_${kind}_test)
+  endforeach()
+endif()
+
+add_executable(botw_motion_test runtime/tools/botw_motion_test.cpp ${MOTION_SOURCES})
+target_include_directories(botw_motion_test PRIVATE runtime/src)
+target_compile_options(botw_motion_test PRIVATE -UNDEBUG)
+target_link_libraries(botw_motion_test PRIVATE Threads::Threads)
+if(WIN32)
+  target_link_libraries(botw_motion_test PRIVATE ws2_32)
+endif()
+foreach(fps 30 60 90 120)
+  add_test(NAME botw_motion_${fps} COMMAND botw_motion_test ${fps})
+endforeach()

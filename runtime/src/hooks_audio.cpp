@@ -4,7 +4,7 @@
 // PowerPC 0x43300000 trick: ~10 memory operations per sample).
 //
 // The results are identical to the original: the same order of operations, each step computed in
-// double and rounded to single exactly as fmadds/frsp do (ppc.h's to_single, round25, ppc_fctiwz),
+// double and rounded to single exactly as fmadds/frsp do (ppc_to_single, round25, ppc_fctiwz),
 // and the same constants read from the game's data (GD(): the installed build's address, USA or EU).
 // Only the volatile registers (r0, r3-r12, f0-f13, ctr, xer, cr0/cr1) end differently, which callers
 // do not rely on (PowerPC EABI).
@@ -34,11 +34,11 @@ void filter8(Cpu* c) {
     const double maxv = ldf32d(GD(0x10170620)), minv = ldf32d(GD(0x10170624)), start = ldf32d(GD(0x10170628)),
                  scale = round25(ldf32d(GD(0x1017062C)));
     double k[8];
-    for (int t = 0; t < 8; t++) k[t] = round25(to_single((double)lds16(coef + 2 * t)));
+    for (int t = 0; t < 8; t++) k[t] = round25(ppc_to_single(c, (double)lds16(coef + 2 * t)));
     for (int n = 0; n < 80; n++, in += 2) {
         double acc = start;
-        for (int t = 0; t < 8; t++) acc = to_single(to_single((double)lds16(in + 2 * t)) * k[t] + acc);
-        double v = to_single(acc * scale);
+        for (int t = 0; t < 8; t++) acc = ppc_to_single(c, ppc_to_single(c, (double)lds16(in + 2 * t)) * k[t] + acc);
+        double v = ppc_to_single(c, acc * scale);
         uint64_t r;
         if (v < minv)  // a NaN fails both tests, as the cr bits from fcmpu do
             r = ppc_fctiwz(minv);
@@ -59,11 +59,11 @@ void mix_ramp(Cpu* c) {
         return;
     }
     const double maxv = ldf32d(GD(0x10170848)), minv = ldf32d(GD(0x1017084C));
-    const double step = to_single(to_single(c->f[2].ps0 - c->f[1].ps0) / ldf32d(GD(0x10170844)));
+    const double step = ppc_to_single(c, ppc_to_single(c, c->f[2].ps0 - c->f[1].ps0) / ldf32d(GD(0x10170844)));
     double vol = c->f[1].ps0;
     uint32_t dst = c->r[4], src = c->r[5];
     for (int n = 0; n < 80; n++, dst += 2, src += 2) {
-        double v = to_single(to_single((double)lds16(src)) * round25(vol) + to_single((double)lds16(dst)));
+        double v = ppc_to_single(c, ppc_to_single(c, (double)lds16(src)) * round25(vol) + ppc_to_single(c, (double)lds16(dst)));
         uint64_t r;
         if (v < minv)
             r = ppc_fctiwz(minv);
@@ -71,7 +71,7 @@ void mix_ramp(Cpu* c) {
             if (v > maxv) v = maxv;
             r = ppc_fctiwz(v);
         }
-        vol = to_single(vol + step);
+        vol = ppc_to_single(c, vol + step);
         st16(dst, low16(r));
     }
     c->f[1].ps0 = vol;

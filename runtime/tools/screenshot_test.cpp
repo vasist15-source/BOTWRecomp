@@ -153,7 +153,7 @@ int main() {
     CHECK(!screenshot::key_down(kVK_F10) && screenshot::key_down(kVK_F9));
 
     // 3. requests: one per press (the two key presses above are one pending request), scripted frames,
-    //    names WindWakerHD_YYYY-MM-DD_HH-MM-SS[_n].png, the GamePad file only with the option
+    //    names BreathOfTheWild_YYYY-MM-DD_HH-MM-SS[_n].png, the GamePad file only with the option
     std::string tv, gp, tv2, gp2;
     CHECK(screenshot::take(1, tv, gp));
     CHECK(!screenshot::take(2, tv2, gp2));
@@ -165,7 +165,9 @@ int main() {
     pad[input_map::kPadR3] = 0;
     screenshot::poll_controller(pad);
     const std::string name = fs::path(tv).filename().string();
-    CHECK(name.rfind("WindWakerHD_", 0) == 0 && name.size() >= 35 && name[16] == '-' && name[22] == '_');
+    const std::string prefix = "BreathOfTheWild_";
+    CHECK(name.rfind(prefix, 0) == 0 && name.size() >= prefix.size() + 23 &&
+          name[prefix.size() + 4] == '-' && name[prefix.size() + 10] == '_' && name.ends_with(".png"));
     CHECK(fs::path(tv).parent_path() == dir && gp.empty());
     CHECK(tv2 != tv);  // still reserved (not written yet): the next name
     screenshot::set_gamepad_too(true);
@@ -185,7 +187,7 @@ int main() {
     for (const std::string& p : {tv, tv2, tv3, gp3}) CHECK(fs::exists(p) && !fs::exists(p + ".part"));
     CHECK(!fs::exists(tv7) && !fs::exists(gp7));
     CHECK(screenshot::last_file() == tv3 || screenshot::last_file() == tv2 || screenshot::last_file() == tv);
-    CHECK(g_notices.size() == 3 && g_notices[0].rfind("Screenshot saved: WindWakerHD_", 0) == 0);
+    CHECK(g_notices.size() == 3 && g_notices[0].rfind("Screenshot saved: BreathOfTheWild_", 0) == 0);
 
     // 5. encoding time of a large picture (2x internal resolution at 21:9), for the log
     {

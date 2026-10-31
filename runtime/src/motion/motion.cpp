@@ -21,6 +21,7 @@ namespace motion {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+bool scripted_motion();
 constexpr float kRadToDeg = 57.2957795f;
 // a device turning faster than this (rad/s, about 20 deg/s) takes over from a resting one
 constexpr float kMoving = 0.35f;
@@ -36,6 +37,7 @@ struct Device {
     Fusion fusion;
     uint64_t last_ns = 0;
     Clock::time_point seen{}, moved{}, log_at{};
+    bool paused = false;
     bool stalled = false;       // "no motion" logged, waiting for samples again
     int bad_stamps = 0;         // samples in a row whose sensor time did not advance plausibly
     bool stamps_logged = false;
@@ -47,7 +49,6 @@ constexpr uint64_t kNone = ~0ull, kDsuDevice = ~1ull;
 bool g_motion_seen = false;  // vpad(): motion arrived from the current source (else Cemu's neutral values)
 std::map<uint64_t, Device> g_devices;   // controllers (key: host device id) and the DSU slot (key kDsuDevice)
 uint64_t g_active = kNone;              // the device that turns the virtual GamePad
-Aim g_pending;                          // the active device's aim not yet read by the game
 VirtualPad g_pad;                       // the one virtual GamePad all sources turn
 std::unique_ptr<dsu::Client> g_dsu;
 VpadMotion g_last;                      // the previous read's values (repeated reads)
@@ -74,7 +75,7 @@ void feed(uint64_t id, uint64_t t_ns, Vec3 gyro_h, Vec3 acc_h) {
     // dt from the sensor's own clock; the arrival time when that clock does not advance plausibly (a
     // driver without timestamps, a clock that stalls or wraps): the motion must never stop because of it
     float dt = 0;
-    if (!fresh) {
+    if (!fresh && !d.paused) {
         const double ds = d.last_ns && t_ns > d.last_ns ? (double)(t_ns - d.last_ns) * 1e-9 : -1.0;
         if (ds > 0 && ds < 0.25) {
             dt = (float)ds;
@@ -89,6 +90,7 @@ void feed(uint64_t id, uint64_t t_ns, Vec3 gyro_h, Vec3 acc_h) {
         if (d.stalled) log_msg("[gyro] motion from %s again (after %.1f s without samples)", device_name(id).c_str(), secs(now - d.seen));
     }
     d.stalled = false;
+    d.paused = false;
     d.last_ns = t_ns;
     d.seen = now;
     d.samples++;
@@ -106,9 +108,18 @@ void feed(uint64_t id, uint64_t t_ns, Vec3 gyro_h, Vec3 acc_h) {
     if (take_over && g_active != id) {
         log_msg("[gyro] motion from %s", device_name(id).c_str());
         g_active = id;
-        g_pending = {};
     }
-    if (g_active == id) g_pending = g_pending + aim;
+    if (g_active == id && !scripted_motion()) {
+        // Integrate each sensor sample in order, before the game's render-dependent polling.
+        // Summing Euler increments per VPADRead loses non-commuting turns and changes with FPS.
+        const Aim tuned = g_settings.tuning.apply(aim);
+        if (g_settings.tuning.axis == kNativeAxes) {
+            g_pad.turn_physical(std::min(dt, 0.1f), aim, tuned);
+            g_pad.observe_gravity(std::min(dt, 0.1f), acc_h);
+        } else
+            g_pad.turn(std::min(dt, 0.1f), tuned);
+        g_read_aim = g_read_aim + tuned;
+    }
     d.logged_aim = d.logged_aim + aim;
     if (g_log && secs(now - d.log_at) >= 0.5) {
         const double span = d.log_at.time_since_epoch().count() ? secs(now - d.log_at) : 0.5;
@@ -164,6 +175,8 @@ const std::vector<TestTurn>& test_turns() {
     return v;
 }
 
+bool scripted_motion() { return !test_turns().empty(); }
+
 }  // namespace
 
 const char* source_id(int s) {
@@ -182,6 +195,7 @@ int source_from_id(const std::string& id) {
 
 std::string value_of(const Settings& s, const std::string& k) {
     auto f = [](float x) { char b[32]; snprintf(b, sizeof b, "%g", x); return std::string(b); };
+    if (k == "gyro.mappingVersion") return std::to_string(s.mapping_version);
     if (k == "gyro.source") return source_id(s.source);
     if (k == "gyro.axis") return axis_id(s.tuning.axis);
     if (k == "gyro.sensitivityX") return f(s.tuning.sensitivity_x);
@@ -208,7 +222,8 @@ void from_kv(Settings& s, const std::string& k, const std::string& v) {
         return end && end != v.c_str() && x == x ? std::clamp(x, lo, hi) : def;
     };
     const float lo = Tuning::kMinSensitivity, hi = Tuning::kMaxSensitivity, def = Tuning::kDefaultSensitivity;
-    if (k == "gyro.source") { int i = source_from_id(v); if (i >= 0) s.source = i; }
+    if (k == "gyro.mappingVersion") s.mapping_version = (int)num(0, 2, 0);
+    else if (k == "gyro.source") { int i = source_from_id(v); if (i >= 0) s.source = i; }
     else if (k == "gyro.axis") { int i = axis_from_id(v.c_str()); if (i >= 0) s.tuning.axis = i; }
     else if (k == "gyro.sensitivityX") s.tuning.sensitivity_x = num(lo, hi, def);
     else if (k == "gyro.sensitivityY") s.tuning.sensitivity_y = num(lo, hi, def);
@@ -224,6 +239,16 @@ void from_kv(Settings& s, const std::string& k, const std::string& v) {
 void upgrade_from_first_release(Settings& s) {
     if (s.tuning.sensitivity_x == 1.0f) s.tuning.sensitivity_x = Tuning::kDefaultSensitivity;
     if (s.tuning.sensitivity_y == 1.0f) s.tuning.sensitivity_y = Tuning::kDefaultSensitivity;
+}
+
+void upgrade_controller_mapping(Settings& s) {
+    if (s.mapping_version >= 2) return;
+    if (s.tuning.axis == kPlayerSpace && s.source != kMouse) {
+        s.tuning.axis = kNativeAxes;
+        if (s.tuning.sensitivity_x == 0.5f) s.tuning.sensitivity_x = 1.0f;
+        // Preserve vertical sensitivity: the reported regression is horizontal/roll.
+    }
+    s.mapping_version = 2;
 }
 
 Settings settings() {
@@ -254,7 +279,7 @@ void set_settings(const Settings& in) {
             // the virtual GamePad stays where it is (the game would see a jump otherwise)
             g_devices.clear();
             g_active = kNone;
-            g_pending = {};
+            g_pad.stop_rate();
             g_mouse_dx = g_mouse_dy = 0;
         }
         restart_dsu = source_changed || (dsu_changed && s.source == kCemuhook);
@@ -273,12 +298,25 @@ void controller_sample(uint64_t device, uint64_t t_ns, const float gyro[3], cons
     std::lock_guard lk(g_mu);
     if (g_settings.source == kController) feed(device, t_ns, g, a);
 }
+void controller_sample_gamecontroller(uint64_t device, uint64_t t_ns, const float gyro[3], const float accel[3]) {
+    Vec3 g, a;
+    from_gamecontroller(gyro, accel, g, a);
+    if (!t_ns) t_ns = (uint64_t)Clock::now().time_since_epoch().count();
+    std::lock_guard lk(g_mu);
+    if (g_settings.source == kController) feed(device, t_ns, g, a);
+}
+void controller_paused(uint64_t device) {
+    std::lock_guard lk(g_mu);
+    auto it = g_devices.find(device);
+    if (it != g_devices.end()) it->second.paused = true;
+    if (g_active == device) g_pad.stop_rate();
+}
 void controller_gone(uint64_t device) {
     std::lock_guard lk(g_mu);
     if (g_devices.erase(device) && g_settings.source == kController) log_msg("[gyro] %s disconnected", device_name(device).c_str());
     if (g_active == device) {
+        g_pad.stop_rate();
         g_active = kNone;
-        g_pending = {};
     }
 }
 bool wants_controller_sensors() {
@@ -319,7 +357,7 @@ bool aiming() {
 void recalibrate() {
     std::lock_guard lk(g_mu);
     for (auto& [id, d] : g_devices) d.fusion.recalibrate();
-    g_pending = {};
+    g_pad.stop_rate();
     g_mouse_dx = g_mouse_dy = 0;
     log_msg("[gyro] recalibrating: the bias is learnt anew when the controller rests");
 }
@@ -386,8 +424,6 @@ VpadMotion vpad(bool repeat) {
         aim = g_settings.tuning.apply({g_mouse_dx * k, -g_mouse_dy * k});
         g_mouse_dx = g_mouse_dy = 0;
     } else if (g_settings.source == kController || g_settings.source == kCemuhook) {
-        aim = g_settings.tuning.apply(g_pending);
-        g_pending = {};
         auto it = g_devices.find(g_active);
         if (it != g_devices.end() && !it->second.stalled && secs(now - it->second.seen) > 1.0) {
             it->second.stalled = true;
@@ -395,8 +431,10 @@ VpadMotion vpad(bool repeat) {
                     device_name(g_active).c_str());
         }
     }
-    g_pad.turn(step, aim);
-    g_read_aim = g_read_aim + aim;
+    if (!test_turns().empty() || g_settings.source == kMouse) {
+        g_pad.turn(step, aim);
+        g_read_aim = g_read_aim + aim;
+    }
     if (g_log && g_settings.source != kOff && secs(now - g_read_log_at) >= 0.5) {
         const double span = g_read_log_at.time_since_epoch().count() ? secs(now - g_read_log_at) : 0.5;
         log_msg("[gyro] GamePad turned %.1f right, %.1f up deg/s; aiming %d; right stick %.2f %.2f", g_read_aim.yaw * kRadToDeg / span,
@@ -410,7 +448,15 @@ VpadMotion vpad(bool repeat) {
     // pose. Once motion arrived the pose stays (no jump when a controller goes or the source changes).
     g_motion_seen = g_motion_seen || !test_turns().empty() || g_settings.source == kMouse ||
                     ((g_settings.source == kController || g_settings.source == kCemuhook) && !g_devices.empty());
-    g_last = g_pad.vpad();
+    // VPAD gyro is a rate, not a frame delta. Keep it between fresh sensor packets so a
+    // 60 Hz Switch Pro does not lose half its aiming speed in a 120 FPS game. Expire it
+    // when input stops/disconnects; zero-rate packets stop it immediately.
+    auto device = g_devices.find(g_active);
+    const bool hold_rate = !scripted_motion() && (g_settings.source == kController || g_settings.source == kCemuhook) &&
+                           device != g_devices.end() && !device->second.paused && secs(now - device->second.seen) < 0.1;
+    if (!scripted_motion() && !hold_rate && (g_settings.source == kOff || (device != g_devices.end() && (device->second.paused || secs(now - device->second.seen) >= 0.1))))
+        g_pad.stop_rate();
+    g_last = g_pad.vpad(hold_rate);
     if (!g_motion_seen) {
         g_last = VpadMotion{};
         g_last.acc = {0, 0, 0};

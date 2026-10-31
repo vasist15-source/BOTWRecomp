@@ -1,5 +1,7 @@
 #include "../game_clock.h"
 #include "vsync_pacing.h"
+#include "fps_limiter.h"
+#include "botw_fps.h"
 #include "../mods/fast_forward.h"
 #include "../perf_metrics.h"
 #include "../platform/host.h"
@@ -913,7 +915,7 @@ void fps_frame() {
     lastDraws = draws;
     static const bool loadGuard = getenv("WWHD_FPS_LOAD_GUARD") && atoi(getenv("WWHD_FPS_LOAD_GUARD"));  // off: not needed once the limiter released its core
     busyFrames = frameDraws < 300 && loadGuard ? 0 : std::min(busyFrames + 1, 1000);
-    const bool gameplay = busyFrames >= 60;
+    const bool gameplay = busyFrames >= 60 || botw_cutscene_limit() > 0;
     g_fps_gameplay = gameplay;
     const double avg = (hist[0] + hist[1] + hist[2] + hist[3]) / 4;
     static int dbg = 0;
@@ -938,22 +940,23 @@ void fps_frame() {
             set_f32(st + 0x24 + core * 4, df * frameTime);
         }
 }
-// the frame limit on the game thread: 60, or with no cap WWHD_FPS_LIMIT (default 0 = none)
+// Cap fixed-step 30 fps as well as variable-step 60 fps. Guest vsync alone can
+// run above 30 on high-refresh displays, accelerating the fixed-step simulation.
 void fps_limit() {
     static const int envLimit = getenv("WWHD_FPS_LIMIT") ? atoi(getenv("WWHD_FPS_LIMIT")) : 0;
-    const int target = gx2::fps_target();
-    const int limit = !gx2::fps_pacing() ? 0 : target == 60 ? 60 : envLimit;
-    if (limit <= 0) return;
-    static auto next = std::chrono::steady_clock::now();
-    const auto period = std::chrono::nanoseconds(1000000000 / limit);
-    next += period;
+    static gx2::FrameLimiter limiter;
+    const int eventLimit = botw_cutscene_limit();
+    const int limit = gx2::frame_limit(botw_effective_fps(gx2::fps_target()),
+                                     gx2::fps_pacing() || eventLimit > 0, envLimit);
     const auto now = std::chrono::steady_clock::now();
-    if (next < now - period) {
-        next = now;
-    } else {
-        BlockingScope b;  // the other guest threads keep this core meanwhile
+    const auto next = limiter.deadline(now, limit);
+    if (limit <= 0) return;
+    if (next > now) {
+        BlockingScope b;  // release the guest core while sleeping, including at 30 fps
         std::this_thread::sleep_until(next);
     }
+    // Never catch up after an oversleep or a hitch: fixed-step frames would speed up.
+    limiter.released(std::chrono::steady_clock::now());
 }
 }  // namespace
 int gx2::fps_target() {
@@ -961,20 +964,24 @@ int gx2::fps_target() {
     if (v < 0) {
         const char* e = getenv("WWHD_FPS");
         v = e ? atoi(e) : 30;
-        if (v != 0 && v != 60) v = 30;
+        v = normalize_fps_target(v);
         int expected = -1;
         g_fps_target.compare_exchange_strong(expected, v);
         v = g_fps_target.load();
-        if (v != 30) LOG("[fps] frame rate %s", v ? "60" : "uncapped");
+        if (v) LOG("[fps] frame rate %d", v);
+        else LOG("[fps] frame rate uncapped");
     }
     return v;
 }
 void gx2::set_fps_target(int fps) {
-    if (fps != 0 && fps != 60) fps = 30;
+    fps = normalize_fps_target(fps);
     fps_target();
-    if (g_fps_target.exchange(fps) != fps) LOG("[fps] frame rate %s", fps == 30 ? "30 (the game's own)" : fps ? "60" : "uncapped");
+    if (g_fps_target.exchange(fps) != fps) {
+        if (fps) LOG("[fps] frame rate %d", fps);
+        else LOG("[fps] frame rate uncapped");
+    }
 }
-bool gx2::present_unsynced() { return gx2::uncapped() || (gx2::fps_target() == 0 && fps_pacing()); }
+bool gx2::present_unsynced() { return gx2::uncapped() || fps_present_unsynced(fps_target(), fps_pacing()); }
 bool gx2::fps_pacing() { return gx2::fps_target() != 30 && g_fps_gameplay.load(std::memory_order_relaxed); }
 
 static void update_flips() {  // g_flip_mutex held

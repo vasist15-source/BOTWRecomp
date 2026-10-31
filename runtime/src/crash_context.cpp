@@ -2,7 +2,7 @@
 #include "crash_redact.h"
 #include "gfx/renderer.h"
 #include "input.h"
-#include "interp.h"
+#include "gx2/gx2.h"
 #include "mods/manager.h"
 #include "mods/packages.h"
 #include <atomic>
@@ -66,7 +66,7 @@ void refresh() {
     std::ostringstream out;
     out << "\n--- crash context (latest game-thread snapshot) ---\n";
     out << "renderer=" << render::api_name(render::active()) << "\nresolution=" << (render::g_backend ? render::res_scale() : 1.f)
-        << "\nframe_mode=" << interp::mode_name() << "\nframe_target=" << interp::fps()
+        << "\nframe_mode=" << (gx2::fps_pacing() ? "variable" : "fixed") << "\nframe_target=" << gx2::fps_target()
         << "\ncontroller=" << (input::pro_controller() ? "Pro" : "GamePad") << '\n';
     for (const auto& entry : mods::manager::entries()) out << "builtin." << entry.id << '=' << entry.enabled() << '\n';
     for (const auto& package : mods::packages::list()) if (package.enabled || package.active)
