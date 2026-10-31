@@ -993,3 +993,10 @@ add_executable(float_mode_test runtime/tools/float_mode_test.cpp runtime/src/esp
 target_include_directories(float_mode_test PRIVATE runtime/include)
 target_compile_options(float_mode_test PRIVATE -UNDEBUG -ffp-contract=off)
 add_test(NAME float_mode COMMAND float_mode_test)
+
+# Exercise signed ADPCM offsets through the production HLE and decoder.
+add_executable(ax_resume_offset_test runtime/tools/ax_resume_offset_test.cpp)
+target_include_directories(ax_resume_offset_test PRIVATE runtime/src runtime/include)
+target_compile_options(ax_resume_offset_test PRIVATE -UNDEBUG)
+target_link_libraries(ax_resume_offset_test PRIVATE Threads::Threads)
+add_test(NAME ax_resume_offset COMMAND ax_resume_offset_test)

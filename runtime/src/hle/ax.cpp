@@ -112,6 +112,17 @@ uint64_t base_units(uint16_t fmt, uint32_t samples_ptr) {
     }
 }
 
+uint64_t absolute_offset(uint16_t fmt, uint32_t samples_ptr, uint32_t offset) {
+    const uint64_t base = base_units(fmt, samples_ptr);
+    // ADPCM offsets are 32-bit relative nibble positions. After an Ex call
+    // rebases a segmented sound, the current cursor (or end) can precede the
+    // new base. Cemu's AX_readADPCMSamples addresses sampleBase with an int32
+    // nibble offset, including NW4F's -1 rewind. Sign-extend the displacement,
+    // not the absolute address: high guest buffers still need 33 address bits.
+    if (fmt == ADPCM) return uint64_t(int64_t(base) + int64_t(int32_t(offset)));
+    return base + offset;
+}
+
 // mirror the playback position into the guest VPB (offsets relative to the sample buffer)
 void write_offsets(const Voice& v) {
     const uint32_t o = v.vpb + kVpbOffsets;
@@ -959,10 +970,9 @@ HLE(snd_core, AXSetVoiceOffsets) {
     v->loop = ld16(o + 2);
     v->samples = ld32(o + 0x10);
     trace_voice_start(c, arg(c, 0), v->samples);  // new sample data on a voice = a (re)started sound
-    const uint64_t b = base_units(v->format, v->samples);
-    v->loop_abs = b + ld32(o + 4);
-    v->end_abs = b + ld32(o + 8);
-    v->cur_abs = b + ld32(o + 0xC);
+    v->loop_abs = absolute_offset(v->format, v->samples, ld32(o + 4));
+    v->end_abs = absolute_offset(v->format, v->samples, ld32(o + 8));
+    v->cur_abs = absolute_offset(v->format, v->samples, ld32(o + 0xC));
     write_offsets(*v);
 }
 HLE(snd_core, AXGetVoiceOffsets) {
@@ -989,7 +999,7 @@ HLE(snd_core, AXSetVoiceEndOffsetEx) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (Voice* v = voice(arg(c, 0))) {
         v->samples = arg(c, 2);
-        v->end_abs = base_units(v->format, v->samples) + arg(c, 1);
+        v->end_abs = absolute_offset(v->format, v->samples, arg(c, 1));
         write_offsets(*v);
     }
 }
@@ -998,7 +1008,7 @@ HLE(snd_core, AXSetVoiceLoopOffsetEx) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (Voice* v = voice(arg(c, 0))) {
         v->samples = arg(c, 2);
-        v->loop_abs = base_units(v->format, v->samples) + arg(c, 1);
+        v->loop_abs = absolute_offset(v->format, v->samples, arg(c, 1));
         write_offsets(*v);
     }
 }
@@ -1006,7 +1016,7 @@ HLE(snd_core, AXSetVoiceLoopOffsetEx) {
 HLE(snd_core, AXSetVoiceCurrentOffset) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (Voice* v = voice(arg(c, 0))) {
-        v->cur_abs = base_units(v->format, v->samples) + arg(c, 1);
+        v->cur_abs = absolute_offset(v->format, v->samples, arg(c, 1));
         write_offsets(*v);
     }
 }
