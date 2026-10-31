@@ -2012,7 +2012,8 @@ static void write_back_linear_copy(Surface* img, GX2Surface* d, uint32_t dbase, 
 // work and written to guest memory once that work has completed (a later DrawDone or swap), instead
 // of waiting for an idle GPU at every DrawDone (BotW draws one every frame: 21% of the render
 // thread in waitUntilCompleted). The CPU sees the result a frame or so later, like Cemu's
-// asynchronous readback. WWHD_SYNC_WRITE_BACK=1 restores the wait.
+// asynchronous readback. CPU probes and BotW's actor picking results must instead be available
+// at DrawDone return (see below). WWHD_SYNC_WRITE_BACK=1 restores the wait for all targets.
 struct PendingWriteBack {
     id<MTLBuffer> buf;
     id<MTLCommandBuffer> cmd;
@@ -2106,15 +2107,20 @@ void write_back_linear_targets() {
         // DrawDone and reads it. A frame late, its water colour table (BotW) took each value one slot off and
         // kept a white default in the first, on the boots where the copy lagged (white water). One wait for
         // all of a DrawDone's probes, only on the frames that draw them; the big targets stay asynchronous.
-        // 1x1 only: the 3x3 end of the exposure chain (3D0FCB00) is drawn last in every frame, so waiting
+        // Keep the 3x3 end of the exposure chain asynchronous: it is drawn last in every frame, so waiting
         // for it held the game thread until the GPU finished the whole frame (~6 ms a frame in villages).
         // And drawn from CPU textures only: the 1x1 targets drawn from GPU results (the sky cube's 3D0F9900
         // and 3D0F9E00, 3CD9BC00 from a screen image) waited for the frame's whole GPU backlog likewise
         const bool probe = s->width == 1 && s->height == 1 && !s->probeFromGpu;
-        if (probe && !sync) {
+        // BotW's double-buffered 4x4 picking outputs contain actor self-pointers (RGBA8) and
+        // hit data (RGBA32F). Stasis consumes them after DrawDone. Publishing an older GPU
+        // result can resurrect a destroyed StoneBall and crash the actor-tag lookup. These
+        // GPU-derived results must join the main-queue wait, not the independent probe queue.
+        const bool picking = s->width == 4 && s->height == 4 && (s->format == 0x1a || s->format == 0x823);
+        if ((probe || picking) && !sync) {
             // drawn on the probe queue with nothing newer since: wait for that command buffer only
             auto pr = g_probe_reads.find(s);
-            if (pr != g_probe_reads.end() && pr->second.writeSeq == s->writeSeq) {
+            if (probe && pr != g_probe_reads.end() && pr->second.writeSeq == s->writeSeq) {
                 probes.push_back({pr->second.buf, pr->second.cmd, addr, s->width, s->height, bytes, pitch});
                 g_probe_reads.erase(pr);
                 continue;
