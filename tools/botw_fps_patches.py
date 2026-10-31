@@ -1,6 +1,7 @@
 """v208 fixed-frame exceptions, applied only after the RPX identity check.
 
-Sites were cross-checked against Cemu graphic packs' FPS++ v208 patches.
+Adapted from Cemu graphic packs' FPS++ v208 patches (CC0-1.0).
+Source links and regression instructions: docs/gameplay-regressions.md.
 Use our engine's measured interval, not the requested FPS or bullet-time speed.
 Original control flow, object properties, and unrelated registers stay intact.
 """
