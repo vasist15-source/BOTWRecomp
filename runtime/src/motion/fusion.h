@@ -4,14 +4,11 @@
 //
 // Plain C++ (no SDL, no sockets), unit-tested in runtime/tools/motion_test.cpp.
 //
-// How the game reads it (docs/gyro.md): WWHD's first-person camera (dCamera_c::CalcSubjectAngle) only uses
-// the change of the GamePad's direction matrix from one frame to the next, R = Cᵀ·M with C the previous
-// frame's matrix: yaw input (R[2][0] − R[1][0])·30, pitch input R[2][1]·30, both used like a right-stick
-// value. R is the turn in the GamePad's own frame, so the port does not mirror the controller's pose: each
-// source works out how far the player turned (left/right, up/down) and the virtual GamePad turns by exactly
-// that about its own axes. The camera then follows the same way however the controller is held, nothing
-// jumps when a controller connects, disconnects or the source changes, and the pose can never drift into a
-// position where a turn reads as something else.
+// BotW needs all three axes: shrines consume orientation/tilt as well as angular rate.
+// Legacy two-axis modes are retained for players who explicitly choose an aiming-only mapping.
+// The default native mode integrates unscaled physical body turns at sensor cadence; VPAD
+// gyro/angle apply the aiming sensitivity independently. Neither FPS nor sensitivity may
+// distort the physical orientation after a closed sequence of shrine turns.
 //
 // Frames. Adapted from Cemu (MPL-2.0, https://github.com/cemu-project/Cemu): the axis signs of the SDL and
 // DSU sources and the VPAD layout; the code here is our own.
@@ -71,40 +68,42 @@ struct VpadMotion {
 // ---- host sources -> frame H ----
 // SDL: gyro rad/s and acceleration m/s^2 in SDL's frame (x right, y up, z towards the player)
 void from_sdl(const float gyro[3], const float accel[3], Vec3& gyro_h, Vec3& acc_h);
+// Apple GameController: rad/s, gravity-inclusive acceleration in g, x right / y top / z face-up.
+void from_gamecontroller(const float gyro[3], const float accel[3], Vec3& gyro_h, Vec3& acc_h);
 // Cemuhook (DSU): gyro deg/s (pitch, yaw, roll) and acceleration in g, as DS4Windows and the others send
 void from_dsu(const float gyro_deg[3], const float accel_g[3], Vec3& gyro_h, Vec3& acc_h);
 
 // Which motion of the controller turns the view left/right (the usual gyro aiming conventions, as in
 // JoyShockMapper and Steam Input). Up/down is always tilting the controller's top up or down.
 enum AxisMode : int {
-    kPlayerSpace,  // turning about the real vertical, however the controller is held (default)
+    kPlayerSpace,  // aiming-only: turn about the real vertical, however the controller is held
     kYawAxis,      // turning about the controller's own vertical axis (best held flat)
     kRollAxis,     // rolling it like a steering wheel
+    kNativeAxes,   // all three physical axes, for BotW aiming and motion-controlled shrine apparatus
     kAxisModeCount
 };
-const char* axis_id(int a);     // "player", "yaw", "roll"
+const char* axis_id(int a);     // "player", "yaw", "roll", "native"
 const char* axis_label(int a);
 int axis_from_id(const char* id);  // -1 if unknown
 
-// How far the player turned the controller: radians to the right and up.
+// Physical/aim turn in radians: yaw right, pitch up, roll right side down.
 struct Aim {
-    float yaw = 0, pitch = 0;
-    Aim operator+(Aim o) const { return {yaw + o.yaw, pitch + o.pitch}; }
+    float yaw = 0, pitch = 0, roll = 0;
+    Aim operator+(Aim o) const { return {yaw + o.yaw, pitch + o.pitch, roll + o.roll}; }
 };
 
-// The player's settings for every source (Gyro settings in the overlay's Controls tab). Sensitivity is the
-// virtual GamePad's turn per turn of the controller: at 1.0 the camera turns as far as with a real GamePad
-// turned by the same angle. The game turns its first-person camera about 1.9x the GamePad's left/right turn
-// and 1.5x its up/down tilt (measured in R3 look), so the default 0.5 is close to the view following the
-// controller one to one.
+// Sensitivity is the virtual GamePad turn per physical turn. BotW defaults to full three-axis
+// motion at 1x; the legacy WWHD aiming conventions remain opt-in. A shrine needs actual roll,
+// not roll projected onto a two-dimensional aiming direction.
 struct Tuning {
-    static constexpr float kDefaultSensitivity = 0.5f, kMinSensitivity = 0.05f, kMaxSensitivity = 5.0f;
+    static constexpr float kDefaultSensitivity = 1.0f, kMinSensitivity = 0.05f, kMaxSensitivity = 5.0f;
     float sensitivity_x = kDefaultSensitivity, sensitivity_y = kDefaultSensitivity;  // left/right, up/down
     bool invert_x = false, invert_y = false;
-    int axis = kPlayerSpace;  // AxisMode (controller sources; the mouse already moves left/right and up/down)
+    int axis = kNativeAxes;  // AxisMode (controller sources; the mouse already moves left/right and up/down)
     bool operator==(const Tuning&) const = default;
     Aim apply(Aim a) const {
-        return {a.yaw * sensitivity_x * (invert_x ? -1.0f : 1.0f), a.pitch * sensitivity_y * (invert_y ? -1.0f : 1.0f)};
+        return {a.yaw * sensitivity_x * (invert_x ? -1.0f : 1.0f), a.pitch * sensitivity_y * (invert_y ? -1.0f : 1.0f),
+                a.roll * sensitivity_x * (invert_x ? -1.0f : 1.0f)};
     }
 };
 
@@ -140,17 +139,27 @@ private:
     Aim aim_;
 };
 
-// The virtual GamePad: turned about its own axes by the aim (radians, right / up), it reports the VPAD values.
+// The virtual GamePad integrates the ordered three-axis sensor turns, then reports VPAD values.
 class VirtualPad {
 public:
     VirtualPad();
     void turn(float dt, Aim a);
-    // the VPAD values now; the gyro is the mean rate since the previous call (or the latest rate)
-    VpadMotion vpad();
+    // Native three-axis pose follows the physical controller, regardless of aiming gain.
+    // Only angular rate/angle use the tuned response; scaling pose increments makes a
+    // closed compound rotation fail to return to its starting orientation.
+    void turn_physical(float dt, Aim physical, Aim response);
+    // Native sensors provide an absolute down direction. Correct pitch/roll drift
+    // without changing yaw or synthesizing gyro input. Ignore shaking/invalid data.
+    void observe_gravity(float dt, Vec3 acceleration);
+    // Sensor sources retain the latest rate between packets (e.g. 60 Hz sensor / 120 FPS game).
+    // The caller expires stale sources; mouse/test turns use one-shot rates.
+    VpadMotion vpad(bool hold_rate = false);
     Quat orientation() const { return q_; }
+    void stop_rate() { window_ = 0; angle_read_ = angle_; last_rate_v_ = {}; }
 
 private:
     Quat q_;
+    bool have_gravity_ = false;
     Vec3 angle_, angle_read_, last_rate_v_;  // revolutions, VPAD frame
     double window_ = 0;                      // seconds turned since the last vpad()
 };

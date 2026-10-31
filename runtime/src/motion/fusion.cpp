@@ -41,6 +41,11 @@ void from_sdl(const float g[3], const float a[3], Vec3& gyro_h, Vec3& acc_h) {
     gyro_h = {g[0], -g[1], -g[2]};
     acc_h = Vec3{-a[0], a[1], a[2]} * (1.0f / kStandardGravity);
 }
+// CoreMotion/GameController: H = (x, -z, y); the accelerometer already has gravity's sign.
+void from_gamecontroller(const float g[3], const float a[3], Vec3& gyro_h, Vec3& acc_h) {
+    gyro_h = {g[0], -g[2], g[1]};
+    acc_h = {a[0], -a[2], a[1]};
+}
 // DSU servers send DS4 conventions: gyro (pitch, yaw, roll) deg/s, acceleration in g
 void from_dsu(const float g[3], const float a[3], Vec3& gyro_h, Vec3& acc_h) {
     const float k = kPi / 180.0f;
@@ -49,11 +54,11 @@ void from_dsu(const float g[3], const float a[3], Vec3& gyro_h, Vec3& acc_h) {
 }
 
 const char* axis_id(int a) {
-    static const char* ids[] = {"player", "yaw", "roll"};
+    static const char* ids[] = {"player", "yaw", "roll", "native"};
     return a >= 0 && a < kAxisModeCount ? ids[a] : ids[0];
 }
 const char* axis_label(int a) {
-    static const char* labels[] = {"Player space", "Yaw", "Roll"};
+    static const char* labels[] = {"Player space", "Yaw", "Roll", "Native (3 axes)"};
     return a >= 0 && a < kAxisModeCount ? labels[a] : labels[0];
 }
 int axis_from_id(const char* id) {
@@ -72,6 +77,7 @@ void Fusion::recalibrate() {
 
 Aim Fusion::aim_rate(Vec3 w, Vec3 g, int mode) {
     switch (mode) {
+    case kNativeAxes: return {w.y, w.x, w.z};
     case kYawAxis: return {w.y, w.x};
     case kRollAxis: return {w.z, w.x};
     default: {
@@ -122,6 +128,7 @@ void Fusion::update(float dt, Vec3 gyro, Vec3 acc, int mode) {
     Aim r = aim_rate(w, grav_, mode);
     aim_.yaw += r.yaw * dt;
     aim_.pitch += r.pitch * dt;
+    aim_.roll += r.roll * dt;
 }
 
 Aim Fusion::take() {
@@ -134,15 +141,20 @@ Aim Fusion::take() {
 VirtualPad::VirtualPad() : q_(Quat::axis_angle({1, 0, 0}, kPi / 2)) {}
 
 void VirtualPad::turn(float dt, Aim a) {
-    if (!std::isfinite(a.yaw) || !std::isfinite(a.pitch)) return;
+    turn_physical(dt, a, a);
+}
+
+void VirtualPad::turn_physical(float dt, Aim a, Aim response) {
+    if (!std::isfinite(a.yaw) || !std::isfinite(a.pitch) || !std::isfinite(a.roll)) return;
+    if (!std::isfinite(response.yaw) || !std::isfinite(response.pitch) || !std::isfinite(response.roll)) return;
     // right = +y, up = +x of frame H, about the virtual GamePad's own axes (q' = q * turn)
-    Vec3 v{a.pitch, a.yaw, 0};
+    Vec3 v{a.pitch, a.yaw, a.roll};
     if (float len = v.length(); len > 0) {
         q_ = q_ * Quat::axis_angle(v, len);
         q_.normalize();
     }
     // the GamePad frame is a mirror of H: the turn (a pseudo-vector) flips once more
-    Vec3 turn_v = Vec3{v.x, v.y, -v.z} * (-1.0f / kTwoPi);
+    Vec3 turn_v = Vec3{response.pitch, response.yaw, -response.roll} * (-1.0f / kTwoPi);
     angle_ = angle_ + turn_v;
     if (dt > 0) {
         last_rate_v_ = turn_v * (1.0f / dt);
@@ -150,16 +162,41 @@ void VirtualPad::turn(float dt, Aim a) {
     }
 }
 
-VpadMotion VirtualPad::vpad() {
+void VirtualPad::observe_gravity(float dt, Vec3 acc) {
+    if (!finite(acc) || !std::isfinite(dt) || dt < 0) return;
+    const float magnitude = acc.length();
+    const float error = std::fabs(magnitude - 1.0f);
+    if (error >= 0.15f) return;  // translation/free fall must not tilt the virtual pad
+    const Vec3 observed = acc * (1.0f / magnitude);
+    const Vec3 predicted = q_.unrotate({0, 0, 1});
+    const float cosine = std::clamp(observed.dot(predicted), -1.0f, 1.0f);
+    Vec3 axis = observed.cross(predicted);
+    const float sine = axis.length();
+    const float angle = std::atan2(sine, cosine);
+    if (sine < 1e-6f) {
+        if (cosine < 0) axis = observed.cross(std::fabs(observed.x) < .8f ? Vec3{1,0,0} : Vec3{0,0,1});
+        else { have_gravity_ = true; return; }
+    }
+    // Initialize from the actual hold, not an assumed flat controller. Later updates
+    // are gradual, including recovery from motion lost while settings block input.
+    const float step = std::min(dt, .1f);
+    float correction = have_gravity_ ? std::min(angle * (1 - std::exp(-2 * step)), step) : angle;
+    correction *= 1 - error / .15f;
+    q_ = q_ * Quat::axis_angle(axis, correction);
+    q_.normalize();
+    have_gravity_ = true;
+}
+
+VpadMotion VirtualPad::vpad(bool hold_rate) {
     VpadMotion m;
     // gyro: mean rate since the previous read
     if (window_ > 0) m.gyro = (angle_ - angle_read_) * (float)(1.0 / window_);
     else m.gyro = last_rate_v_;
-    last_rate_v_ = {};
+    if (!hold_rate) last_rate_v_ = {};
     angle_read_ = angle_;
     window_ = 0;
     m.angle = angle_;
-    // acc: gravity from the virtual pose (the game reads only dir; acc stays consistent with it)
+    // Native pose is corrected from measured gravity; BotW consumes both tilt and gyro.
     Vec3 d = q_.unrotate({0, 0, 1});  // world down in frame H
     // VPAD acc is the specific force, gravity points the other way: flat on a table it reads (0, -1, 0)
     m.acc = {-d.x, -d.y, d.z};

@@ -858,14 +858,20 @@ void save_gyro(const motion::Settings& g) {
 void load_gyro() {
     motion::Settings g;
     std::string v;
-    bool saved = false, axis = false;
+    bool saved = false, axis = false, mapping = false;
     for (const char* k : motion::kKeys)
         if (hostui::get(k, v)) {
             motion::from_kv(g, k, v);
             saved = true;
             axis |= !strcmp(k, "gyro.axis");
+            mapping |= !strcmp(k, "gyro.mappingVersion");
         }
     if (saved && !axis) motion::upgrade_from_first_release(g);
+    if (!mapping) g.mapping_version = 0;
+    if (g.mapping_version < 2) {
+        motion::upgrade_controller_mapping(g);
+        for (const char* k : motion::kKeys) hostui::set(k, motion::value_of(g, k));
+    }
     motion::set_settings(g);
 }
 // the Gyro window (Controls tab > Gyro...): source, axis, sensitivity, invert, recalibrate, Cemuhook server
@@ -885,14 +891,16 @@ void gyro_window(bool& open) {
     if (motion::env_override()) note("WWHD_GYRO=%s overrides the saved source.", getenv("WWHD_GYRO"));
     if (g.source == motion::kOff && motion::gyro_controllers() > 0) note("A controller with a gyro is connected: choose Controller gyro to use it.");
     if (g.source == motion::kController || g.source == motion::kCemuhook) {
-        ImGui::TextUnformatted("Turn left/right by");
-        for (int a = 0; a < motion::kAxisModeCount; a++) {
-            ImGui::SameLine();
-            if (radio(motion::axis_label(a), g.tuning.axis == a)) g.tuning.axis = a;
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::BeginCombo("Motion mapping", motion::axis_label(g.tuning.axis))) {
+            for (int a : {motion::kNativeAxes, motion::kPlayerSpace, motion::kYawAxis, motion::kRollAxis})
+                if (ImGui::Selectable(motion::axis_label(a), g.tuning.axis == a)) g.tuning.axis = a;
+            ImGui::EndCombo();
         }
-        help("Player space: turning the controller left or right about the real vertical, however you hold it "
-             "(recommended). Yaw: turning it about its own vertical axis (as if it lay flat). Roll: tilting it to "
-             "the side like a steering wheel. Tilting its top up or down always looks up or down.");
+        help("Native preserves pitch, yaw and roll for aiming and shrine apparatus. The other modes "
+             "project motion onto two aiming axes and do not preserve full shrine orientation.");
+        if (g.tuning.axis == motion::kNativeAxes)
+            note("Sensitivity changes aiming rate; shrine orientation follows the physical controller.");
     }
     const float lo = motion::Tuning::kMinSensitivity, hi = motion::Tuning::kMaxSensitivity;
     ImGui::SetNextItemWidth(220);
@@ -905,8 +913,8 @@ void gyro_window(bool& open) {
     if (check("Invert##y", g.tuning.invert_y, &v)) g.tuning.invert_y = v;
     if (ImGui::Button("Default sensitivity"))
         g.tuning.sensitivity_x = g.tuning.sensitivity_y = motion::Tuning::kDefaultSensitivity;
-    help("1.0 turns the view as far as moving a real Wii U GamePad by the same angle would (about twice the "
-         "controller's turn); the default 0.5 lets the view follow the controller about one to one.");
+    help("1.0 passes physical rotation to the game at its original scale. Left/right sensitivity also "
+         "affects roll aiming; up/down sensitivity affects pitch. Native orientation is not scaled.");
     if (g.source == motion::kMouse) {
         ImGui::SetNextItemWidth(220);
         ImGui::SliderFloat("Mouse: degrees per point", &g.mouse_degrees, 0.01f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
