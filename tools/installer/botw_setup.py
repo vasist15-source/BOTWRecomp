@@ -933,7 +933,7 @@ def cmd_recomp(rpx, out):
         while not stop.wait(1.0):
             print("@progress analyze 0 0", flush=True)
     threading.Thread(target=ticker, daemon=True).start()
-    r = recomp.Recompiler(rpx, probe_recomp.botw_build(rpx))
+    r = probe_recomp.make_recompiler(rpx)
     stop.set()
     total = len(r.sorted_entries)
     emit = r.emit_function

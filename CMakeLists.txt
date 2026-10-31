@@ -1000,3 +1000,22 @@ target_include_directories(ax_resume_offset_test PRIVATE runtime/src runtime/inc
 target_compile_options(ax_resume_offset_test PRIVATE -UNDEBUG)
 target_link_libraries(ax_resume_offset_test PRIVATE Threads::Threads)
 add_test(NAME ax_resume_offset COMMAND ax_resume_offset_test)
+
+# Tests extracting real functions from a user's generated v208 code are opt-in.
+# No generated game source or data is checked in. The fixtures use POSIX mmap.
+option(BOTW_GUEST_TESTS "Build offline v208 guest-function regressions" OFF)
+if(BOTW_GUEST_TESTS AND UNIX)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(BOTW_JPEG_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/botw_jpeg_fixture.c)
+  add_custom_command(OUTPUT ${BOTW_JPEG_FIXTURE}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/jpeg_fixture.py ${GEN_DIR} ${BOTW_JPEG_FIXTURE}
+    DEPENDS tools/jpeg_fixture.py ${GEN_SOURCES} VERBATIM)
+  add_executable(botw_jpeg_test runtime/tools/botw_jpeg_test.cpp runtime/src/botw_jump.c
+    runtime/src/espresso_fp.c ${BOTW_JPEG_FIXTURE})
+  target_include_directories(botw_jpeg_test PRIVATE runtime/include)
+  target_compile_options(botw_jpeg_test PRIVATE -UNDEBUG -ffp-contract=off)
+  set(BOTW_JPEG_TEST_DATA "" CACHE FILEPATH "Locally extracted v208 .rodata for JPEG regression")
+  if(BOTW_JPEG_TEST_DATA)
+    add_test(NAME botw_jpeg COMMAND botw_jpeg_test ${BOTW_JPEG_TEST_DATA})
+  endif()
+endif()
