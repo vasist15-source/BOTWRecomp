@@ -987,3 +987,9 @@ if(WIN32 AND SDL3_FOUND)
     endforeach()
   endif()
 endif()
+
+# Espresso NI single-precision underflow, including the camera refinement regression.
+add_executable(float_mode_test runtime/tools/float_mode_test.cpp runtime/src/espresso_fp.c)
+target_include_directories(float_mode_test PRIVATE runtime/include)
+target_compile_options(float_mode_test PRIVATE -UNDEBUG -ffp-contract=off)
+add_test(NAME float_mode COMMAND float_mode_test)

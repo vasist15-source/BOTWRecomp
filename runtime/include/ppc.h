@@ -172,6 +172,18 @@ static inline double round25(double d) {
 }
 static inline double to_single(double d) { return (double)(float)d; }
 
+/* FPSCR.NI flushes single-precision underflow before rounding, including a
+   value just below FLT_MIN that would otherwise round up to FLT_MIN. Keep
+   the sign of zero. Loads/stores are conversions, not arithmetic, and do
+   not use this helper. */
+static inline double ppc_to_single(const Cpu* c, double d) {
+    uint64_t bits = f64_as_u64(d);
+    if ((c->fpscr & 4u) &&
+        (bits & 0x7FFFFFFFFFFFFFFFull) < 0x3810000000000000ull)
+        return u64_as_f64(bits & 0x8000000000000000ull);
+    return to_single(d);
+}
+
 static inline void cr_set_f(Cpu* c, int f, double a, double b) {
     int un = isnan(a) || isnan(b);
     c->cr[4 * f + 0] = !un && a < b; c->cr[4 * f + 1] = !un && a > b;

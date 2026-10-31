@@ -463,7 +463,7 @@ def translate59(w, d, a, b, cc):
     }
     if xo not in ex:
         raise Unhandled("op59 xo=%d" % xo)
-    return "{ double v = to_single(%s); %s = v; %s = v; }%s" % (ex[xo], F0(d), F1(d), fp_rc(w))
+    return "{ double v = ppc_to_single(c, %s); %s = v; %s = v; }%s" % (ex[xo], F0(d), F1(d), fp_rc(w))
 
 
 def translate63(w, d, a, b, cc):
@@ -488,7 +488,7 @@ def translate63(w, d, a, b, cc):
     if xo in (0, 32):  # fcmpu / fcmpo
         return "cr_set_f(c, %d, %s, %s);" % (d >> 2, fa, fb)
     if xo == 12:  # frsp
-        return "{ double v = to_single(%s); %s = v; %s = v; }%s" % (fb, F0(d), F1(d), fp_rc(w))
+        return "{ double v = ppc_to_single(c, %s); %s = v; %s = v; }%s" % (fb, F0(d), F1(d), fp_rc(w))
     if xo == 15:
         return "%s = u64_as_f64(ppc_fctiwz(%s));%s" % (F0(d), fb, fp_rc(w))
     if xo == 14:
@@ -532,11 +532,11 @@ def translate4(w, d, a, b, cc):
     A0, A1, B0, B1, C0, C1 = F0(a), F1(a), F0(b), F1(b), F0(cc), F1(cc)
 
     def pair(e0, e1):
-        return "{ double v0 = to_single(%s), v1 = to_single(%s); %s = v0; %s = v1; }%s" % (e0, e1, F0(d), F1(d), fp_rc(w))
+        return "{ double v0 = ppc_to_single(c, %s), v1 = ppc_to_single(c, %s); %s = v0; %s = v1; }%s" % (e0, e1, F0(d), F1(d), fp_rc(w))
 
     if xo5 in (10, 11, 12, 13, 14, 15, 18, 20, 21, 23, 24, 25, 26, 28, 29, 30, 31):
-        if xo5 == 10: return "{ double v0 = to_single(%s + %s), v1 = %s; %s = v0; %s = v1; }" % (A0, B1, C1, F0(d), F1(d))
-        if xo5 == 11: return "{ double v0 = %s, v1 = to_single(%s + %s); %s = v0; %s = v1; }" % (C0, A0, B1, F0(d), F1(d))
+        if xo5 == 10: return "{ double v0 = ppc_to_single(c, %s + %s), v1 = %s; %s = v0; %s = v1; }" % (A0, B1, C1, F0(d), F1(d))
+        if xo5 == 11: return "{ double v0 = %s, v1 = ppc_to_single(c, %s + %s); %s = v0; %s = v1; }" % (C0, A0, B1, F0(d), F1(d))
         if xo5 == 12: return pair("%s * round25(%s)" % (A0, C0), "%s * round25(%s)" % (A1, C0))
         if xo5 == 13: return pair("%s * round25(%s)" % (A0, C1), "%s * round25(%s)" % (A1, C1))
         if xo5 == 14: return pair("%s * round25(%s) + %s" % (A0, C0, B0), "%s * round25(%s) + %s" % (A1, C0, B1))
