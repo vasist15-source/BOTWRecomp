@@ -50,4 +50,24 @@ int main() {
         t+=seconds(1);
         assert(l.deadline(t,fps)==t);
     }
+    // Oversleeps of the sleep itself are made up: the schedule stays one period apart, so the
+    // average rate is exact (releasing each frame 0.4 ms late used to give 29.6 instead of 30).
+    for (int fps : {30, 60}) {
+        gx2::FrameLimiter o;
+        auto u = gx2::FrameLimiter::Clock::time_point{} + seconds(10);
+        o.deadline(u, fps);
+        o.released(u);
+        const auto start = u;
+        for (int i = 0; i < 600; ++i) {
+            auto next = o.deadline(u + milliseconds(2), fps);
+            assert(next - start == (i + 1) * nanoseconds(1000000000LL / fps));
+            u = next + microseconds(400);  // woke late
+            o.released(u);
+        }
+        // a big oversleep (over a quarter period) moves the schedule: no catch-up frame
+        auto next = o.deadline(u + milliseconds(1), fps);
+        u = next + milliseconds(12);
+        o.released(u);
+        assert(o.deadline(u + milliseconds(1), fps) == u + nanoseconds(1000000000LL / fps));
+    }
 }

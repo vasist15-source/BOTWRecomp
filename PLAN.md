@@ -82,6 +82,19 @@ picture is always presented filtered. Logs: `[dynres]` per change, `[gfx]` repor
 `WWHD_DYNRES_MIN`, `WWHD_DYNRES_TEST_AT=f:factor`, `WWHD_DYNRES_TEST_BUDGET=f:ms`, `WWHD_DYNRES_LOG_FRAMES=1`.
 **UNTESTED** in game: Hateno/Kakariko at 2x, frame time, CPU %, hitch at a change, memory.
 
+### 2026-11-04: 30 fps at real-time speed (issue #1), PR #2 merged
+vasist15-source/BOTWRecomp#2 (shpodg) merged as 83c1a91: a host frame limiter at GX2SwapScanBuffers
+now also caps 30 fps (`fps_limiter.h`), so the frame-locked game can't run above 1x when its own vsync
+fence lets frames through early (an Oct 20 log showed 40-53 swaps/s at 30 fps; the fence leak itself
+is not found, b0d39a2's grid moves are a suspect). Also from the PR: 90/120 fps, VFR-scaled
+menu/map/audio clocks and FPS++-derived translator patches (`tools/botw_fps_patches.py`, applied as C
+text in `probe_recomp.py`, so those functions are kept out of crlive/leaflocal via
+`Recompiler.plain_funcs`), per-cutscene caps, three-axis motion, ADPCM/JPEG/FPSCR.NI fixes, Stasis
+picking read back at DrawDone. The PR's limiter paced from each actual release, so the sleep's
+oversleep added up (60 fps 56-58, 30 fps 29.4 swaps/s); it now keeps a fixed schedule and only resets
+it after a late frame (60 fps 59.7-60.0, 30 fps 30.0). Play-tested: 30 fps at normal speed.
+CPU % not measured yet.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

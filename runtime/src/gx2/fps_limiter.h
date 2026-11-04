@@ -15,18 +15,35 @@ inline int frame_limit(int target, bool variableStep, int uncappedLimit) {
     return target == 30 ? 30 : !variableStep ? 0 : target > 0 ? target : uncappedLimit;
 }
 
+// Frames go out on a fixed schedule, one period apart, so the sleep's usual oversleep (a fraction of
+// a millisecond on macOS) is made up by the next frame instead of adding up (pacing from each actual
+// release ran 60 fps at 56-58 and 30 fps at 29.4, the fixed-step game 2% slow). A frame that is late,
+// or oversleeps by more than a quarter period, moves the schedule to its release instead: no burst of
+// catch-up frames after a hitch, which would speed up the fixed-step 30 fps game.
 class FrameLimiter {
 public:
     using Clock = std::chrono::steady_clock;
     Clock::time_point deadline(Clock::time_point now, int limit) {
-        if (limit <= 0) { active_ = false; return now; }
-        // A cap change uses the last actual frame, not an old scheduled deadline.
+        if (limit <= 0) { active_ = false; waited_ = false; return now; }
         const auto period = std::chrono::nanoseconds(1000000000LL / limit);
-        return active_ && last_ + period > now ? last_ + period : now;
+        // A cap change uses the last actual frame, not an old scheduled deadline.
+        const auto base = active_ && limit == limit_ ? slot_ : last_;
+        waited_ = active_ && base + period > now;
+        pending_ = waited_ ? base + period : now;
+        limit_ = limit;
+        period_ = period;
+        return pending_;
     }
-    void released(Clock::time_point now) { last_ = now; active_ = true; }
+    void released(Clock::time_point now) {
+        slot_ = waited_ && now - pending_ < period_ / 4 ? pending_ : now;
+        last_ = now;
+        active_ = true;
+        waited_ = false;
+    }
 private:
-    Clock::time_point last_{};
-    bool active_ = false;
+    Clock::time_point last_{}, slot_{}, pending_{};
+    Clock::duration period_{};
+    int limit_ = 0;
+    bool active_ = false, waited_ = false;
 };
 }

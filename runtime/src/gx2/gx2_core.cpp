@@ -980,7 +980,8 @@ void fps_limit() {
         BlockingScope b;  // release the guest core while sleeping, including at 30 fps
         std::this_thread::sleep_until(next);
     }
-    // Never catch up after an oversleep or a hitch: fixed-step frames would speed up.
+    // A small oversleep is made up by the next frame, a hitch is not (fps_limiter.h): fixed-step
+    // frames would speed up.
     limiter.released(std::chrono::steady_clock::now());
 }
 }  // namespace
