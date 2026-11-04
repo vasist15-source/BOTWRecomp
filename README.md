@@ -12,10 +12,9 @@ it builds is meant to be shared.
 This project is not affiliated with or endorsed by Nintendo. The Legend of Zelda and Breath of the
 Wild are trademarks of Nintendo.
 
-**Status: early, but playable.** It boots, plays the intro and the Great Plateau, with menus, NPCs,
-sound, movie cutscenes, saving and the DLC, at the game's own 30 fps on an M4 MacBook Air. Expect
+**Status: Fully playable.** It boots, plays the intro and the Great Plateau, with menus, NPCs,
+sound, movie cutscenes, saving and the DLC, at the game's own 30 fps, 60 fps, 120 fps and uncapped on an M4 MacBook Air. Expect
 rough edges: stutter the first time new effects are drawn (shaders are compiled then, and cached),
-and some lighting glitches.
 
 ## Play it on your Mac
 
@@ -89,8 +88,6 @@ tools/make_app.sh ~/Desktop   # bundles that build as Breath of the Wild.app
 - [Dear ImGui](https://github.com/ocornut/imgui) (MIT), [fmt](https://github.com/fmtlib/fmt) (MIT),
   [metal-cpp](https://developer.apple.com/metal/cpp/) (Apache-2.0), [stb](https://github.com/nothings/stb)
   (MIT / public domain), [xxHash](https://github.com/Cyan4973/xxHash) (BSD-2-Clause)
-- The installer follows the setup app of the
-  [Need for Speed: Carbon Mac port](https://github.com/vasist15-source/nfs-carbon-mac).
 
 Licence: MPL-2.0 (see [LICENSE](LICENSE)); the third-party licences are next to their code in
 `runtime/third_party/`.
