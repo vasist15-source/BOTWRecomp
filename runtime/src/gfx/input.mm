@@ -249,8 +249,7 @@ static void start_test_keys() {
 // GameController.framework reports the gyro and accelerometer of DualSense, DualShock 4, Switch Pro and
 // Joy-Con controllers (macOS 11+). Its frame (as CoreMotion's, for a controller lying flat): x right, y
 // towards the top (away from the player), z up out of the face; acceleration in g with gravity's sign
-// (at rest flat: z = -1). motion.h takes SDL's frame (x right, y up, z towards the player, m/s^2 of
-// specific force), so: sdl = (x, z, -y), acceleration negated.
+// (at rest flat: z = -1). The shared, tested GameController adapter converts it to motion's H frame.
 // WWHD_GYRO_LOG=1 logs a raw sample twice a second (to check the axes with a new controller).
 static void update_motion_sensors() API_AVAILABLE(macos(11.0)) {
     const bool want = motion::wants_controller_sensors() && !getenv("WWHD_NO_HOST_INPUT");
@@ -281,22 +280,21 @@ static void update_motion_sensors() API_AVAILABLE(macos(11.0)) {
             if (m.sensorsRequireManualActivation) m.sensorsActive = YES;
             const uint64_t id = (uint64_t)(uintptr_t)(__bridge void*)c;
             m.valueChangedHandler = ^(GCMotion* mm) {
-                if (overlay::blocks_input()) return;
+                if (overlay::blocks_input()) { motion::controller_paused(id); return; }
                 GCRotationRate r = mm.rotationRate;
                 GCAcceleration a = mm.hasGravityAndUserAcceleration
                                        ? GCAcceleration{mm.gravity.x + mm.userAcceleration.x, mm.gravity.y + mm.userAcceleration.y,
                                                         mm.gravity.z + mm.userAcceleration.z}
                                        : mm.acceleration;
-                const float g = 9.80665f;
-                float gyro[3] = {(float)r.x, (float)r.z, (float)-r.y};
-                float acc[3] = {(float)-a.x * g, (float)-a.z * g, (float)a.y * g};
+                float gyro[3] = {(float)r.x, (float)r.y, (float)r.z};
+                float acc[3] = {(float)a.x, (float)a.y, (float)a.z};
                 static const bool log = getenv("WWHD_GYRO_LOG") != nullptr;
                 static double last_log = 0;
                 if (log && CACurrentMediaTime() - last_log > 0.5) {
                     last_log = CACurrentMediaTime();
                     LOG("[gyro] GameController raw: rate %.3f %.3f %.3f rad/s, acc %.3f %.3f %.3f g", r.x, r.y, r.z, a.x, a.y, a.z);
                 }
-                motion::controller_sample(id, 0, gyro, acc);
+                motion::controller_sample_gamecontroller(id, 0, gyro, acc);
             };
         } else {
             [active removeObject:c];

@@ -59,6 +59,7 @@ namespace gfxvk { int android_display_smoke_test(); void save_renderer_caches();
 #endif
 #ifdef WWHD_HAS_METAL
 int gfx_headstart_warm();  // gfx/shader_headstart.mm
+namespace gfx { int readback_test(); }
 #endif
 
 void mem_setup_heaps(uint32_t data_end);
@@ -392,6 +393,9 @@ int main(int argc, char** argv) {
     }
 #endif
     bool warm_shaders = false;
+#ifdef WWHD_HAS_METAL
+    bool metal_readback_test = false;
+#endif
 #ifdef WWHD_HAS_VULKAN
     bool renderer_smoke = false;
 #ifdef __ANDROID__
@@ -405,6 +409,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--aoc") && i + 1 < argc) config::aoc_dir = argv[++i];
         else if (!strcmp(argv[i], "--trace")) g_trace_hle = true;
         else if (!strcmp(argv[i], "--warm-shaders")) warm_shaders = true;
+#ifdef WWHD_HAS_METAL
+        else if (!strcmp(argv[i], "--metal-readback-test")) metal_readback_test = true;
+#endif
 #ifdef WWHD_HAS_VULKAN
         else if (!strcmp(argv[i], "--renderer-smoke")) renderer_smoke = true;
 #ifdef __ANDROID__
@@ -451,6 +458,13 @@ int main(int argc, char** argv) {
     }
     // Metal or Vulkan: --renderer=, WWHD_RENDERER_RUNTIME, Graphics > Renderer (gfx/renderer.h)
     render::choose(argc, argv);
+#ifdef WWHD_HAS_METAL
+    if (metal_readback_test) {
+        int result = 1;
+        host::with_autorelease_pool([&] { result = gfx::readback_test(); });
+        return result;
+    }
+#endif
 #ifdef WWHD_HAS_VULKAN
     if(renderer_smoke) {
         // GPU self-test of the Vulkan renderer (no game files): always Vulkan, no fallback

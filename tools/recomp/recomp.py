@@ -117,6 +117,7 @@ class Recompiler:
         if self.build is None:
             raise SystemExit(unknown_build_message(path))
         self.mod_hooks = mod_hooks
+        self.plain_funcs = set()  # function starts kept out of the register passes (emit_function)
         self.p = Program(path)
         self.p.discover()
         self.entries = set(self.p.entries)
@@ -281,7 +282,9 @@ class Recompiler:
         # registers mid-way: not in hooked functions (hook_X runs around f_X_orig), not in functions
         # with instruction hooks (ppc_host_call(c, site_X) reads and changes the Cpu struct) and not in
         # builds with guest mod hooks (a mod may hook or replace any function): those keep the plain code
-        plain = hooked or self.mod_hooks or any(a in self.sites for a, _, _ in body)
+        # (and functions a subclass patches as C text afterwards, which expects the struct accesses:
+        # plain_funcs, probe_recomp.py's BotW frame-time fixes)
+        plain = hooked or self.mod_hooks or any(a in self.sites for a, _, _ in body) or start in self.plain_funcs
         if CRLIVE and not plain:
             live_after, fields = crlive.analyze(body, self.cur_start, self.cur_end, self.p.jump_tables, branch_target,
                                                 self.sites)

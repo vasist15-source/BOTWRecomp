@@ -12,7 +12,10 @@
 // The game decides itself when it uses the gyro (its own Options "Gyro" switch, aiming, the right stick
 // released); this module only reports how the virtual GamePad moves. WWHD turns its first-person camera by
 // the change of the GamePad's direction from one frame to the next (fusion.h, docs/gyro.md), so the sources
-// only say how far the player turned (Aim) and one virtual GamePad (VirtualPad) turns by that.
+// report three physical turns (Aim) and one virtual GamePad (VirtualPad) integrates them.
+// BotW defaults to complete three-axis motion for aiming and shrine apparatus; the older two-axis
+// aiming conventions remain optional. Controller turns are integrated at sensor cadence, independent
+// of VPAD polling; fresh angular rates stay valid between packets and expire after 100 ms without input.
 //
 // Pro Controller mode: the game ignores the GamePad's motion when it plays with a Pro Controller; while a
 // source is on, game_hooks.cpp lets it read the virtual GamePad's motion there too (drives_gamepad()).
@@ -42,6 +45,7 @@ int source_from_id(const std::string& id);  // -1 if unknown
 struct Settings {
     int source = kOff;
     Tuning tuning;                 // sensitivity, invert (all sources) and axis mode (controller sources)
+    int mapping_version = 2;      // persisted: migrate old untouched two-axis defaults once
     float mouse_degrees = 0.1f;    // mouse source: degrees the controller "turned" per mouse point (then sensitivity)
     std::string dsu_host = "127.0.0.1";
     int dsu_port = 26760;
@@ -56,11 +60,11 @@ std::string to_ini(const Settings& s);
 void from_kv(Settings& s, const std::string& key, const std::string& value);  // unknown keys ignored
 const char* const kKeys[] = {"gyro.source", "gyro.axis", "gyro.sensitivityX", "gyro.sensitivityY", "gyro.invertX",
                              "gyro.invertY", "gyro.mouseDegrees", "gyro.dsuHost", "gyro.dsuPort", "gyro.dsuSlot",
-                             "gyro.recenterPad", "gyro.recenterKey"};
+                             "gyro.recenterPad", "gyro.recenterKey", "gyro.mappingVersion"};
 std::string value_of(const Settings& s, const std::string& key);
-// settings saved by v0.2.5 (the first release with gyro; it had no "gyro.axis"): its default sensitivity
-// 1.0 was too high (issue #45), so an untouched 1.0 becomes the new default
+// Settings saved by the first release had no "gyro.axis": migrate its old default sensitivity.
 void upgrade_from_first_release(Settings& s);
+void upgrade_controller_mapping(Settings& s); // old player + default horizontal 0.5 -> native/1x; vertical/custom values retained
 
 Settings settings();
 // applies at once (starts or stops the Cemuhook client, controller sensors follow on the next host update)
@@ -72,6 +76,8 @@ bool env_override();
 // a controller's sensor sample (SDL frame: gyro rad/s, accel m/s^2); `device` tells controllers apart,
 // `timestamp_ns` is the sensor's time (0: the time it arrived)
 void controller_sample(uint64_t device, uint64_t timestamp_ns, const float gyro[3], const float accel[3]);
+void controller_sample_gamecontroller(uint64_t device, uint64_t timestamp_ns, const float gyro[3], const float accel[3]);
+void controller_paused(uint64_t device); // menu blocks input: preserve pose, discard stale rate
 void controller_gone(uint64_t device);
 bool wants_controller_sensors();  // the hosts enable the sensors only for the controller source
 void set_gyro_controllers(int n); // hosts: connected controllers that have a gyro and an accelerometer

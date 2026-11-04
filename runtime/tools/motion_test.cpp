@@ -219,7 +219,8 @@ static void test_game_reading() {
     assert(close_to(m.acc_magnitude, 1, 0.01f));
     // tuning: sensitivity and invert per axis
     Tuning t;
-    assert(t.sensitivity_x == 0.5f && t.sensitivity_y == 0.5f && t.axis == kPlayerSpace);
+    assert(t.sensitivity_x == 1.0f && t.sensitivity_y == 1.0f && t.axis == motion::kNativeAxes);
+    t.sensitivity_y = 0.5f;
     t.sensitivity_x = 2;
     t.invert_y = true;
     Aim a = t.apply({1, 1});
@@ -379,8 +380,8 @@ static void test_dsu_loopback() {
 
 static void test_settings_and_sources() {
     Settings s;
-    assert(s.source == kOff);  // off by default
-    assert(!drives_gamepad());
+    assert(s.source == kOff);
+    assert(!wants_controller_sensors() && !drives_gamepad());
     // no motion yet this run: Cemu's values without a motion source (no tilt; BotW's aiming follows the tilt)
     {
         const VpadMotion m = vpad(false);
@@ -468,9 +469,12 @@ static void test_settings_and_sources() {
     assert(status().find("right stick") == std::string::npos);
     set_aiming(false);
 
-    // the controller source: samples from SDL; sensitivity 0.5 (the default)
+    // Legacy aiming-only projection, read by the WWHD matrix camera model above.
+    // BotW native pose/rate and custom gains are covered by botw_motion_test.
     Settings c;
     c.source = kController;
+    c.tuning.axis = kPlayerSpace;
+    c.tuning.sensitivity_x = c.tuning.sensitivity_y = 0.5f; // saved custom sensitivity still applies
     set_settings(c);
     assert(wants_controller_sensors() && drives_gamepad());
     float right90[3] = {0, -kPi / 2, 0}, still[3] = {0, 0, 0}, acc[3] = {0, 9.80665f, 0};  // 90 deg/s right
@@ -540,7 +544,9 @@ static void test_settings_and_sources() {
     before = g.yaw;
     g.frame(vpad(false));
     assert(close_to(g.yaw, before, 1e-4f));
-    set_settings(Settings{});
+    Settings off;
+    from_kv(off, "gyro.source", "off");  // a saved off choice remains off
+    set_settings(off);
     assert(status().rfind("Gyro off", 0) == 0);
     assert(!wants_controller_sensors() && !drives_gamepad());
     for (int i = 0; i < 10; i++) controller_sample(42, t += 4000000, right90, acc);

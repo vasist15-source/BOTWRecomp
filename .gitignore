@@ -13,3 +13,5 @@ build/
 
 # built by tools/installer/install-macos.command
 BOTWRecomp Installer.app/
+
+__pycache__/

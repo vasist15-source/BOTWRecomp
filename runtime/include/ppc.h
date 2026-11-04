@@ -202,6 +202,18 @@ static inline double round25(double d) {
 }
 static inline double to_single(double d) { return (double)(float)d; }
 
+/* FPSCR.NI flushes single-precision underflow before rounding, including a
+   value just below FLT_MIN that would otherwise round up to FLT_MIN. Keep
+   the sign of zero. Loads/stores are conversions, not arithmetic, and do
+   not use this helper. */
+static inline double ppc_to_single(const Cpu* c, double d) {
+    uint64_t bits = f64_as_u64(d);
+    if ((c->fpscr & 4u) &&
+        (bits & 0x7FFFFFFFFFFFFFFFull) < 0x3810000000000000ull)
+        return u64_as_f64(bits & 0x8000000000000000ull);
+    return to_single(d);
+}
+
 /* fcmpu / fcmpo. IEEE comparisons with a NaN are false, so lt/gt/eq need no NaN test; un is the
  * fourth outcome. FPSCR's FPCC field (which fcmp also sets) is not kept: only mffs and mcrfs read
  * it, and this game has neither (ppc2c warns when it translates one). */

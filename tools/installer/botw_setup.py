@@ -873,7 +873,7 @@ def recomp_stamp(rpx):
     h.update(file_sha256(rpx).encode())
     for d in (os.path.join(ROOT, "tools", "recomp"), os.path.join(ROOT, "tools")):
         for n in sorted(os.listdir(d)):
-            if n.endswith(".py") and (d.endswith("recomp") or n in ("probe_recomp.py", "rpx.py")):
+            if n.endswith(".py") and (d.endswith("recomp") or n in ("probe_recomp.py", "botw_fps_patches.py", "rpx.py")):
                 with open(os.path.join(d, n), "rb") as f:
                     h.update(n.encode() + f.read())
     return h.hexdigest()
@@ -933,7 +933,7 @@ def cmd_recomp(rpx, out):
         while not stop.wait(1.0):
             print("@progress analyze 0 0", flush=True)
     threading.Thread(target=ticker, daemon=True).start()
-    r = recomp.Recompiler(rpx, probe_recomp.botw_build(rpx))
+    r = probe_recomp.make_recompiler(rpx)
     stop.set()
     total = len(r.sorted_entries)
     emit = r.emit_function
