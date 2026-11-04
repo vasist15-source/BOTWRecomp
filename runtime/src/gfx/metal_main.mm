@@ -102,6 +102,36 @@ static void map_guest_range(uint32_t base, uint32_t size) {
     R.guest.push_back({base, size, b});
 }
 
+// Residency set (macOS 15+, the Metal 4 residency model, usable with this renderer's command queues):
+// the guest memory buffers, which nearly every draw reads, are made resident once and kept so for the
+// queues (main and readback probes) instead of being made resident per command buffer.
+// WWHD_RESIDENCY_SET=0 leaves residency to Metal's per-command-buffer tracking as before.
+static id g_guest_residency = nil;  // id<MTLResidencySet>
+static void make_guest_residency() {
+    const char* e = getenv("WWHD_RESIDENCY_SET");
+    if (e && !strcmp(e, "0")) return;
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
+        d.label = @"guest memory";
+        d.initialCapacity = R.guest.size();
+        NSError* err = nil;
+        id<MTLResidencySet> set = [R.device newResidencySetWithDescriptor:d error:&err];
+        if (!set) {
+            LOG("[gfx] residency set: %s", err ? err.localizedDescription.UTF8String : "not made");
+            return;
+        }
+        for (auto& g : R.guest) [set addAllocation:g.buf];
+        [set commit];
+        [set requestResidency];
+        g_guest_residency = set;
+        LOG("[gfx] guest memory in a residency set (%lu buffers, %.0f MB)", (unsigned long)R.guest.size(), set.allocatedSize / 1048576.0);
+    }
+}
+static void attach_guest_residency(id<MTLCommandQueue> q) {
+    if (@available(macOS 15.0, *))
+        if (g_guest_residency) [q addResidencySet:g_guest_residency];
+}
+
 id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset) {
     for (auto& g : R.guest) {
         if (addr - g.base < g.size) {
@@ -677,6 +707,7 @@ void probe_begin(id<MTLTexture> target) {
     if (!g_probe_queue) {
         g_probe_queue = [R.device newCommandQueue];
         g_probe_queue.label = @"readback probes";
+        attach_guest_residency(g_probe_queue);
         g_probe_event = [R.device newEvent];
     }
     g_probe_saved = {R.cmd, g_cmd_pending, g_cmd_created_ns, g_draws_since_commit, g_eq_direct_draw};
@@ -798,6 +829,8 @@ void init() {
     map_guest_range(0xA0000000, 0x1C000000);  // overlay arena (OSEnableOverlayArena, BotW)
     map_guest_range(0xE0000000, 0x04000000);
     map_guest_range(0xF4000000, 0x02000000);
+    make_guest_residency();
+    attach_guest_residency(R.queue);
     LOG("[gfx] Metal device: %s", R.device.name.UTF8String);
 }
 

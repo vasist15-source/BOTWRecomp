@@ -373,6 +373,30 @@ static LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut
 // Shaders and pipelines compile in the background (WWHD_SYNC_SHADERS=1 waits instead); draws that
 // need one still compiling are skipped for those frames rather than stalling the game.
 static const bool g_sync_shaders = getenv("WWHD_SYNC_SHADERS") != nullptr;
+
+// Metal 4's shader compiler (macOS 26+) builds the MSL libraries: an MTL4Compiler of our own, whose
+// libraries (plain MTLLibrary objects) feed the same pipeline descriptors and command encoders as
+// before. Pipelines are still made by the device: MTL4Compiler's pipeline descriptors are the
+// Metal 4 command model's (argument tables), which this renderer does not use.
+// WWHD_MTL4_COMPILER=0 compiles with the device as before. A library the Metal 4 compiler fails on is
+// tried again with the device before it counts as a failed compile.
+static id mtl4_compiler() {  // id<MTL4Compiler>, or nil
+    static id c = []() -> id {
+        const char* e = getenv("WWHD_MTL4_COMPILER");
+        if (e && !strcmp(e, "0")) return nil;
+        if (@available(macOS 26.0, *)) {
+            MTL4CompilerDescriptor* d = [MTL4CompilerDescriptor new];
+            d.label = @"translated shaders";
+            NSError* err = nil;
+            id<MTL4Compiler> comp = [R.device newCompilerWithDescriptor:d error:&err];
+            LOG("[gfx] shader libraries: %s", comp ? "Metal 4 compiler (MTL4Compiler)" : "device (no Metal 4 compiler)");
+            if (!comp && err) LOG("[gfx] MTL4Compiler: %s", err.localizedDescription.UTF8String);
+            return comp;
+        }
+        return nil;
+    }();
+    return c;
+}
 enum CompileState { CS_PENDING, CS_READY, CS_FAILED, CS_DEFERRED };  // deferred: translated from the cache, not compiled yet
 
 // Metal's completion handlers publish results through compile_done, which wakes the render thread
@@ -594,7 +618,18 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     }
     if (g_sync_shaders) {
         NSError* err = nil;
-        id<MTLLibrary> lib = injectFailure ? nil : [R.device newLibraryWithSource:source options:opt error:&err];
+        id<MTLLibrary> lib = nil;
+        if (!injectFailure) {
+            if (@available(macOS 26.0, *)) {
+                if (id<MTL4Compiler> comp = mtl4_compiler()) {
+                    MTL4LibraryDescriptor* ld = [MTL4LibraryDescriptor new];
+                    ld.source = source;
+                    ld.options = opt;
+                    lib = [comp newLibraryWithDescriptor:ld error:&err];
+                }
+            }
+            if (!lib) lib = [R.device newLibraryWithSource:source options:opt error:&err];
+        }
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:entry] : nil;
         if (!fn) { report_compile_error(src, key, err, attempt, lib != nil); sh->state = CS_FAILED; return; }
         sh->fn = fn;
@@ -604,7 +639,7 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     }
     std::string copy = src;
     g_compiles_in_flight++;
-    [R.device newLibraryWithSource:source options:opt completionHandler:^(id<MTLLibrary> lib, NSError* err) {
+    MTLNewLibraryCompletionHandler done = ^(id<MTLLibrary> lib, NSError* err) {
         g_compiles_in_flight--;
         if (injectFailure) lib = nil;
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:entry] : nil;
@@ -612,7 +647,21 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
         sh->fn = fn;
         release_source(sh);
         compile_done(sh->state, CS_READY);
-    }];
+    };
+    if (@available(macOS 26.0, *)) {
+        if (id<MTL4Compiler> comp = mtl4_compiler()) {
+            MTL4LibraryDescriptor* ld = [MTL4LibraryDescriptor new];
+            ld.source = source;
+            ld.options = opt;
+            [comp newLibraryWithDescriptor:ld completionHandler:^(id<MTLLibrary> lib, NSError* err) {
+                if (lib || injectFailure) { done(lib, err); return; }
+                // the device's compiler gets its own try before the compile counts as failed
+                [R.device newLibraryWithSource:source options:opt completionHandler:done];
+            }];
+            return;
+        }
+    }
+    [R.device newLibraryWithSource:source options:opt completionHandler:done];
 }
 
 // registers that influence how a shader stage is translated (gathered, then hashed in one pass)

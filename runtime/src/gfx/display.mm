@@ -46,9 +46,11 @@
 #include "gx2/gx2.h"
 #include "input.h"
 #include "metal.h"
+#include "metalfx.h"
 #include "renderer.h"
 #include "runtime.h"
 #include "../interp.h"
+#include "../metalfx_opts.h"
 #ifdef WWHD_HAS_VULKAN
 #include "vulkan/api.h"
 #endif
@@ -706,6 +708,7 @@ void display_init() {
     attach_metal_layers();
     display_start_input();
     create_present_pipeline();
+    metalfx::init();
 }
 
 // Vulkan renderer start-up (gfx/vulkan/backend_table.cpp): windows, then a layer per view for its
@@ -978,6 +981,12 @@ static void draw_overlay_glass(id<MTLRenderCommandEncoder> e, MTLPixelFormat fmt
     flush(d->CmdLists.Size);
 }
 
+// the TV picture compose_tv draws: MetalFX's (metalfx.h) while present_screens has set one, else R.tv's
+static metalfx::Picture g_tv_pic;
+// the settings overlay's colours are converted in place for sRGB targets: once per frame (frame
+// generation composes the window twice)
+static uint64_t g_overlay_linearized = ~0ull;
+
 // the TV window's picture: TV image scaled to fit, GamePad overlay on top
 static void compose_tv(id<MTLTexture> target, const Layout& L) {
     const bool glass = prepare_glass(target.width, target.height, L);  // its passes go before this one
@@ -990,7 +999,8 @@ static void compose_tv(id<MTLTexture> target, const Layout& L) {
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     float dw = target.width, dh = target.height;
     MTLPixelFormat fmt = target.pixelFormat;
-    draw_image(e, fmt, dw, dh, R.tv.tex, R.tv.srgb, L.tv, 1.0f, R.tv.dyn);
+    if (g_tv_pic.tex) draw_image(e, fmt, dw, dh, g_tv_pic.tex, g_tv_pic.linear, L.tv, 1.0f, g_tv_pic.dyn);
+    else draw_image(e, fmt, dw, dh, R.tv.tex, R.tv.srgb, L.tv, 1.0f, R.tv.dyn);
     if (L.pip_on && R.drc.tex) {
         float op = L.drc_only ? 1.0f : g_pip_opacity.load(), bw = std::max(1.0f, roundf(L.pip.w / 200.0f));
         float frame[4] = {0, 0, 0, 0.6f * op};
@@ -1004,7 +1014,10 @@ static void compose_tv(id<MTLTexture> target, const Layout& L) {
     }
     // settings overlay (overlay/overlay.h) on top: Dear ImGui's Metal backend in the same pass
     if (g_overlay_draw) {
-        if (is_srgb(fmt)) overlay::linearize_colors(g_overlay_draw);
+        if (is_srgb(fmt) && g_overlay_linearized != R.frame) {
+            overlay::linearize_colors(g_overlay_draw);
+            g_overlay_linearized = R.frame;
+        }
         ImGui_ImplMetal_NewFrame(rp);
         if (glass) draw_overlay_glass(e, fmt, dw, dh, g_overlay_draw);
         else ImGui_ImplMetal_RenderDrawData(g_overlay_draw, command_buffer(), e);
@@ -1127,7 +1140,8 @@ static id<MTLTexture> offscreen(NSUInteger w, NSUInteger h, bool srgb) {
     return [R.device newTextureWithDescriptor:d];
 }
 
-static void present_to_layer(Screen& scr, void (^draw)(id<MTLTexture>)) {
+// minDuration > 0: shown once the previous drawable has been on screen that long (frame generation)
+static void present_to_layer(Screen& scr, void (^draw)(id<MTLTexture>), double minDuration = 0) {
     if (!scr.layer || !scr.tex) return;
     MTLPixelFormat want = scr.srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
     if (scr.layer.pixelFormat != want) scr.layer.pixelFormat = want;
@@ -1149,7 +1163,8 @@ static void present_to_layer(Screen& scr, void (^draw)(id<MTLTexture>)) {
     id<CAMetalDrawable> drawable = scr.visible ? [scr.layer nextDrawable] : nil;
     if (!drawable) return;
     draw(drawable.texture);
-    [command_buffer() presentDrawable:drawable];
+    if (minDuration > 0) [command_buffer() presentDrawable:drawable afterMinimumDuration:minDuration];
+    else [command_buffer() presentDrawable:drawable];
 }
 
 // Screenshot (screenshot.h): the picture at its own size, drawn as compose_tv draws it (FXAA, sRGB
@@ -1250,7 +1265,15 @@ void present_screens() {
             compose_tv(t, layout(ds.width, ds.height, nominal_w(R.tv), nominal_h(R.tv), nominal_w(R.drc), nominal_h(R.drc), pip, drc_only));
         });
     } else {
-        present_to_layer(R.tv, ^(id<MTLTexture> t) { compose_tv(t, L); });
+        // MetalFX (metalfx.h): the upscaled picture, and with frame generation the in-between one first
+        metalfx::Picture real, mid;
+        const bool gen = R.tv.visible && metalfx::frame(P.tv.w, P.tv.h, &real, &mid);
+        if (gen) {
+            g_tv_pic = mid;
+            present_to_layer(R.tv, ^(id<MTLTexture> t) { compose_tv(t, L); });
+        }
+        g_tv_pic = real.tex != R.tv.tex ? real : metalfx::Picture{};
+        present_to_layer(R.tv, ^(id<MTLTexture> t) { compose_tv(t, L); }, gen ? metalfx::second_present_delay() : 0);
     }
     bool drc_win = P.drc_window;
     if (drc_win) present_to_layer(R.drc, ^(id<MTLTexture> t) { compose_drc(t); });
@@ -1271,6 +1294,7 @@ void present_screens() {
         }
         display_log_present_dump(path, P, nominal_w(R.tv), nominal_h(R.tv));
     }
+    g_tv_pic = metalfx::Picture{};
 }
 
 // settings overlay (overlay_appkit.mm): the Display menu's options

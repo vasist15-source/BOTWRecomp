@@ -106,6 +106,32 @@ passes, then a rounded panel per window (rim light, edge refraction, shadow) jus
 draw list; only while overlay windows show. Vulkan keeps dense backgrounds. Play-tested (menu opened
 three times, 60.0 swaps/s, GPU busy 10-13 ms/frame); the blur's own cost is not A/B measured yet.
 
+### 2026-11-04: MetalFX upscaling, frame generation, Metal 4 residency and compiler (Metal)
+Settings > Graphics > MetalFX, both off by default (saved as `metalfxUpscale` / `metalfxFrameGen`;
+`WWHD_METALFX_UPSCALE`, `WWHD_METALFX_FRAMEGEN`, `WWHD_METALFX_LOG=1`). `gfx/metalfx.mm`, called by
+`present_screens`:
+- Upscaling: MetalFX's spatial scaler takes the TV scan image to the size of its box in the window when
+  the box is larger (in place of the Picture scaling filter); made again on a size change (resize,
+  dynamic resolution step). macOS 13+.
+- Frame generation: one picture between each pair of game frames, presented first; the frame's own
+  picture follows `afterMinimumDuration` half a game frame later (30 -> 60, 60 -> 120 on 120 Hz, +half a
+  frame of latency). Only while game frame time >= 1.8 refreshes with vsync. Motion is estimated on the
+  GPU (luma pyramid 1/4..1/32, coarse-to-fine block matching, sub-pixel, 3x3 median); the halfway picture
+  samples both pictures half a vector away and leans to the newer one where they disagree. Standalone
+  check on moving test pictures (scratch test, not in the tree): motion exact at the centre, still HUD box 0,
+  halfway picture matches t=0.5 (mean error 6 vs 32 for either real picture), clean under Metal API and
+  shader validation. MetalFX's own `MTLFXFrameInterpolator` is wired up behind
+  `WWHD_METALFX_INTERPOLATOR=1` but does not interpolate with estimated motion and a constant depth: on the
+  same pictures (macOS 27; any constant depth, reversed or not, any motion scale, camera matrices, own
+  history) it puts out the current picture. A nil depth texture fails MetalFX validation; on macOS 27
+  `contentWidth/Height` must be set or the whole picture is copied.
+- Metal 4 on the existing queue (the full MTL4 command model was decided against: no hazard tracking):
+  guest memory buffers in an `MTLResidencySet` on the main and probe queues (macOS 15+,
+  `WWHD_RESIDENCY_SET=0` off); MSL libraries built by an `MTL4Compiler` (macOS 26+, `WWHD_MTL4_COMPILER=0`
+  off; a library it fails on is retried with the device). Pipelines are still made by the device.
+Play-tested (user, 2026-11-04): upscaling, frame generation and the Metal 4 changes all work. Not measured
+yet: GPU cost, CPU % / heat with frame generation on vs off, shader compile times with MTL4Compiler.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

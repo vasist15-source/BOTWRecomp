@@ -60,6 +60,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../render_prof.h"
 #include "../perf_metrics.h"
 #include "../dynres.h"
+#include "../metalfx_opts.h"
 #include "../build_info.h"
 #include "../report_header.h"
 
@@ -778,6 +779,25 @@ void tab_graphics() {
              "and above where the graphics chip is the limit (villages at 2x); when the processor is the limit,\n"
              "the resolution stays.");
         if (dynres::on()) note("%s", dynres::status().c_str());
+
+        // MetalFX (metalfx_opts.h, gfx/metalfx.mm)
+        heading("MetalFX");
+        bool on;
+        if (check("Upscaling (MetalFX spatial)", mfx::upscale(), &on, mfx::upscale_available() && !mfx::from_env()))
+            post_changed([on] { mfx::set_upscale(on); });
+        help("Scales the picture to the window with Apple's MetalFX upscaler instead of the Picture scaling filter,\n"
+             "whenever the window is larger than the internal resolution. Sharper than bilinear at a low internal\n"
+             "resolution (1x in a large window, or while dynamic resolution has lowered it); costs a little GPU time.");
+        if (check("Frame generation", mfx::framegen(), &on, mfx::framegen_available() && !mfx::from_env()))
+            post_changed([on] { mfx::set_framegen(on); });
+        help("Draws one generated frame between each pair of game frames: 30 fps shows as 60, or 60 as 120 on a\n"
+             "120 Hz display. It runs while twice the game's frame rate fits the display (pick 30 fps on a 60 Hz\n"
+             "screen) and adds half a game frame of latency. Motion is estimated from the pictures, so fast motion,\n"
+             "the HUD over moving scenes and transparent effects can show artefacts.");
+        if (!mfx::framegen_available()) note("Frame generation is not available on this Mac (see the log).");
+        if (mfx::from_env()) note("Set by WWHD_METALFX_UPSCALE / WWHD_METALFX_FRAMEGEN.");
+        const std::string st = mfx::status();
+        if (!st.empty()) note("%s", st.c_str());
     }
 
     heading("Effects");
@@ -856,6 +876,7 @@ void tab_display() {
         if (i) ImGui::SameLine();
         if (radio(f[i], hostui::scale_filter() == i, fok)) hostui::post([i] { hostui::set_scale_filter(i); });
     }
+    if (!render::vulkan() && mfx::upscale()) note("MetalFX upscaling is on (Graphics): it scales the picture up in place of this filter.");
     screenshots_section();
 }
 
@@ -1992,6 +2013,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         if (!rumble::env_override() && hostui::get("rumble", v)) rumble::set_enabled(v != "0");
         // the saved dynamic resolution (WWHD_DYNRES_MIN wins)
         if (!dynres::min_from_env() && hostui::get("dynResMin", v)) dynres::set_min(strtof(v.c_str(), nullptr));
+        mfx::load_saved();  // the saved MetalFX choices (WWHD_METALFX_* win)
         // (no saved aspect ratio: the wider pictures need Wind Waker's camera hooks)
         // the saved gyro settings (WWHD_GYRO overrides the source)
         hostui::post([] { load_gyro(); });
