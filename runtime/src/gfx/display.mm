@@ -579,6 +579,77 @@ fragment float4 present_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(
     return float4(c, 1.0);
 }
 fragment float4 solid_fs(VOut in [[stage_in]], constant float4& color [[buffer(0)]]) { return color; }
+
+// ---- Liquid Glass behind the settings overlay's windows (overlay::GlassPanel)
+// separable Gaussian over the quarter-size copy of the picture (sigma 4 texels: ~16 target pixels)
+fragment float4 glass_blur_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                              constant float2& dir [[buffer(0)]]) {
+    float2 texel = dir / float2(t.get_width(), t.get_height());
+    float3 sum = 0.0;
+    float wsum = 0.0;
+    for (int i = -10; i <= 10; i++) {
+        float w = exp(-float(i * i) / 32.0);
+        sum += t.sample(s, in.uv + texel * float(i)).rgb * w;
+        wsum += w;
+    }
+    return float4(sum / wsum, 1.0);
+}
+struct GlassP {
+    float4 rect;    // panel x, y, w, h (target pixels)
+    float4 tint;    // smoke colour (display-encoded) and amount
+    float2 target;  // target size (pixels)
+    float radius;   // corner radius (pixels)
+    float scale;    // target pixels per UI point
+    float shadow;   // drop shadow strength
+    int to_linear;  // the target expects linear values (sRGB format)
+};
+static float rrect(float2 p, float2 c, float2 hs, float r) {
+    float2 q = abs(p - c) - (hs - r);
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+fragment float4 glass_fs(VOut in [[stage_in]], texture2d<float> bd [[texture(0)]], sampler s [[sampler(0)]],
+                         constant GlassP& p [[buffer(0)]]) {
+    float2 px = in.pos.xy;
+    float2 hs = p.rect.zw * 0.5, c = p.rect.xy + hs;
+    float r = min(p.radius, min(hs.x, hs.y));
+    float S = p.scale;
+    float d = rrect(px, c, hs, r);                       // < 0 inside
+    // soft drop shadow, a little below the panel
+    float ds = rrect(px, c + float2(0.0, 4.0 * S), hs, r);
+    float shadow = p.shadow * (1.0 - smoothstep(-6.0 * S, 26.0 * S, ds));
+    float cov = saturate(0.5 - d);
+    if (cov <= 0.0) return float4(0.0, 0.0, 0.0, shadow);
+    // outward normal (the distance field's gradient)
+    float2 q = abs(px - c) - (hs - r), sg = select(float2(1.0), float2(-1.0), px < c);
+    float2 n = (q.x > 0.0 || q.y > 0.0) ? normalize(max(q, 0.0)) * sg : (q.x > q.y ? float2(sg.x, 0.0) : float2(0.0, sg.y));
+    float e = -d;                                        // distance in from the edge
+    float bezel = min(18.0 * S, min(hs.x, hs.y));
+    float t = saturate(1.0 - e / bezel);
+    // the rim works as a lens: near the edge the picture is pulled in from beyond it (red and blue a
+    // little apart, as real glass splits them)
+    float2 off = n * (t * t * t) * 16.0 * S;
+    float3 col;
+    col.r = bd.sample(s, (px + off * 1.10) / p.target).r;
+    col.g = bd.sample(s, (px + off) / p.target).g;
+    col.b = bd.sample(s, (px + off * 0.90) / p.target).b;
+    // vibrancy: a little more saturation, then the smoke that keeps text legible over a bright sky
+    float l = dot(col, float3(0.2126, 0.7152, 0.0722));
+    col = max(mix(float3(l), col, 1.3), 0.0);
+    col = mix(col, p.tint.rgb, p.tint.a);
+    float yn = saturate((px.y - p.rect.y) / p.rect.w);
+    col += (1.0 - yn) * 0.035;                           // light from above
+    col += t * t * 0.05;                                 // the bezel glows a little
+    // the rim catches the light: bright at the top left, faint at the bottom right
+    float rim = 1.0 - smoothstep(0.0, 1.3 * S, e);
+    float2 L = normalize(float2(-0.55, -0.85));
+    float lit = 0.22 + 0.78 * pow(saturate(dot(n, L)), 1.5) + 0.35 * pow(saturate(dot(n, -L)), 1.5);
+    col += rim * lit * 0.42;
+    col = saturate(col);
+    float a = cov + shadow * (1.0 - cov);
+    col = col * cov / max(a, 1e-4);
+    if (p.to_linear) col = to_linear(col);
+    return float4(col, a);
+}
 )";
 
 static id<MTLLibrary> g_lib;
@@ -762,10 +833,154 @@ static void draw_solid(id<MTLRenderCommandEncoder> e, MTLPixelFormat fmt, float 
 
 // this frame's settings overlay (null: nothing shown)
 static ImDrawData* g_overlay_draw = nullptr;
-static void overlay_metal_init() { ImGui_ImplMetal_Init(R.device); }
+static void overlay_metal_init() {
+    ImGui_ImplMetal_Init(R.device);
+    overlay::set_glass(true);
+}
+
+// ---------------------------------------------------------------- Liquid Glass (settings overlay)
+// While overlay windows show, the composed picture (TV, picture-in-picture) is drawn at a quarter of
+// the target's size and blurred (two passes); glass_fs draws each panel from it just before that
+// window's draw list. Only while overlay windows are shown; ~1/16 of the target's pixels per pass.
+static id<MTLRenderPipelineState> glass_pipeline(MTLPixelFormat fmt, bool glass) {
+    static std::mutex mu;
+    static std::map<std::pair<int, bool>, id<MTLRenderPipelineState>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto key = std::make_pair((int)fmt, glass);
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [g_lib newFunctionWithName:@"present_vs"];
+    d.fragmentFunction = [g_lib newFunctionWithName:glass ? @"glass_fs" : @"glass_blur_fs"];
+    d.colorAttachments[0].pixelFormat = fmt;
+    if (glass) {
+        auto* a = d.colorAttachments[0];
+        a.blendingEnabled = YES;
+        a.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        a.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        a.sourceAlphaBlendFactor = MTLBlendFactorOne;
+        a.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
+    NSError* err = nil;
+    id<MTLRenderPipelineState> p = [R.device newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!p) fatal("glass pipeline: %s", err.localizedDescription.UTF8String);
+    cache[key] = p;
+    return p;
+}
+
+static id<MTLTexture> g_backdrop[2];  // [0] the blurred picture, [1] scratch (quarter of the target's size)
+
+// the blurred picture behind this target's glass panels; false: no panels (or no picture)
+static bool prepare_glass(NSUInteger tw, NSUInteger th, const Layout& L) {
+    const overlay::GlassPanel* panels = nullptr;
+    if (!g_overlay_draw || overlay::glass_panels(&panels) == 0 || !R.tv.tex || tw < 16 || th < 16) return false;
+    // once per frame and target size (the picture may be composed several times: dumps, tests)
+    static uint64_t done_frame = ~0ull;
+    static NSUInteger done_w = 0, done_h = 0;
+    if (done_frame == R.frame && done_w == tw && done_h == th && g_backdrop[0]) return true;
+    done_frame = R.frame, done_w = tw, done_h = th;
+    const NSUInteger bw = (tw + 3) / 4, bh = (th + 3) / 4;
+    const MTLPixelFormat bf = MTLPixelFormatRGBA16Float;
+    if (!g_backdrop[0] || g_backdrop[0].width != bw || g_backdrop[0].height != bh) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bf width:bw height:bh mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        g_backdrop[0] = [R.device newTextureWithDescriptor:d];
+        g_backdrop[1] = [R.device newTextureWithDescriptor:d];
+    }
+    auto pass = [&](id<MTLTexture> t, int line) {
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = t;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        time_render_pass(rp, __FILE_NAME__, line);
+        return [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    };
+    // the picture as compose_tv lays it out, display-encoded (draw_image: a float target is not sRGB)
+    const float k = (float)bw / (float)tw;
+    auto scaled = [k](Box b) { return Box{b.x * k, b.y * k, b.w * k, b.h * k}; };
+    id<MTLRenderCommandEncoder> e = pass(g_backdrop[1], __LINE__);
+    draw_image(e, bf, bw, bh, R.tv.tex, R.tv.srgb, scaled(L.tv), 1.0f, R.tv.dyn);
+    if (L.pip_on && R.drc.tex)
+        draw_image(e, bf, bw, bh, R.drc.tex, R.drc.srgb, scaled(L.pip), L.drc_only ? 1.0f : g_pip_opacity.load(), R.drc.dyn);
+    [e endEncoding];
+    const float full[4] = {0, 0, 1, 1};
+    for (int i = 0; i < 2; i++) {  // horizontal: picture [1] -> [0]; vertical: [0] -> [1]
+        id<MTLTexture> src = g_backdrop[i ? 0 : 1], dst = g_backdrop[i ? 1 : 0];
+        const float dir[2] = {i ? 0.0f : 1.0f, i ? 1.0f : 0.0f};
+        e = pass(dst, __LINE__);
+        [e setRenderPipelineState:glass_pipeline(bf, false)];
+        [e setVertexBytes:full length:sizeof full atIndex:0];
+        [e setFragmentTexture:src atIndex:0];
+        [e setFragmentBytes:dir length:sizeof dir atIndex:0];
+        [e setFragmentSamplerState:R.linearClamp atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        [e endEncoding];
+    }
+    std::swap(g_backdrop[0], g_backdrop[1]);  // the vertical pass wrote [1]: make it [0]
+    return true;
+}
+
+static void draw_glass(id<MTLRenderCommandEncoder> e, MTLPixelFormat fmt, float dw, float dh, const overlay::GlassPanel& g) {
+    if (g.dim) {  // a modal sheet: what is below steps back
+        const float dim[4] = {0, 0, 0, 0.30f};
+        draw_solid(e, fmt, dw, dh, Box{0, 0, dw, dh}, dim);
+    }
+    struct {
+        float rect[4], tint[4], target[2], radius, scale, shadow;
+        int to_linear;
+        float pad[2];  // GlassP's size in Metal (16-byte aligned)
+    } p = {};
+    const float scale = g_overlay_draw->FramebufferScale.x > 0 ? g_overlay_draw->FramebufferScale.x : 1.0f;
+    p.rect[0] = g.x, p.rect[1] = g.y, p.rect[2] = g.w, p.rect[3] = g.h;
+    p.tint[0] = 0.10f, p.tint[1] = 0.10f, p.tint[2] = 0.12f, p.tint[3] = g.tint;
+    p.target[0] = dw, p.target[1] = dh;
+    p.radius = g.radius;
+    p.scale = scale;
+    p.shadow = g.shadow;
+    p.to_linear = is_srgb(fmt) ? 1 : 0;
+    const float m = 34.0f * scale;  // room for the shadow
+    const float rect[4] = {(g.x - m) / dw, (g.y - m) / dh, (g.w + 2 * m) / dw, (g.h + 2 * m) / dh};
+    [e setRenderPipelineState:glass_pipeline(fmt, true)];
+    [e setVertexBytes:rect length:sizeof rect atIndex:0];
+    [e setFragmentTexture:g_backdrop[0] atIndex:0];
+    [e setFragmentBytes:&p length:sizeof p atIndex:0];
+    [e setFragmentSamplerState:R.linearClamp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+
+// the overlay's draw lists in order, each glass window's panel just before its list
+static void draw_overlay_glass(id<MTLRenderCommandEncoder> e, MTLPixelFormat fmt, float dw, float dh, ImDrawData* d) {
+    const overlay::GlassPanel* panels = nullptr;
+    const int np = overlay::glass_panels(&panels);
+    ImDrawData part = *d;
+    int start = 0;
+    auto flush = [&](int end) {
+        if (end <= start) return;
+        part.CmdLists.resize(0);
+        part.TotalVtxCount = part.TotalIdxCount = 0;
+        for (int i = start; i < end; i++) {
+            part.CmdLists.push_back(d->CmdLists[i]);
+            part.TotalVtxCount += d->CmdLists[i]->VtxBuffer.Size;
+            part.TotalIdxCount += d->CmdLists[i]->IdxBuffer.Size;
+        }
+        ImGui_ImplMetal_RenderDrawData(&part, command_buffer(), e);
+        start = end;
+    };
+    const MTLScissorRect all = {0, 0, (NSUInteger)dw, (NSUInteger)dh};
+    for (int i = 0; i < d->CmdLists.Size; i++)
+        for (int k = 0; k < np; k++)
+            if (panels[k].list == d->CmdLists[i]) {
+                flush(i);
+                [e setScissorRect:all];  // the backend leaves its last clip rectangle set
+                draw_glass(e, fmt, dw, dh, panels[k]);
+            }
+    flush(d->CmdLists.Size);
+}
 
 // the TV window's picture: TV image scaled to fit, GamePad overlay on top
 static void compose_tv(id<MTLTexture> target, const Layout& L) {
+    const bool glass = prepare_glass(target.width, target.height, L);  // its passes go before this one
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -791,7 +1006,8 @@ static void compose_tv(id<MTLTexture> target, const Layout& L) {
     if (g_overlay_draw) {
         if (is_srgb(fmt)) overlay::linearize_colors(g_overlay_draw);
         ImGui_ImplMetal_NewFrame(rp);
-        ImGui_ImplMetal_RenderDrawData(g_overlay_draw, command_buffer(), e);
+        if (glass) draw_overlay_glass(e, fmt, dw, dh, g_overlay_draw);
+        else ImGui_ImplMetal_RenderDrawData(g_overlay_draw, command_buffer(), e);
     }
     [e endEncoding];
 }

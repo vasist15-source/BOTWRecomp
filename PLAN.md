@@ -95,6 +95,17 @@ oversleep added up (60 fps 56-58, 30 fps 29.4 swaps/s); it now keeps a fixed sch
 it after a late frame (60 fps 59.7-60.0, 30 fps 30.0). Play-tested: 30 fps at normal speed.
 CPU % not measured yet.
 
+### 2026-11-04: Liquid Glass settings menu and performance HUD (Metal)
+The Cmd+, / F1 overlay is restyled as a macOS window: no title bar, close button top left, a sidebar
+with icon tiles in place of the tab bar, a large page title and grouped cards (`heading()` opens
+them), switches instead of checkboxes, capsule segments instead of radio buttons, SF Pro. The Saves
+page is gone (save states and crash recovery stay in the menu bar and on F2-F5 / Shift+F1-F5);
+Screenshots moved to Display. On Metal, `overlay::glass_panels()` lists the root windows on glass and
+`display.mm` draws them: the composed picture at a quarter of the target's size, blurred in two
+passes, then a rounded panel per window (rim light, edge refraction, shadow) just before that window's
+draw list; only while overlay windows show. Vulkan keeps dense backgrounds. Play-tested (menu opened
+three times, 60.0 swaps/s, GPU busy 10-13 ms/frame); the blur's own cost is not A/B measured yet.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

@@ -3,7 +3,8 @@
 // F1 opens and closes it (Esc closes); on macOS also Cmd+, (app menu > Settings...; most Mac keyboards
 // send F1 only with Fn unless the top row is set to standard function keys); on a controller, hold Select/Minus for half a second or press
 // Home. While it is open the game sees no buttons (it keeps running) and the overlay takes keyboard,
-// mouse and controller. Tabs: Saves, Graphics, Display, Audio, Mods, Controls, Language / About. Every option
+// mouse and controller. Sidebar pages: Graphics, Display, Audio, Controls, Keyboard & Mouse, Language &
+// About. On Metal the windows sit on Liquid Glass (the blurred game picture, GlassPanel). Every option
 // calls the same functions as the macOS menu bar (which stays in sync) or the SDL host's shortcuts.
 // When the game asks for text, the overlay shows its text prompt (text_entry.h) with the same input rules.
 //
@@ -11,8 +12,8 @@
 // thread once per TV present (frame()); option changes go back to the main thread (hostui::post).
 //
 // Test switches:
-//   WWHD_TEST_OVERLAY=open[:<tab>][@<frame>]   open the overlay (tab: saves, graphics, display, audio, mods,
-//                                              controls, about) at TV frame <frame> (default 1)
+//   WWHD_TEST_OVERLAY=open[:<tab>][@<frame>]   open the overlay (tab: graphics, display, audio, controls,
+//                                              keyboard, about) at TV frame <frame> (default 1)
 //   WWHD_TEST_MOD_DISABLE/WWHD_TEST_MOD_REMOVE=<id>  normal package actions in headless runs
 //   WWHD_TEST_CATALOGUE_INSTALL=<id>         refresh and install through the normal catalogue UI worker
 //                                              (headless tests only; open the Mods tab separately)
@@ -70,5 +71,20 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)());
 // The same draw data for a target with sRGB encoding: vertex colours converted to linear once per
 // frame (the Metal backend draws colours as they are; the Vulkan renderer converts in its shader).
 void linearize_colors(ImDrawData* d,bool fresh_copy=false);
+
+// ---- Liquid Glass (Metal renderer)
+// The windows of this frame's draw data that sit on glass: the renderer blurs the picture behind each
+// one and draws the glass panel just before that window's draw list. Rectangles in target pixels.
+struct GlassPanel {
+    const void* list;           // the window's ImDrawList (in frame()'s draw data)
+    float x, y, w, h, radius;
+    float tint;                 // smoky darkening over the blurred picture (legibility)
+    float shadow;               // drop shadow strength
+    bool dim;                   // a modal sheet: the picture and the windows below are dimmed first
+};
+// valid with frame()'s draw data; 0 when nothing is on glass
+int glass_panels(const GlassPanel** out);
+// the renderer draws glass behind the panels (otherwise the windows draw their own dense background)
+void set_glass(bool on);
 
 }  // namespace overlay
