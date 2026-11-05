@@ -132,6 +132,18 @@ Settings > Graphics > MetalFX, both off by default (saved as `metalfxUpscale` / 
 Play-tested (user, 2026-11-04): upscaling, frame generation and the Metal 4 changes all work. Not measured
 yet: GPU cost, CPU % / heat with frame generation on vs off, shader compile times with MTL4Compiler.
 
+### 2026-11-06: save states taken out of the menus
+The Save States menu in the menu bar and its shortcuts (Cmd+1-5 / Cmd+Shift+1-5, F2-F5 / Shift+F1-F5)
+are gone, so F2-F5 can be bound in Controls; crash recovery lost its switch with it
+(`WWHD_CRASH_RECOVERY=1` still turns it on). Why: a full state loads into the running game only while
+every guest thread is still parked where it was saved, because a thread's native call stack can't be
+rebuilt. Play test: saving and loading on the spot works (Great Plateau, Kakariko), but from Kakariko
+a slot saved earlier elsewhere was refused every time (a thread from the save had exited, a
+WorkerMgr worker waited on another object). Making it work anywhere needs resumable recompiled
+functions (a check at every non-leaf call), decided against for that per-call cost. The engine stays
+for scripted runs (`tools/bench/run_bench.py` loads a state with `WWHD_STATE_LOAD_AT`); this change
+touches no per-frame or per-call code.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

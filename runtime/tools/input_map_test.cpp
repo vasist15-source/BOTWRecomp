@@ -299,8 +299,11 @@ static void test_names() {
 }
 
 static void test_reserved() {
-    for (int k : std::initializer_list<int>{kVK_F1, kVK_F2, kVK_F5, kVK_F12, kVK_Escape, kVK_Command})
+    for (int k : std::initializer_list<int>{kVK_F1, kVK_F12, kVK_Escape, kVK_Command})
         CHECK(reserved_key(k) != nullptr);
+    // F2-F5 are free since the save state shortcuts were removed (2026-11-06)
+    for (int k : std::initializer_list<int>{kVK_F2, kVK_F3, kVK_F4, kVK_F5})
+        CHECK(reserved_key(k) == nullptr);
     // the single-key Graphics hotkeys give way to a binding (gfx/input.mm)
     for (int k : std::initializer_list<int>{kVK_ANSI_K, kVK_ANSI_R, kVK_ANSI_M, kVK_ANSI_N, kVK_ANSI_P, kVK_ANSI_6})
         CHECK(reserved_key(k) == nullptr);

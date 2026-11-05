@@ -8,8 +8,8 @@
 // running, automatic state n is loaded and the pad reads after the load return the recorded input in
 // order; when the recording ends, live input takes over. Crash recovery saves nothing during a replay.
 //
-// On/off: Save States menu, or WWHD_CRASH_RECOVERY=0|1 for one start; the menu choice is kept in
-// <states>/crash_recovery.cfg. WWHD_CRASH_RECOVERY_INTERVAL=<seconds> (default 120).
+// On/off: WWHD_CRASH_RECOVERY=0|1 for one start, or <states>/crash_recovery.cfg (the Save States menu
+// that wrote it is gone since 2026-11-06). WWHD_CRASH_RECOVERY_INTERVAL=<seconds> (default 120).
 // Test aid: WWHD_TEST_CRASH_AT=<TV frame> crashes on purpose.
 #include "crashrec.h"
 #include "crash_context.h"
@@ -68,7 +68,7 @@ char g_note[512] = "crash recovery: off\n";
 
 void update_note(int latest, const char* when) {
     if (!enabled()) {
-        snprintf(g_note, sizeof g_note, "crash recovery: off (Save States > Crash Recovery to turn it on)\n");
+        snprintf(g_note, sizeof g_note, "crash recovery: off (WWHD_CRASH_RECOVERY=1 turns it on)\n");
         return;
     }
     if (!latest) {

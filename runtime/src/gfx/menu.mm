@@ -14,7 +14,6 @@
 #include "../input_map.h"
 #include "../overlay/hostui.h"
 #include "../overlay/overlay.h"
-#include "../crashrec.h"
 #include "renderer.h"
 #include "runtime.h"
 
@@ -115,7 +114,7 @@ static void update_title() {
                                              render::aniso() ? "16x" : "game",
                                              interp::mode() ? [@" \u00b7 " stringByAppendingString:@(interp::mode_name())] : @"", render::fxaa() ? @" \u00b7 FXAA" : @""];
     if (gx2::uncapped()) t = [t stringByAppendingString:@" \u00b7 UNCAPPED (debug)"];
-    std::string msg = ss::last_message();  // save state confirmations
+    std::string msg = ss::last_message();  // short notices (screenshots)
     if (!msg.empty()) t = [NSString stringWithFormat:@"%@ \u2014 %@ \u2014 %s", kTitle, rnd, msg.c_str()];
     if (getenv("WWHD_LOG_TITLE") && ![t isEqualToString:g_tv.title]) {  // tests: the window title as it changes
         NSString* noFps = [t stringByReplacingOccurrencesOfString:[NSString stringWithFormat:@"%.0f fps", g_fps] withString:@"N fps"];
@@ -125,67 +124,6 @@ static void update_title() {
     }
     [g_tv setTitle:t];
 }
-
-// Save States menu: items are rebuilt each time it opens (slot time and area)
-@interface WWStateMenu : NSObject <NSMenuDelegate>
-@end
-@implementation WWStateMenu
-- (void)save:(NSMenuItem*)item { ss::request_save((int)item.tag); }
-- (void)load:(NSMenuItem*)item { ss::request_load((int)item.tag); }
-- (void)toggleCrashRecovery:(NSMenuItem*)item { crashrec::set_enabled(!crashrec::enabled()); }
-- (void)toggleFullStates:(NSMenuItem*)item { ss::set_full_states(!ss::full_states()); }
-- (void)loadAuto:(NSMenuItem*)item { crashrec::request_load((int)item.tag); }
-- (void)menuNeedsUpdate:(NSMenu*)m {
-    [m removeAllItems];
-    ss::SlotInfo info[ss::kSlots + 1];
-    for (int i = 1; i <= ss::kSlots; i++) info[i] = ss::slot_info(i);
-    auto label = [&](int i) -> NSString* {
-        const ss::SlotInfo& s = info[i];
-        if (!s.used) return @"empty";
-        NSString* d = [NSString stringWithFormat:@"%s%s%s%s", s.when.c_str(), s.area.empty() ? "" : " · ", s.area.c_str(),
-                                                    s.portable ? "" : " · full"];
-        if (!s.controller.empty()) d = [d stringByAppendingFormat:@" · %s", s.controller.c_str()];
-        return s.compatible ? d : [d stringByAppendingString:@" (incompatible)"];
-    };
-    for (int i = 1; i <= ss::kSlots; i++) {
-        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Save to slot %d  (%@)", i, label(i)] action:@selector(save:)
-                               keyEquivalent:[NSString stringWithFormat:@"%d", i]];
-        it.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
-        it.target = self;
-        it.tag = i;
-        it.toolTip = [NSString stringWithFormat:@"Also Shift+F%d in game", i];
-    }
-    [m addItem:[NSMenuItem separatorItem]];
-    for (int i = 1; i <= ss::kSlots; i++) {
-        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Load slot %d  (%@)", i, label(i)] action:@selector(load:)
-                               keyEquivalent:[NSString stringWithFormat:@"%d", i]];
-        it.keyEquivalentModifierMask = NSEventModifierFlagCommand;
-        it.target = self;
-        it.tag = i;
-        it.enabled = info[i].used && info[i].compatible;
-        it.toolTip = i == 1 ? @"F1 in game opens the settings overlay (Saves) instead" : [NSString stringWithFormat:@"Also F%d in game", i];
-    }
-    // crash recovery (crashrec.cpp): automatic states every few minutes + recorded input
-    [m addItem:[NSMenuItem separatorItem]];
-    NSMenuItem* cr = [m addItemWithTitle:[NSString stringWithFormat:@"Crash Recovery (automatic state every %d min)",
-                                                                    (crashrec::interval_seconds() + 30) / 60]
-                                  action:@selector(toggleCrashRecovery:) keyEquivalent:@""];
-    cr.target = self;
-    cr.state = crashrec::enabled() ? NSControlStateValueOn : NSControlStateValueOff;
-    cr.toolTip = @"Saves the game into automatic states in the background and records the controller input since the "
-                 @"latest one. After a crash, the crash log in captures/ says how to load it and replay the input. "
-                 @"Saving freezes the game for a moment.";
-    for (int i = 1; i <= crashrec::kAutoSlots; i++) {
-        crashrec::AutoInfo a = crashrec::auto_info(i);
-        NSString* d = a.used ? [NSString stringWithFormat:@"%s%s%s", a.when.c_str(), a.area.empty() ? "" : " · ", a.area.c_str()] : @"empty";
-        NSMenuItem* it = [m addItemWithTitle:[NSString stringWithFormat:@"Load automatic state %d  (%@)", i, d] action:@selector(loadAuto:) keyEquivalent:@""];
-        it.target = self;
-        it.tag = i;
-        it.enabled = a.used;
-    }
-}
-@end
-static WWStateMenu* g_state_menu;
 
 @interface WWGraphicsMenu : NSObject <NSMenuItemValidation>
 @end
@@ -319,14 +257,6 @@ void install_menu(NSWindow* tv) {
 
     mods::mouse_init((__bridge void*)tv);  // mouse input: gyro aiming with the mouse (mods/mouse.mm)
 
-    // Save States: 5 slots (savestate.cpp); Cmd+Shift+1..5 / Shift+F1..F5 save, Cmd+1..5 / F2..F5 load
-    NSMenuItem* ssItem = [bar addItemWithTitle:@"Save States" action:nil keyEquivalent:@""];
-    NSMenu* sm = [[NSMenu alloc] initWithTitle:@"Save States"];
-    sm.autoenablesItems = NO;
-    g_state_menu = [WWStateMenu new];
-    sm.delegate = g_state_menu;
-    ssItem.submenu = sm;
-
     // Window: the standard items. Close Window (Cmd+W) on the TV window quits, asking first while a
     // game is in progress (quit_prompt.mm); on the GamePad window it only hides it
     NSMenuItem* winItem = [bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""];
@@ -367,18 +297,7 @@ void menu_options_changed() { update_title(); }
 
 // single-key shortcuts from the game window; true if the key was used
 bool menu_hotkey(uint16_t code) {
-    // save states without the fn key (Mac keyboards send F1..F5 as media keys): Cmd+1..5 load, Cmd+Shift+1..5 save
-    const NSEventModifierFlags mods = [NSEvent modifierFlags];
-    if (mods & NSEventModifierFlagCommand) {
-        static const uint16_t digits[5] = {kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5};
-        for (int i = 0; i < 5; i++)
-            if (code == digits[i]) {
-                if (mods & NSEventModifierFlagShift) ss::request_save(i + 1);
-                else ss::request_load(i + 1);
-                return true;
-            }
-        return false;  // other Cmd shortcuts belong to the menus
-    }
+    if ([NSEvent modifierFlags] & NSEventModifierFlagCommand) return false;  // Cmd shortcuts belong to the menus
     switch (code) {
     case kVK_ANSI_N: if (render::feature_available(render::kFeatureAniso)) render::set_aniso(!render::aniso()); break;
     case kVK_ANSI_6: gx2::set_fps_target(gx2::fps_target() == 60 ? 30 : 60); break;
@@ -386,12 +305,6 @@ bool menu_hotkey(uint16_t code) {
     case kVK_ANSI_8: if (render::feature_available(render::kFeatureFXAA)) render::set_fxaa(!render::fxaa()); break;
     case kVK_ANSI_R: cycle_res(); break;
     case kVK_ANSI_P: case kVK_F12: render::request_capture(); return true;
-    case kVK_F1: case kVK_F2: case kVK_F3: case kVK_F4: case kVK_F5: {
-        int slot = code == kVK_F1 ? 1 : code == kVK_F2 ? 2 : code == kVK_F3 ? 3 : code == kVK_F4 ? 4 : 5;
-        if ([NSEvent modifierFlags] & NSEventModifierFlagShift) ss::request_save(slot);
-        else if (slot != 1) ss::request_load(slot);  // F1: the settings overlay (overlay_appkit.mm)
-        return true;
-    }
     case kVK_ANSI_9: {
         // 3 s of sound activity (voice starts), without the frame capture's stall
         char path[96];

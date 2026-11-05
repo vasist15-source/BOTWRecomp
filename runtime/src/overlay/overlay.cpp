@@ -144,7 +144,7 @@ ImGuiKey imgui_key(int code) {
 }
 
 // ---------------------------------------------------------------- UI state (render thread)
-// no Mods: Wind Waker code mods and cheats; no Saves: save states and crash recovery stay in the menu bar
+// no Mods: Wind Waker code mods and cheats; no Saves: save states have no menu or shortcut (removed 2026-11-06)
 enum Tab { kGraphics, kDisplay, kAudio, kControls, kKeyboard, kAbout, kTabs };
 const char* const kTabNames[kTabs] = {"Graphics", "Display", "Audio", "Controls", "Keyboard & Mouse", "Language & About"};
 const char* const kTabIds[kTabs] = {"graphics", "display", "audio", "controls", "keyboard", "about"};
@@ -1942,7 +1942,7 @@ bool key(int code, bool down, bool repeat, int mods) {
         return true;
     }
 #endif
-    // F1 (no modifiers; Shift+F1 saves slot 1) toggles; Esc closes
+    // F1 (no modifiers) toggles; Esc closes
     if (code == kVK_F1 && !(mods & (kShift | kCtrl | kAlt | kSuper))) {
         if (down && !repeat && !g_capturing_keys.load()) set_open(!is_open());
         if (!g_capturing_keys.load()) return true;

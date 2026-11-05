@@ -12,8 +12,8 @@
 #include "platform/input_sdl.h"
 static int audioResets=0;
 namespace audio {void flush(){++audioResets;}}
-static int savedSlot=0, loadedSlot=0, saveRequests=0, loadRequests=0;
-namespace ss { void request_save(int slot){savedSlot=slot;++saveRequests;} void request_load(int slot){loadedSlot=slot;++loadRequests;} }
+static int saveRequests=0, loadRequests=0;
+namespace ss { void request_save(int){++saveRequests;} void request_load(int){++loadRequests;} }
 static int graphicsRequests=0; static char graphicsKey=0;
 namespace render { uint64_t frame_count(){return 0;} }
 namespace gfxvk { bool graphics_hotkey(char key,bool activate){if(activate){++graphicsRequests;graphicsKey=key;}return true;} }
@@ -73,24 +73,15 @@ int main(){
  auto* game=SDL_CreateWindow("Game",32,32,SDL_WINDOW_HIDDEN);
  auto* controls=SDL_CreateWindow("Controls",32,32,SDL_WINDOW_HIDDEN);
  assert(game&&controls);input::set_prompt_window(game);
- auto stateKey=[&](int slot,SDL_Keymod mod,bool repeat=false,SDL_Window* window=nullptr,Uint32 type=SDL_EVENT_KEY_DOWN){
-  SDL_Event e{};e.type=type;e.key.scancode=SDL_Scancode(SDL_SCANCODE_F1+slot-1);
-  e.key.windowID=SDL_GetWindowID(window?window:game);e.key.mod=mod;e.key.repeat=repeat;input::handle_event(e);
+ // F1-F5 (with or without Shift) are plain keys: the save state shortcuts were removed (2026-11-06)
+ auto fKey=[&](int n,SDL_Keymod mod,Uint32 type){
+  SDL_Event e{};e.type=type;e.key.scancode=SDL_Scancode(SDL_SCANCODE_F1+n-1);
+  e.key.windowID=SDL_GetWindowID(game);e.key.mod=mod;input::handle_event(e);
  };
- for(int slot=1;slot<=5;++slot){
-  stateKey(slot,SDL_KMOD_NONE);assert(loadedSlot==slot&&loadRequests==slot);
-  stateKey(slot,SDL_KMOD_LSHIFT);assert(savedSlot==slot&&saveRequests==2*slot-1);
-  stateKey(slot,SDL_KMOD_RSHIFT);assert(savedSlot==slot&&saveRequests==2*slot);
- }
- const int saves=saveRequests,loads=loadRequests;
- stateKey(1,SDL_KMOD_LSHIFT,true);stateKey(1,SDL_KMOD_NONE,false,controls);
- stateKey(1,SDL_KMOD_LSHIFT,false,nullptr,SDL_EVENT_KEY_UP);
- stateKey(6,SDL_KMOD_NONE);input::set_prompt_window(nullptr);stateKey(1,SDL_KMOD_NONE);
- assert(saveRequests==saves&&loadRequests==loads);
- input::set_prompt_window(game);input::release_keys();
- for(int slot=1;slot<=5;++slot)stateKey(slot,SDL_KMOD_NONE,true);
- input::held_keys(held);
- for(const char* id:{"F1","F2","F3","F4","F5"})assert(!held[input_map::key_from_id(id)]);
+ for(int n=1;n<=5;++n)
+  for(SDL_Keymod mod:{SDL_KMOD_NONE,SDL_KMOD_LSHIFT}){fKey(n,mod,SDL_EVENT_KEY_DOWN);fKey(n,mod,SDL_EVENT_KEY_UP);}
+ assert(saveRequests==0&&loadRequests==0);
+ input::release_keys();
  auto graphicsEvent=[&](SDL_Scancode code,SDL_Window* window, bool repeat=false, Uint32 type=SDL_EVENT_KEY_DOWN,SDL_Keymod mod=SDL_KMOD_NONE){SDL_Event e{};e.type=type;e.key.scancode=code;e.key.windowID=SDL_GetWindowID(window);e.key.repeat=repeat;e.key.mod=mod;input::handle_event(e);};
  for(auto code:{SDL_SCANCODE_R,SDL_SCANCODE_O,SDL_SCANCODE_M,SDL_SCANCODE_N,SDL_SCANCODE_8,SDL_SCANCODE_6,SDL_SCANCODE_7}){
   int before=graphicsRequests;graphicsEvent(code,game);assert(graphicsRequests==before+1);

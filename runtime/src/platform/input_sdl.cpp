@@ -506,17 +506,6 @@ void handle_event(const SDL_Event& event){
  // the Screenshot binding (F10 by default), in any game window; posted test keys take this path too
  if(event.type==SDL_EVENT_KEY_DOWN&&!event.key.repeat){int code=keycode(event.key.scancode);if(code>=0&&screenshot::key_down(code))return;}
  if(test_event(event))return;  // posted test keys reach only the overlay (and the Screenshot binding)
- // Save states belong to the game window, not auxiliary controls/text windows.
- if((event.type==SDL_EVENT_KEY_DOWN||event.type==SDL_EVENT_KEY_UP) &&
-    g_prompt_window && event.key.windowID==SDL_GetWindowID(g_prompt_window) &&
-    event.key.scancode>=SDL_SCANCODE_F1 && event.key.scancode<=SDL_SCANCODE_F5){
-  if(event.type==SDL_EVENT_KEY_DOWN && !event.key.repeat){
-   const int slot=int(event.key.scancode-SDL_SCANCODE_F1)+1;
-   if(event.key.mod&SDL_KMOD_SHIFT)ss::request_save(slot);
-   else ss::request_load(slot);
-  }
-  return;
- }
  // Graphics shortcuts are plain keys scoped to the game window; repeats never toggle.
  if((event.type==SDL_EVENT_KEY_DOWN||event.type==SDL_EVENT_KEY_UP) && g_prompt_window &&
     event.key.windowID==SDL_GetWindowID(g_prompt_window) &&
