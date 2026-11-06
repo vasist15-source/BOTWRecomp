@@ -355,6 +355,43 @@ they work. Frame time and CPU % not measured (the runtime does no per-frame work
 patched function loses the register passes and reads its mod's switch byte at each changed instruction).
 The Rebuild button also covers an app `tools/make_app.sh` made (it runs make_app.sh again after the build).
 
+### 2026-11-07: BCML merge data for events, flags, save data and texts (layer 2 of the mod loader, part 1)
+A `.bnp`'s `eventinfo.yml`, `gamedata.yml`, `savedata.yml` and `texts.json` are applied (before, the mod was refused).
+New formats: `mods/byml.{h,cpp}` (BYML v2-4, either byte order, and the YAML text oead writes, which BCML's logs use:
+`!u`/`!l`/`!ul`/`!f64`, floats with a '.', s32 otherwise), `mods/msbt.{h,cpp}` (MSBT files and msyt's JSON form of
+texts, all of its control kinds). The mergers (`mods/bcml_merge.{h,cpp}`) follow BCML (bcml/mergers data.py, events.py,
+texts.py and its Rust texts.rs), with UKMM's uk-content as a second reference and msyt/msbt-rs (MIT) for the texts'
+control sequences; our own code, as a specification only:
+- events (`Event/EventInfo.product.sbyml` in Bootup.pack): whole entries added or replaced.
+- flags (`GameData/gamedata.ssarc`): per type added or replaced by DataName, then deleted; diffs combine as BCML's
+  dict_merge (a later mod's deletion list replaces an earlier one's). The game's files stay as they are unless a flag
+  in them changes; a new flag goes to the last file of its kind (stage flags such as MainField_... to the revival files,
+  UKMM's rule), and a new file when that one has 4096.
+- save data (`GameData/savedataformat.ssarc`): game_data.sav's flags, the highest mod's per hash, deletions of any,
+  sorted by signed hash, 8192 per file, caption.sav and option.sav renumbered after them.
+- texts (`Message/Msg_<lang>.product.ssarc` in `Pack/Bootup_<lang>.pack`): per MSBT file and label, for every language
+  of the dump, the mod's texts chosen as BCML maps languages (the same, another region's, English, any). Texts the
+  merge doesn't change stay as raw bytes; the game's attribute strings are kept when an entry has none.
+These files are rebuilt from the game's copies after the archive merge and replace any mod's copy (as BCML's Bootup
+injection). A mod with its own copy and no log for it (a plain content mod) has its changes against the game's copy
+merged entry by entry, and a loose copy is no longer read instead of the rebuilt one. `kCacheFormat` 4 (one re-merge).
+Checked on the dump: all 1091 MSBT files of USen, USes and USfr write back byte for byte and all 29,730 texts decode and
+encode back the same; every BYML in Bootup.pack and TitleBG.pack writes back at the game's size (only the order of a
+hash's child nodes differs). Gerudo Hero 1.0.0 (gamebanana 733520) alone: 580 ms at the first start, 371 MB peak, 3 ms
+from the cache; 8 events, 5 flags, 4 save data flags and 71 texts (x3 languages) in the merged files; the merge changes 11
+files in Bootup.pack, 27 in each language pack and 2 in TitleBG.pack; no size entry smaller than its file. With The Linkle
+Mod 3.0.1 and both options too: 1.16-1.39 s, about 400 MB peak, 146 archives (both change TitleBG's
+SignalFlowchart.bfevfl: the higher one wins). The peak counts freed memory: on macOS 27 freed medium and large blocks
+stay resident (malloc's in-use bytes drop to about 1 MB between archives, the footprint doesn't, and
+`malloc_zone_pressure_relief` releases nothing); a window-sized Yaz0 match table saved only 3 MB and was left out.
+`content_merge_test` covers BYML and its YAML, MSBT and every control kind, the four merges (logs, a plain mod's copies in
+a pack and loose, two languages, flags and save data overflowing into new files) and `--dump` now checks rebuilt data
+tables and texts and that every logged change is in the merged files. Play-tested by the user (2026-11-07) with Gerudo
+Hero: Gerudo Town lets Link in without the vai outfit and the NPCs' voe lines show. Seven lines its flows use are missing
+from the mod's own texts.json (BCML misses them too). Switching Linkle off worked (Link only looked like Linkle in an
+outfit). Still refused by name: actorinfo.yml, areadata.yml, drops.json, dstatic.yml, effects.yml, mainstatic.yml,
+map.yml, quests.yml, residents.yml, shop.aamp. No per-frame work; frame time and CPU % not measured.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

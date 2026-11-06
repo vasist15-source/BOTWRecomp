@@ -21,7 +21,7 @@ struct Layout {  // what a mod folder holds
     std::string kind;  // "Cemu graphic pack", "SDCafiine folder", "Content folder", "BCML mod", "BCML mod (.bnp)"
     std::string name, description;
     std::filesystem::path content, aoc;  // empty when absent
-    std::filesystem::path logs;          // a BCML mod's merge data (deepmerge.aamp, aslist.aamp, rstb.json)
+    std::filesystem::path logs;          // a BCML mod's merge data (deepmerge.aamp, rstb.json, texts.json, ...)
     // A BCML mod's optional parts (info.json "options"; options/<folder> holds content, aoc and logs). A "multi"
     // option is a switch of its own; the options of a "single" group are one choice, or none unless the
     // group is required. A chosen option is merged over its mod.

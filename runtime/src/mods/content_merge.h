@@ -6,7 +6,9 @@
 //  - a loose file the game only has inside archives (most of Pack/TitleBG.pack and Pack/Bootup.pack,
 //    which the game reads instead of loose files) is put into those archives;
 //  - the resource size table takes the mods' own entries, and entries of files that grew grow too;
-//  - a .bnp's BCML merge data (deepmerge.aamp, aslist.aamp, rstb.json) is applied in the mod's turn.
+//  - a .bnp's BCML merge data (deepmerge.aamp, aslist.aamp, rstb.json) is applied in the mod's turn; its merge
+//    data for game data tables (eventinfo.yml, gamedata.yml, savedata.yml, texts.json: bcml_merge.h) rebuilds
+//    those files from the game's copies, with every mod's changes, over any mod's copy of them.
 #pragma once
 #include <cstdint>
 #include <filesystem>
@@ -26,7 +28,8 @@ struct Mod {
     std::string id, name;
     std::filesystem::path content, aoc;  // the mod's content/ and aoc/ folders (either may be empty)
     // BCML's merge data of a .bnp (empty: none): deepmerge.aamp and aslist.aamp (parameter changes, applied to
-    // the files they name inside the merged archives) and rstb.json (sizes; 0: the entry is dropped)
+    // the files they name inside the merged archives), rstb.json (sizes; 0: the entry is dropped), eventinfo.yml,
+    // gamedata.yml, savedata.yml and texts.json (events, flags, save data flags and texts; bcml_merge.h)
     std::filesystem::path logs;
     bool option = false;  // a BCML mod's option, after its mod (counted as an option of it)
 };

@@ -52,7 +52,7 @@ inline std::string dump(const Value& v) {
     return "null";
 }
 class Reader {
-    const std::string& s;size_t p=0;
+    const std::string& s;size_t p=0;size_t limit=1024*1024;
     [[noreturn]] void fail(const char* message) const {exception_report::raise(std::string(message)+" at byte "+std::to_string(p));}
     void ws(){while(p<s.size() && (s[p]==' '||s[p]=='\n'||s[p]=='\r'||s[p]=='\t'))++p;}
     bool take(char c){ws();if(p<s.size()&&s[p]==c){++p;return true;}return false;}
@@ -82,8 +82,10 @@ class Reader {
         std::string n=s.substr(start,p-start);v.type=Value::Number;v.number=std::strtod(n.c_str(),nullptr);if(!std::isfinite(v.number))fail("Number overflow");return v;
     }
 public:
-    explicit Reader(const std::string& input):s(input){}
-    Value read(){if(s.size()>1024*1024)fail("JSON size limit");auto v=value(0);ws();if(p!=s.size())fail("Trailing JSON input");return v;}
+    explicit Reader(const std::string& input,size_t max_size=1024*1024):s(input),limit(max_size){}
+    Value read(){if(s.size()>limit)fail("JSON size limit");auto v=value(0);ws();if(p!=s.size())fail("Trailing JSON input");return v;}
 };
 inline Value parse(const std::string& s){return Reader(s).read();}
+// a larger document (BCML's texts.json and drops.json merge logs)
+inline Value parse(const std::string& s,size_t max_size){return Reader(s,max_size).read();}
 } // namespace mods::json

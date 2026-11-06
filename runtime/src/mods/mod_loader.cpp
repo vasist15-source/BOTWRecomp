@@ -28,7 +28,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kCacheFormat = 3;     // bump when merged output changes for the same inputs (3: compact AAMP, sizes of rebuilt files)
+constexpr int kCacheFormat = 4;     // bump when merged output changes for the same inputs (3: compact AAMP, sizes of rebuilt files; 4: BCML events, flags, save data, texts)
 constexpr size_t kSaveBackups = 10;  // newest kept in "Save backups"
 
 std::string lower(std::string s) {
@@ -99,10 +99,12 @@ void read_rules(const fs::path& rules, Layout& l) {
         l.problem = "This graphic pack is for another game (its titleIds don't name Breath of the Wild)";
 }
 // A BCML mod (.bnp) keeps some changes only as merge data in logs/. The merge applies deepmerge.aamp and
-// aslist.aamp (actor parameters, animation lists) and rstb.json (sizes); packs.json only lists its packs.
-// Anything else (texts, flags, ActorInfo, maps, ...) is not applied yet, and without it the game can crash
+// aslist.aamp (actor parameters, animation lists), rstb.json (sizes), eventinfo.yml, gamedata.yml, savedata.yml
+// and texts.json (events, game data and save data flags, texts: bcml_merge.h); packs.json only lists its packs.
+// Anything else (ActorInfo, maps, shops, drops, quests, ...) is not applied yet, and without it the game can crash
 // (The Linkle Mod unpacked before this support: support bones and physics of its new models, 2026-11-06).
-const char* const kBcmlLogs[] = {"packs.json", "rstb.json", "deepmerge.aamp", "aslist.aamp"};
+const char* const kBcmlLogs[] = {"packs.json", "rstb.json", "deepmerge.aamp", "aslist.aamp",
+                                 "eventinfo.yml", "gamedata.yml", "savedata.yml", "texts.json"};
 bool bcml_logs(const fs::path& dir, std::string& unsupported) {  // whether dir/logs has any; which can't be applied
     std::error_code ec;
     std::vector<std::string> other;

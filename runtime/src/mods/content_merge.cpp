@@ -3,6 +3,7 @@
 
 #include "../exception_report.h"
 #include "aamp.h"
+#include "bcml_merge.h"
 #include "botw_formats.h"
 
 #include <algorithm>
@@ -229,6 +230,12 @@ struct Ctx {
     // (lower mod, higher mod) -> files of the lower one the higher one replaced, and one of them
     std::map<std::pair<int, int>, std::pair<size_t, std::string>> conflicts;
     std::vector<std::pair<int, std::string>> notes;
+    // files of this archive that BCML merge data rebuilds (the name in the archive -> mods with a log for it): a mod's
+    // own copy of one is set aside (copies) and merged with the logs, entry by entry, instead of replacing it
+    const std::map<std::string, std::set<int>>* rebuilt = nullptr;
+    std::map<std::string, std::map<int, Blob>> copies;
+    std::string host;  // the mod file being applied
+    std::map<std::string, std::set<std::pair<int, std::string>>> set_aside;  // name -> (mod, file) whose copy of it was set aside
 };
 
 bool replace(Archive& work, const std::string& name, const Blob& raw, int mod, Ctx& ctx, const std::string& path) {
@@ -265,6 +272,12 @@ bool replace(Archive& work, const std::string& name, const Blob& raw, int mod, C
 // game already has is skipped, archives both have are merged file by file, anything else replaces.
 bool apply_file(Archive& work, const Archive* vanilla, const std::string& name, const Blob& m, int mod, int depth,
                 Ctx& ctx, const std::string& path) {
+    if (depth == 1 && ctx.rebuilt)
+        if (auto it = ctx.rebuilt->find(name); it != ctx.rebuilt->end()) {
+            if (!it->second.count(mod)) ctx.copies[name][mod] = m;  // its changes become its diff
+            ctx.set_aside[name].insert({mod, ctx.host});  // (a mod with a log for it: the log has its changes)
+            return false;
+        }
     const Node* v = nullptr;
     if (vanilla)
         if (auto it = vanilla->files.find(name); it != vanilla->files.end()) v = &it->second;
@@ -539,11 +552,243 @@ struct Source {  // something a mod changes in an archive the game has
     const Patch* patch = nullptr;  // or a BCML parameter change inside it
     int order() const { return patch ? 2 : inner.empty() ? 0 : 1; }  // within a mod: its archive, loose files, changes
 };
+// a file that BCML merge data for a game data table rebuilds, inside the archive of a job
+struct Rebuild {
+    enum Kind { Events, Flags, Save, Texts } kind;
+    std::string inner;     // its name in the archive ("Event/EventInfo.product.sbyml")
+    std::string language;  // Texts: the game's language ("USen")
+};
 struct Job {
     std::string tree;
     fs::path vanilla;
     std::vector<Source> sources;
+    std::vector<Rebuild> rebuilds;  // applied after the sources, over the game's copies
 };
+// the mods' merge data for game data tables (bcml_merge.h), by mod
+struct TableLogs {
+    std::map<int, byml::Value> events, flags;
+    std::map<int, bcml::SaveDiff> save;
+    std::map<int, std::map<std::string, bcml::TextFiles>> texts;  // language -> files
+    std::set<int> owners(Rebuild::Kind k) const {
+        std::set<int> out;
+        auto take = [&](const auto& m) {
+            for (const auto& e : m) out.insert(e.first);
+        };
+        switch (k) {
+        case Rebuild::Events: take(events); break;
+        case Rebuild::Flags: take(flags); break;
+        case Rebuild::Save: take(save); break;
+        case Rebuild::Texts: take(texts); break;
+        }
+        return out;
+    }
+};
+// the game's languages: content/Pack/Bootup_<USen|EUde|...>.pack
+std::vector<std::string> game_languages(const Vanilla& v) {
+    std::set<std::string> out;
+    for (const fs::path& content : {v.update_content, v.base_content}) {
+        std::error_code ec;
+        const fs::path dir = child_dir(content, "Pack");
+        if (dir.empty()) continue;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string n = it->path().filename().string();
+            if (n.size() == 16 && n.rfind("Bootup_", 0) == 0 && tree_key(n.substr(11)) == ".pack") out.insert(n.substr(7, 4));
+        }
+    }
+    return {out.begin(), out.end()};
+}
+Bytes bytes_of(const Blob& b) { return Bytes(b.data(), b.data() + b.len); }
+// an archive's files as stored (bcml::Files); false if it isn't one
+bool files_of(const Blob& raw, bcml::Files& out, std::string* why = nullptr) {
+    Blob u;
+    Archive a;
+    if (!unpack(raw, u) || !open(u, a, why)) return false;
+    for (const auto& [name, n] : a.files) out[name] = bytes_of(n.raw);
+    return true;
+}
+// Rebuilds `rb` in `work` from the game's copy in `game` and, in load order, each mod's log or its own copy's
+// changes. Returns the highest mod whose changes went in (-1: none).
+int rebuild(const Rebuild& rb, Archive& work, const Archive& game, const std::map<int, Blob>& copies, const TableLogs& tl, Ctx& ctx,
+            const std::string& where) {
+    const std::set<int> logged = tl.owners(rb.kind);
+    std::set<int> order = logged;
+    for (const auto& [mod, blob] : copies) order.insert(mod);
+    const std::string path = where + "/" + rb.inner;
+    const auto vit = game.files.find(rb.inner);
+    Blob gu;
+    if (vit == game.files.end() || !unpack(vit->second.raw, gu)) {
+        for (int mod : logged) ctx.notes.push_back({mod, path + " is not in the game's files: its BCML merge data is skipped"});
+        return -1;
+    }
+    const Node& vn = vit->second;
+    std::vector<int> used;
+    std::string why;
+    auto bad_copy = [&](int mod) { ctx.notes.push_back({mod, path + ": its copy can't be merged (" + why + ") and is not used"}); };
+    auto derived_note = [&](int mod, const std::string& what) {
+        ctx.notes.push_back({mod, path + ": its changes (" + what + ") are merged with other mods' BCML merge data"});
+    };
+    // the work archive's node, back to the game's copy (a mod's copy that replaced it is in `copies`)
+    Node& w = work.files[rb.inner];
+    w.raw = vn.raw;
+    w.archive.reset();
+    w.yaz0 = vn.yaz0;
+    w.yaz0_align = vn.yaz0_align;
+    w.alignment = std::max(w.alignment, vn.alignment);
+    if (rb.kind == Rebuild::Events) {
+        std::vector<std::unique_ptr<byml::Value>> derived;
+        std::vector<const byml::Value*> diffs;
+        const Bytes game_bytes = bytes_of(gu);
+        for (int mod : order) {
+            if (auto it = tl.events.find(mod); it != tl.events.end()) {
+                diffs.push_back(&it->second);
+                used.push_back(mod);
+                continue;
+            }
+            Blob cu;
+            auto d = std::make_unique<byml::Value>();
+            if (!unpack(copies.at(mod), cu) || !bcml::events_of_copy(game_bytes, bytes_of(cu), *d, why)) {
+                bad_copy(mod);
+                continue;
+            }
+            if (d->hash.empty()) continue;
+            derived_note(mod, std::to_string(d->hash.size()) + (d->hash.size() == 1 ? " event" : " events"));
+            diffs.push_back(d.get());
+            derived.push_back(std::move(d));
+            used.push_back(mod);
+        }
+        Bytes out;
+        size_t changed = 0;
+        if (diffs.empty()) return -1;
+        if (!bcml::merge_events(game_bytes, diffs, out, changed, why)) {
+            ctx.notes.push_back({used.back(), path + ": BCML merge data can't be applied (" + why + ")"});
+            return -1;
+        }
+        w.raw = vn.yaz0 ? whole(yaz0_encode(out.data(), out.size(), vn.yaz0_align)) : whole(std::move(out));
+        w.changed_by = used.back();
+        return used.back();
+    }
+    bcml::Files gf;
+    if (!files_of(vn.raw, gf, &why)) {
+        for (int mod : logged) ctx.notes.push_back({mod, path + " can't be read (" + why + "): its BCML merge data is skipped"});
+        return -1;
+    }
+    std::map<int, bcml::Files> copy_files;
+    for (const auto& [mod, blob] : copies)
+        if (!logged.count(mod) && !files_of(blob, copy_files[mod], &why)) {
+            copy_files.erase(mod);
+            bad_copy(mod);
+        }
+    bcml::Files result;
+    bool whole_set = false;  // result is the archive's whole new set of files
+    size_t count = 0;
+    bool ok = true;
+    if (rb.kind == Rebuild::Flags) {
+        std::vector<std::unique_ptr<byml::Value>> derived;
+        std::vector<const byml::Value*> diffs;
+        for (int mod : order) {
+            if (auto it = tl.flags.find(mod); it != tl.flags.end()) {
+                diffs.push_back(&it->second);
+                used.push_back(mod);
+            } else if (copy_files.count(mod)) {
+                auto d = std::make_unique<byml::Value>();
+                if (!bcml::flags_of_copy(gf, copy_files[mod], *d, why)) {
+                    bad_copy(mod);
+                    continue;
+                }
+                if (d->hash.empty()) continue;
+                derived_note(mod, "game data flags");
+                diffs.push_back(d.get());
+                derived.push_back(std::move(d));
+                used.push_back(mod);
+            }
+        }
+        ok = diffs.empty() || bcml::merge_flags(gf, diffs, result, count, why);
+    } else if (rb.kind == Rebuild::Save) {
+        std::vector<std::unique_ptr<bcml::SaveDiff>> derived;
+        std::vector<const bcml::SaveDiff*> diffs;
+        for (int mod : order) {
+            if (auto it = tl.save.find(mod); it != tl.save.end()) {
+                diffs.push_back(&it->second);
+                used.push_back(mod);
+            } else if (copy_files.count(mod)) {
+                auto d = std::make_unique<bcml::SaveDiff>();
+                if (!bcml::save_of_copy(gf, copy_files[mod], *d, why)) {
+                    bad_copy(mod);
+                    continue;
+                }
+                if (d->add.empty() && d->del.empty()) continue;
+                derived_note(mod, "save data flags");
+                diffs.push_back(d.get());
+                derived.push_back(std::move(d));
+                used.push_back(mod);
+            }
+        }
+        whole_set = true;
+        why.clear();
+        if (!diffs.empty() && !bcml::merge_save(gf, diffs, result, count, why)) {
+            ok = why.empty();  // false with no reason: nothing changes
+            result.clear();
+            whole_set = false;
+        }
+    } else {
+        std::vector<std::unique_ptr<bcml::TextFiles>> derived;
+        std::vector<const bcml::TextFiles*> diffs;
+        for (int mod : order) {
+            if (auto it = tl.texts.find(mod); it != tl.texts.end()) {
+                if (const bcml::TextFiles* t = bcml::texts_for(it->second, rb.language)) {
+                    diffs.push_back(t);
+                    used.push_back(mod);
+                }
+            } else if (copy_files.count(mod)) {
+                auto d = std::make_unique<bcml::TextFiles>();
+                if (!bcml::texts_of_copy(gf, copy_files[mod], *d, why)) {
+                    bad_copy(mod);
+                    continue;
+                }
+                if (d->empty()) continue;
+                derived_note(mod, "texts");
+                diffs.push_back(d.get());
+                derived.push_back(std::move(d));
+                used.push_back(mod);
+            }
+        }
+        ok = diffs.empty() || bcml::merge_texts(gf, diffs, result, count, why);
+    }
+    if (!ok) {
+        ctx.notes.push_back({used.empty() ? *logged.rbegin() : used.back(), path + ": BCML merge data can't be applied (" + why + ")"});
+        return -1;
+    }
+    if (used.empty() || result.empty()) return -1;
+    const int top = used.back();
+    if (!expand(w)) {
+        ctx.notes.push_back({top, path + " can't be opened: its BCML merge data is skipped"});
+        return -1;
+    }
+    Archive& a = *w.archive;
+    if (whole_set)
+        for (auto it = a.files.begin(); it != a.files.end();) it = result.count(it->first) ? std::next(it) : a.files.erase(it);
+    for (auto& [name, data] : result) {
+        auto it = a.files.find(name);
+        if (it != a.files.end() && it->second.raw.len == data.size() && !memcmp(it->second.raw.data(), data.data(), data.size())) continue;
+        if (it == a.files.end()) {  // a new file: aligned as the game's files of its kind
+            uint32_t align = 0;
+            const std::string ext = name.substr(name.rfind('.') == std::string::npos ? name.size() : name.rfind('.'));
+            for (const auto& [other, n] : a.files)
+                if (other.size() >= ext.size() && !other.compare(other.size() - ext.size(), ext.size(), ext))
+                    align = align ? std::min(align, n.alignment) : n.alignment;
+            it = a.files.emplace(name, Node{}).first;
+            it->second.alignment = align ? align : data_alignment(data.data(), data.size());
+        }
+        Node& n = it->second;
+        n.raw = whole(std::move(data));
+        n.archive.reset();
+        n.yaz0 = is_yaz0(n.raw.data(), n.raw.len);
+        n.yaz0_align = yaz0_alignment(n.raw.data(), n.raw.len);
+        n.changed_by = top;
+    }
+    w.changed_by = top;
+    return top;
+}
 
 }  // namespace
 
@@ -630,6 +875,95 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
             j.vanilla = vanilla.find(p.tree);
         }
         j.sources.push_back({p.mod, {}, {}, &p});
+    }
+
+    // ---- BCML merge data for game data tables (events, flags, save data, texts): rebuilt over the game's copies
+    TableLogs tables_logged;
+    std::vector<std::string> table_notes;  // for the summary
+    {
+        std::map<int, std::vector<std::string>> what;  // mod -> what its logs change
+        for (int i = 0; i < int(mods.size()); i++) {
+            const fs::path& logs = mods[size_t(i)].logs;
+            if (logs.empty()) continue;
+            auto text_of = [&](const char* name, std::string& out) {
+                std::error_code ec;
+                if (!fs::is_regular_file(logs / name, ec)) return false;
+                Bytes b;
+                if (!read_file(logs / name, b)) {
+                    note(i, std::string("Its ") + name + " can't be read");
+                    return false;
+                }
+                out.assign(b.begin(), b.end());
+                return true;
+            };
+            auto plural = [](size_t n, const char* one, const char* many) { return std::to_string(n) + " " + (n == 1 ? one : many); };
+            std::string text, why;
+            if (text_of("eventinfo.yml", text)) {
+                byml::Value v;
+                if (!bcml::read_events(text, v, why)) note(i, "Its eventinfo.yml can't be used: " + why);
+                else if (!v.hash.empty()) {
+                    what[i].push_back(plural(v.hash.size(), "event", "events"));
+                    tables_logged.events[i] = std::move(v);
+                }
+            }
+            if (text_of("gamedata.yml", text)) {
+                byml::Value v;
+                if (!bcml::read_flags(text, v, why)) note(i, "Its gamedata.yml can't be used: " + why);
+                else {
+                    size_t n = 0;
+                    for (const auto& [type, d] : v.hash) {
+                        if (const byml::Value* add = d.find("add")) n += add->hash.size();
+                        if (const byml::Value* del = d.find("del")) n += del->array.size();
+                    }
+                    if (n) {
+                        what[i].push_back(plural(n, "game data flag", "game data flags"));
+                        tables_logged.flags[i] = std::move(v);
+                    }
+                }
+            }
+            if (text_of("savedata.yml", text)) {
+                bcml::SaveDiff d;
+                if (!bcml::read_save(text, d, why)) note(i, "Its savedata.yml can't be used: " + why);
+                else if (!d.add.empty() || !d.del.empty()) {
+                    what[i].push_back(plural(d.add.size() + d.del.size(), "save data flag", "save data flags"));
+                    tables_logged.save[i] = std::move(d);
+                }
+            }
+            if (text_of("texts.json", text)) {
+                std::map<std::string, bcml::TextFiles> t;
+                if (!bcml::read_texts(text, t, why)) note(i, "Its texts.json can't be used: " + why);
+                else if (!t.empty()) {
+                    size_t files = 0, texts = 0;  // of its largest language
+                    for (const auto& [lang, f] : t) {
+                        size_t n = 0;
+                        for (const auto& [file, entries] : f) n += entries.size();
+                        if (n > texts) texts = n, files = f.size();
+                    }
+                    what[i].push_back(plural(texts, "text", "texts") + " in " + plural(files, "file", "files"));
+                    tables_logged.texts[i] = std::move(t);
+                }
+            }
+        }
+        for (const auto& [mod, parts] : what) {
+            std::string s;
+            for (const auto& p : parts) s += (s.empty() ? "" : ", ") + p;
+            note(mod, "BCML merge data: " + s);
+        }
+        const std::string boot = "content/Pack/Bootup.pack";
+        auto add = [&](const std::string& pack, Rebuild rb) {
+            Job& j = jobs[tree_key(pack)];
+            if (j.tree.empty()) {
+                j.tree = pack;
+                j.vanilla = vanilla.find(pack);
+            }
+            j.rebuilds.push_back(std::move(rb));
+        };
+        if (!tables_logged.events.empty()) add(boot, {Rebuild::Events, "Event/EventInfo.product.sbyml", {}});
+        if (!tables_logged.flags.empty()) add(boot, {Rebuild::Flags, "GameData/gamedata.ssarc", {}});
+        if (!tables_logged.save.empty()) add(boot, {Rebuild::Save, "GameData/savedataformat.ssarc", {}});
+        if (!tables_logged.texts.empty())
+            for (const std::string& lang : game_languages(vanilla))  // every language of the game, as BCML's "all languages"
+                add("content/Pack/Bootup_" + lang + ".pack", {Rebuild::Texts, "Message/Msg_" + lang + ".product.ssarc", lang});
     }
 
     // ---- loose files the game only has inside packs go into those packs
@@ -719,6 +1053,7 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
 
     // ---- merged archives
     std::map<int, std::set<std::string>> contributed;  // mod -> its files that changed a merged archive
+    std::set<std::string> rebuilt_loose;  // rebuilt files' loose paths: a mod's loose copy is not read instead
     for (auto& [key, job] : jobs) {
         std::stable_sort(job.sources.begin(), job.sources.end(), [](const Source& a, const Source& b) {
             return a.mod != b.mod ? a.mod < b.mod : a.order() < b.order();
@@ -735,7 +1070,11 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
             Blob vu;
             ok = unpack(root.raw, vu) && open(vu, vanilla_archive, &why) && expand(root);
         }
-        const int winner = job.sources.back().mod;
+        std::map<std::string, std::set<int>> rebuilt;  // files BCML merge data rebuilds here -> the mods with a log for them
+        for (const auto& rb : job.rebuilds) rebuilt[rb.inner] = tables_logged.owners(rb.kind);
+        int winner = job.sources.empty() ? -1 : job.sources.back().mod;
+        for (const auto& [inner, owners] : rebuilt)
+            if (!owners.empty()) winner = std::max(winner, *owners.rbegin());
         if (!ok) {  // the game's archive can't be read: the copy of the mod highest in the list, if any
             for (auto it = job.sources.rbegin(); it != job.sources.rend(); ++it)
                 if (it->inner.empty() && !it->patch) {
@@ -748,6 +1087,7 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
         }
         r.vanilla_used.push_back(job.vanilla);
         Ctx ctx;
+        if (!rebuilt.empty()) ctx.rebuilt = &rebuilt;
         std::set<int> mods_in;
         for (const auto& src : job.sources) {
             if (src.patch) {
@@ -764,6 +1104,7 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
             }
             const Blob m = whole(std::move(mb));
             const std::string where = shown(job.tree);
+            ctx.host = src.host.string();
             bool changed = false;
             if (!src.inner.empty()) {
                 changed = apply_file(*root.archive, &vanilla_archive, src.inner, m, src.mod, 1, ctx, where + "/" + src.inner);
@@ -783,6 +1124,17 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
                 mods_in.insert(src.mod);
                 contributed[src.mod].insert(src.host.string());
             }
+        }
+        // game data tables: the game's copy with every mod's log (or its own copy's changes), over the mods' copies
+        for (const auto& rb : job.rebuilds) {
+            const int top = rebuild(rb, *root.archive, vanilla_archive, ctx.copies[rb.inner], tables_logged, ctx, shown(job.tree));
+            if (top < 0) continue;
+            for (const auto& [mod, host] : ctx.set_aside[rb.inner]) contributed[mod].insert(host);  // read through the rebuilt file
+            if (job.tree.rfind("content/", 0) == 0) rebuilt_loose.insert(tree_key("content/" + rb.inner));
+            for (int mod : tables_logged.owners(rb.kind)) mods_in.insert(mod);
+            for (const auto& [mod, blob] : ctx.copies[rb.inner]) mods_in.insert(mod);
+            table_notes.push_back(rb.kind == Rebuild::Events ? "events" : rb.kind == Rebuild::Flags ? "game data flags"
+                                  : rb.kind == Rebuild::Save ? "save data" : "texts " + rb.language);
         }
         const Blob built = build(root);
         const fs::path file = out / job.tree;
@@ -805,6 +1157,7 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
             for (int mod : mods_in) note(mod, shown(job.tree) + ": merged (" + names + ")");
         }
     }
+    for (const auto& key : rebuilt_loose) r.files.erase(key);
     // loose parameter files a BCML change names
     for (const Patch* p : loose_patches) {
         const std::string key = tree_key(p->tree);
@@ -842,6 +1195,15 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
     }
     for (const auto& [mod, count] : patched)
         note(mod, "BCML merge data: " + std::to_string(count) + (count == 1 ? " parameter file" : " parameter files") + " changed");
+    if (!table_notes.empty()) {  // "Rebuilt from BCML merge data: events, game data flags, texts USen, USes"
+        std::string s, langs;
+        for (const auto& t : table_notes) {
+            if (t.rfind("texts ", 0) == 0) langs += (langs.empty() ? "" : ", ") + t.substr(6);
+            else s += (s.empty() ? "" : ", ") + t;
+        }
+        if (!langs.empty()) s += (s.empty() ? "texts " : ", texts ") + langs;
+        r.log.push_back("Rebuilt from BCML merge data: " + s);
+    }
 
     for (const auto& [mod, files] : contributed) r.mods[size_t(mod)].merged += files.size();
     for (const auto& [pair, o] : overridden)

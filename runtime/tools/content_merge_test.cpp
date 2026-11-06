@@ -1,6 +1,7 @@
 // Tests the content mod loader with synthetic files: Yaz0, SARC and resource size table formats
-// (mods/botw_formats.h), merging several mods' content (mods/content_merge.h), mod folder layouts and
-// the loader's startup, settings and cache (mods/mod_loader.h).
+// (mods/botw_formats.h), AAMP, BYML with its YAML text and MSBT (mods/aamp.h, byml.h, msbt.h), merging several
+// mods' content with BCML merge data (mods/content_merge.h, bcml_merge.h), mod folder layouts and the loader's
+// startup, settings and cache (mods/mod_loader.h).
 //   content_merge_test WORK            all tests (WORK is emptied)
 //   content_merge_test WORK --reuse T  (run by the test itself) a second start must take the cached merge
 //   content_merge_test WORK --options TABLE  (run by the test itself) a start with other BCML options
@@ -16,15 +17,19 @@
 #include <fstream>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
 #include <sys/resource.h>
 
 #include "mods/aamp.h"
+#include "mods/bcml_merge.h"
 #include "mods/botw_formats.h"
+#include "mods/byml.h"
 #include "mods/content_merge.h"
 #include "mods/mod_loader.h"
+#include "mods/msbt.h"
 
 namespace config { std::string game_dir, base_dir, aoc_dir, save_dir; }
 bool g_trace_hle = false;
@@ -42,6 +47,10 @@ namespace fs = std::filesystem;
 namespace merge = mods::merge;
 namespace loader = mods::loader;
 namespace aamp = mods::aamp;
+namespace byml = mods::byml;
+namespace msbt = mods::msbt;
+namespace bcml = mods::bcml;
+namespace json = mods::json;
 
 namespace {
 
@@ -301,6 +310,211 @@ void test_aamp() {
     assert(run && aamp::text(value(*run, "CFPre", "Name")) == "Run");
 }
 
+// ---------------------------------------------------------------- BYML and its YAML text
+byml::Value S(const std::string& s) { return byml::Value::string(s); }
+byml::Value N(int32_t v) { return byml::Value::s32(v); }
+byml::Value Bo(bool b) { return byml::Value::boolean(b); }
+byml::Value Fl(float f) { return byml::Value::f32(f); }
+byml::Value Ar(std::vector<byml::Value> items) {
+    byml::Value v = byml::Value::new_array();
+    v.array = std::move(items);
+    return v;
+}
+byml::Value Ha(std::vector<std::pair<std::string, byml::Value>> items) {
+    byml::Value v = byml::Value::new_hash();
+    for (auto& [k, x] : items) v.set(k, std::move(x));
+    return v;
+}
+Bytes byml_bytes(const byml::Value& root, uint16_t version = 2, bool big = true) {
+    byml::Document d;
+    d.root = root;
+    d.version = version;
+    d.big_endian = big;
+    Bytes out;
+    std::string why;
+    const bool ok = byml::write(d, out, &why);
+    if (!ok) fprintf(stderr, "byml write: %s\n", why.c_str());
+    assert(ok);
+    return out;
+}
+byml::Value byml_of(const Bytes& b) {
+    byml::Document d;
+    std::string why;
+    const Bytes u = is_yaz0(b.data(), b.size()) ? unyaz(b) : b;
+    const bool ok = byml::parse(u.data(), u.size(), d, &why);
+    if (!ok) fprintf(stderr, "byml parse: %s\n", why.c_str());
+    assert(ok);
+    return d.root;
+}
+byml::Value yaml(const std::string& text) {
+    byml::Value v;
+    std::string why;
+    const bool ok = byml::parse_text(text, v, &why);
+    if (!ok) fprintf(stderr, "yaml: %s\n", why.c_str());
+    assert(ok);
+    return v;
+}
+
+void test_byml() {
+    // every type reads back as written, either byte order; 64-bit values in version 3
+    const byml::Value shared = Ar({Fl(1.5f), Fl(-2.0f)});
+    const byml::Value root = Ha({{"null", byml::Value::null()}, {"str", S("text")}, {"bool", Bo(true)}, {"int", N(-7)}, {"float", Fl(0.25f)},
+                                 {"uint", byml::Value::u32(0xFFFFFFF0u)}, {"s64", byml::Value::s64(-5000000000ll)},
+                                 {"u64", byml::Value::u64(0xFFFFFFFFFFull)}, {"f64", byml::Value::f64(3.25)},
+                                 {"list", Ar({S("a"), N(1), Ha({{"k", S("v")}}), Ar({})})}, {"a", shared}, {"b", shared}, {"empty", Ha({})}});
+    for (bool big : {true, false}) {
+        const Bytes b = byml_bytes(root, 3, big);
+        assert(byml::is_byml(b.data(), b.size()) && byml_of(b) == root);
+        byml::Document d;
+        assert(byml::parse(b.data(), b.size(), d) && d.version == 3 && d.big_endian == big);
+        assert(byml_bytes(byml_of(b), 3, big) == b);  // stable
+    }
+    // equal containers are stored once (as the game's files): "a" and "b" share their array
+    const Bytes one = byml_bytes(Ha({{"a", shared}, {"b", shared}}));
+    const Bytes two = byml_bytes(Ha({{"a", shared}, {"b", Ar({Fl(1.5f), Fl(-3.0f)})}}));
+    assert(one.size() < two.size() && one.size() % 4 == 0);
+    // keys in order, values found by key
+    const byml::Value h = Ha({{"zeta", N(1)}, {"alpha", N(2)}, {"mid", N(3)}});
+    assert(h.hash[0].first == "alpha" && h.hash[2].first == "zeta" && h.find("mid")->as_s32() == 3 && !h.find("none"));
+    // bad data: refused, not read out of range
+    Bytes b = byml_bytes(root);
+    byml::Document d;
+    for (size_t cut : {size_t(0), size_t(8), size_t(15), b.size() / 2}) assert(!byml::parse(b.data(), cut, d));
+    Bytes bad = b;
+    put32(bad.data() + 12, 0x7FFFFFF0);  // root out of range
+    assert(!byml::parse(bad.data(), bad.size(), d));
+    bad = b;
+    bad[3] = 9;  // version 9
+    assert(!byml::parse(bad.data(), bad.size(), d) && !byml::is_byml(bad.data(), bad.size()));
+
+    // oead's YAML text, as BCML's logs have it
+    const byml::Value t = yaml(R"(Npc_A<Talk>:
+  exist_enable_camera_input: true
+  mode: Seamless
+  subfile:
+  - {file: InitTalk.bfevfl}
+  - {file: 'Common.bfevfl'}
+SignalFlowchart<<Check>: {disable_event_start_interval: true, is_timeline: false, mode: Seamless}
+numbers: {f: 1.5, neg: -2.0, i: -12, hex: 0x10, u: !u 0xFFFFFFFF, l: !l -5, ul: !ul 0x10, d: !f64 2.5, e: 1.0e-05, big: 4294967295}
+strings: ['true', "a: b", '123', "it's \"quoted\" \u00e9\n", plain text with spaces, 'it''s', ~, null]
+nested:
+  - - 1
+    - 2
+  - key: value  # a comment
+    other: [1, 2.0, 'x', {a: [b]}]
+  -
+  - []
+  - {}
+'quoted key': 1
+empty:
+block: |-
+  line one
+  line two
+last: x
+)");
+    const byml::Value& a = *t.find("Npc_A<Talk>");
+    assert(a.find("exist_enable_camera_input")->is(byml::Type::Bool) && a.str("mode") == "Seamless");
+    assert(a.find("subfile")->array.size() == 2 && a.find("subfile")->array[1].str("file") == "Common.bfevfl");
+    const byml::Value& sig = *t.find("SignalFlowchart<<Check>");
+    assert(sig.hash.size() == 3 && sig.find("is_timeline")->bits == 0);
+    const byml::Value& n = *t.find("numbers");
+    assert(*n.find("f") == Fl(1.5f) && *n.find("neg") == Fl(-2.0f) && *n.find("i") == N(-12) && *n.find("hex") == N(16));
+    assert(*n.find("u") == byml::Value::u32(0xFFFFFFFFu) && *n.find("l") == byml::Value::s64(-5) && *n.find("ul") == byml::Value::u64(16));
+    assert(*n.find("d") == byml::Value::f64(2.5) && *n.find("e") == Fl(1.0e-05f) && *n.find("big") == N(-1));  // s32 wraps, as oead
+    const auto& s = t.find("strings")->array;
+    assert(s.size() == 8 && s[0] == S("true") && s[1] == S("a: b") && s[2] == S("123") && s[3] == S("it's \"quoted\" \xC3\xA9\n"));
+    assert(s[4] == S("plain text with spaces") && s[5] == S("it's") && s[6].is(byml::Type::Null) && s[7].is(byml::Type::Null));
+    const auto& nested = t.find("nested")->array;
+    assert(nested.size() == 5 && nested[0] == Ar({N(1), N(2)}) && nested[1].str("key") == "value");
+    assert(*nested[1].find("other") == Ar({N(1), Fl(2.0f), S("x"), Ha({{"a", Ar({S("b")})}})}));
+    assert(nested[2].is(byml::Type::Null) && nested[3] == Ar({}) && nested[4] == Ha({}));
+    assert(*t.find("quoted key") == N(1) && t.find("empty")->is(byml::Type::Null) && t.str("block") == "line one\nline two" && t.str("last") == "x");
+    byml::Value v;
+    assert(byml::parse_text("", v) && v.is(byml::Type::Null));
+    assert(byml::parse_text("- a\n- b\n", v) && v == Ar({S("a"), S("b")}));
+    assert(!byml::parse_text("a: 'open\n", v) && !byml::parse_text("a:\n  b: 1\n c: 2\n", v) && !byml::parse_text("a: !u x\n", v));
+    assert(!byml::parse_text("just a scalar", v));
+}
+
+// ---------------------------------------------------------------- MSBT texts
+Bytes u16s(std::initializer_list<uint16_t> units) {
+    Bytes b;
+    for (uint16_t u : units) {
+        b.push_back(uint8_t(u >> 8));
+        b.push_back(uint8_t(u));
+    }
+    return b;
+}
+json::Value contents(const std::string& j) { return json::parse(j); }
+
+void test_msbt() {
+    std::string why;
+    // texts: control sequences as msyt writes them (0x0E, group, type, fields)
+    Bytes raw;
+    assert(msbt::encode(contents(R"([{"text": "Hi "}, {"control": {"kind": "set_colour", "colour": "blue"}}, {"text": "you"},
+        {"control": {"kind": "reset_colour"}}, {"control": {"kind": "pause", "length": "longer"}},
+        {"control": {"kind": "choice", "choice_labels": [0, 1, 2], "selected_index": 0, "cancel_index": 2, "unknown": 8}},
+        {"control": {"kind": "sound", "unknown": [0, 4]}}, {"control": {"kind": "sound2", "unknown": [7, 205]}}])"),
+                        true, raw, &why));
+    const Bytes want = u16s({'H', 'i', ' ', 0x0E, 0, 3, 2, 2, 'y', 'o', 'u', 0x0E, 0, 3, 2, 0xFFFF, 0x0E, 5, 2, 0, 0x0E, 1, 5, 8, 0, 1, 2, 0x0002,
+                             0x0E, 3, 1, 2, 0x0004, 0x0E, 4, 1, 2, 0x07CD, 0});
+    assert(raw == want);
+    // every kind decodes back to what encodes it (msyt's high-level kinds and its raw ones)
+    const std::string all = R"([{"text": "\u00e9t\u00e9 \ud83d\ude00"}, {"control": {"kind": "pause", "frames": 30}},
+        {"control": {"kind": "icon", "icon": "b"}}, {"control": {"kind": "icon", "icon": {"a": 10}}},
+        {"control": {"kind": "variable", "variable_kind": 11, "name": "Cmn_Money"}},
+        {"control": {"kind": "choice", "choice_labels": [5, 6], "selected_index": 1, "cancel_index": 1, "unknown": 6}},
+        {"control": {"kind": "choice", "choice_labels": [1, 2, 3, 4], "selected_index": 0, "cancel_index": 3, "unknown": 10}},
+        {"control": {"kind": "single_choice", "label": 7}}, {"control": {"kind": "animation", "name": "Wait"}},
+        {"control": {"kind": "text_size", "percent": 125}}, {"control": {"kind": "auto_advance", "frames": 60}},
+        {"control": {"kind": "localisation", "localisation_kind": "gender", "options": ["he", "", "they"]}},
+        {"control": {"kind": "font", "font_kind": "hylian"}},
+        {"control": {"kind": "raw", "zero": {"zero": {"field_1": 1, "field_2": 2, "field_3": 3}}}},
+        {"control": {"kind": "raw", "zero": {"four": {"field_1": 9}}}},
+        {"control": {"kind": "raw", "one": {"two": {"field_1": 4}}}},
+        {"control": {"kind": "raw", "one": {"eight": {"unknown_1": [[255, 255, 0, 0]], "field_1": [3, 4], "field_2": [1, 2, 3, 4]}}}},
+        {"control": {"kind": "raw", "one": {"nine": {"unknown_1": null, "strings": [{"field_1": 1, "string": "a"}, {"field_1": 2, "string": ""},
+            {"field_1": 3, "string": "cd"}, {"field_1": 4, "string": "e"}], "field_3": 5, "field_4": 6, "unknown_2": null, "field_6": [1, 205]}}}},
+        {"control": {"kind": "raw", "two": {"one_field": [3, {"field_1": 7}]}}},
+        {"control": {"kind": "raw", "two": {"variable": [1, {"field_1": 12, "string": "Name", "field_3": 2}]}}},
+        {"control": {"kind": "raw", "three": {"field_1": 2, "field_2": [1, 2]}}},
+        {"control": {"kind": "raw", "four": {"zero": {"field_1": 4, "string": "abc"}}}},
+        {"control": {"kind": "raw", "four": {"three": {"field_1": 1}}}},
+        {"control": {"kind": "raw", "five": {"field_1": 7, "field_2": 1}}},
+        {"control": {"kind": "raw", "two_hundred_one": {"dynamic": [0, {"len": 4, "field_2": [1, 2, 3, 4]}]}}},
+        {"control": {"kind": "raw", "two_hundred_one": {"one_field": [2, {"field_1": 3}]}}}, {"text": "end"}])";
+    Bytes text;
+    assert(msbt::encode(contents(all), true, text, &why));
+    json::Value back;
+    Bytes again;
+    assert(msbt::decode(text, true, back, &why) && msbt::encode(back, true, again, &why) && again == text);
+    assert(back.array.size() == contents(all).array.size() && back.array[2].get("control").get("icon").string() == "b");
+    assert(!msbt::encode(contents(R"([{"control": {"kind": "set_colour", "colour": "purple"}}])"), true, text, &why));
+    assert(!msbt::encode(contents(R"([{"control": {"kind": "choice", "choice_labels": [1], "selected_index": 0, "cancel_index": 0, "unknown": 4}}])"),
+                         true, text, &why));
+    // files: labels in hash buckets, attribute strings in EventFlowMsg files; written back byte for byte
+    assert(msbt::label_hash("Talk013_Voe", 41) == 21 && msbt::label_hash("Talk_New", 3) == 2);
+    msbt::File f = msbt::make("EventFlowMsg/Npc.msbt", true);
+    f.groups = 3;
+    msbt::set(f, "Talk_00", u16s({'a', 0}), msbt::encode_string("Npc", true, true));
+    msbt::set(f, "Talk_New", u16s({'b', 0}), {});
+    msbt::set(f, "Item_Name", u16s({'c', 0}), msbt::encode_string("Npc", true, true));
+    Bytes file;
+    assert(msbt::write(f, file, &why) && file.size() % 16 == 0 && !memcmp(file.data(), "MsgStdBn", 8));
+    msbt::File g;
+    assert(msbt::parse(file.data(), file.size(), g, &why) && g.entries.size() == 3 && g.atr_strings && g.atr_size == 4);
+    assert(msbt::find(g, "Talk_New")->text == u16s({'b', 0}) && msbt::find(g, "Talk_New")->attribute == u16s({0}));
+    assert(msbt::find(g, "Item_Name")->bucket == msbt::label_hash("Item_Name", 3) && msbt::find(g, "Talk_00")->attribute == u16s({'N', 'p', 'c', 0}));
+    Bytes file2;
+    assert(msbt::write(g, file2, &why) && file2 == file);
+    msbt::set(g, "Talk_00", u16s({'z', 'z', 0}), {});  // no attribute: an empty string
+    assert(msbt::find(g, "Talk_00")->attribute == u16s({0}) && msbt::find(g, "Talk_00")->text == u16s({'z', 'z', 0}));
+    const msbt::File plain = msbt::make("ActorType/Item.msbt", true);
+    assert(!plain.atr_strings && plain.atr_size == 0);
+    Bytes cut(file.begin(), file.begin() + 40);
+    assert(!msbt::parse(cut.data(), cut.size(), g, &why));
+}
+
 // ---------------------------------------------------------------- merging
 struct World {
     fs::path root, update, base, aoc, out;
@@ -487,6 +701,180 @@ void test_bcml(const fs::path& root) {
     assert(has_note(r.mods[0], "BCML merge data: 3 parameter files changed") && has_note(r.mods[0], "Missing.sbactorpack is not in"));
 }
 
+// BCML merge data for game data tables: events, flags, save data and texts merged over the game's copies, with a
+// plain mod's own copies merged entry by entry; two languages (one only by BCML's language mapping)
+byml::Value flag(const std::string& name, int32_t hash, int32_t init = 0) {
+    return Ha({{"DataName", S(name)}, {"DeleteRev", N(-1)}, {"HashValue", N(hash)}, {"InitValue", N(init)}, {"IsSave", Bo(true)}, {"MaxValue", Bo(true)},
+               {"MinValue", Bo(false)}, {"ResetType", N(0)}});
+}
+byml::Value save_entry(const std::string& name, int32_t hash) { return Ha({{"DataName", S(name)}, {"HashValue", N(hash)}}); }
+byml::Value save_file(const std::string& sav, std::vector<byml::Value> entries) {
+    return Ha({{"file_list", Ar({Ha({{"IsCommon", Bo(false)}, {"IsCommonAtSameAccount", Bo(false)}, {"IsSaveSecureCode", Bo(true)}, {"file_name", S(sav)}}),
+                                Ar(std::move(entries))})},
+               {"save_info", Ar({Ha({{"directory_num", N(8)}, {"is_build_machine", Bo(true)}, {"revision", N(18203)}})})}});
+}
+Bytes msbt_file(const std::string& name, std::vector<std::pair<std::string, std::string>> texts, uint32_t groups) {
+    msbt::File f = msbt::make(name, true);
+    f.groups = groups;
+    for (const auto& [label, t] : texts) msbt::set(f, label, msbt::encode_string(t, true, true), msbt::encode_string("Npc", true, true));
+    Bytes out;
+    assert(msbt::write(f, out));
+    return out;
+}
+std::string msbt_text(const Bytes& file, const std::string& label) {  // a plain text's string, or "?" if missing
+    msbt::File f;
+    assert(msbt::parse(file.data(), file.size(), f));
+    const msbt::Entry* e = msbt::find(f, label);
+    if (!e) return "?";
+    json::Value c;
+    assert(msbt::decode(e->text, true, c));
+    std::string s;
+    for (const auto& part : c.array) s += part.object.count("text") ? part.get("text").string() : "<" + part.get("control").get("kind").string() + ">";
+    return s;
+}
+std::vector<byml::Value> flags_in(const Bytes& b) { return byml_of(b).hash[0].second.array; }
+
+void test_bcml_tables(const fs::path& root) {
+    const World w = make_world(root);
+    // the game: Bootup.pack with EventInfo, gamedata and save data; text packs for two languages
+    const byml::Value events = Ha({{"Ev<A>", Ha({{"mode", S("Seamless")}})}, {"Ev<B>", Ha({{"mode", S("Seamless")}, {"is_timeline", Bo(false)}})}});
+    std::vector<byml::Value> full;
+    for (int k = 0; k < 4096; k++) full.push_back(flag("Bulk_" + std::to_string(k), 100000 + k));
+    const Bytes gamedata = sarc({{"/bool_data_0.bgdata", byml_bytes(Ha({{"bool_data", Ar({flag("Existing_Flag", 11), flag("Old_Flag", 12)})}}))},
+                                 {"/revival_bool_data_0.bgdata", byml_bytes(Ha({{"bool_data", Ar(full)}}))},
+                                 {"/s32_data_0.bgdata", byml_bytes(Ha({{"s32_data", Ar({flag("dummy", 1000)})}}))},
+                                 {"/string32_data_0.bgdata", byml_bytes(Ha({{"string_data", Ar({flag("dummy_string", 20)})}}))}});
+    const Bytes savedata = sarc({{"/saveformat_0.bgsvdata", byml_bytes(save_file("game_data.sav", {save_entry("A", -5), save_entry("B", 3), save_entry("C", 9)}))},
+                                 {"/saveformat_1.bgsvdata", byml_bytes(save_file("caption.sav", {save_entry("Cap", 1)}))},
+                                 {"/saveformat_2.bgsvdata", byml_bytes(save_file("option.sav", {save_entry("Opt", 2)}))}});
+    const Bytes ev = byml_bytes(events);
+    put(w.update / "content/Pack/Bootup.pack", sarc({{"Event/EventInfo.product.sbyml", yaz(ev)}, {"GameData/gamedata.ssarc", yaz(gamedata)},
+                                                     {"GameData/savedataformat.ssarc", yaz(savedata)}, {"Other/Untouched.txt", bytes("same")}}));
+    for (const char* lang : {"USen", "USfr"}) {
+        const Bytes msg = sarc({{"EventFlowMsg/Npc.msbt", msbt_file("EventFlowMsg/Npc.msbt", {{"Talk_00", std::string("hello ") + lang}}, 3)},
+                                {"ActorType/Item.msbt", msbt_file("ActorType/Item.msbt", {{"Item_Name", std::string("Item ") + lang}}, 2)}});
+        put(w.update / (std::string("content/Pack/Bootup_") + lang + ".pack"), sarc({{std::string("Message/Msg_") + lang + ".product.ssarc", yaz(msg)}}));
+    }
+    Rstb t = game_table();
+    rstb_set(t, "Event/EventInfo.product.byml", uint32_t(ev.size() + 264));
+    rstb_set(t, "GameData/gamedata.sarc", uint32_t(gamedata.size() + 396));
+    rstb_set(t, "GameData/savedataformat.sarc", uint32_t(savedata.size() + 412));
+    rstb_set(t, "Message/Msg_USen.product.sarc", 100);  // smaller than the file: grows with it
+    put(w.update / "content/System/Resource/ResourceSizeTable.product.srsizetable", yaz(rstb_write(t)));
+
+    // mod A (a .bnp): logs for all four; its own EventInfo copy (the log wins); a size for EventInfo too small for the merge
+    const fs::path m = w.root / "mods";
+    put(m / "a/logs/eventinfo.yml", "Ev<A>:\n  mode: FromA\n  subfile:\n  - {file: A.bfevfl}\nEv<C>: {mode: New}\n");
+    put(m / "a/logs/gamedata.yml",
+        "bool_data:\n  add:\n    Existing_Flag:\n      DataName: Existing_Flag\n      DeleteRev: -1\n      HashValue: 11\n      InitValue: 1\n"
+        "      IsSave: true\n      MaxValue: true\n      MinValue: false\n      ResetType: 0\n"
+        "    Mod_Flag: {DataName: Mod_Flag, DeleteRev: -1, HashValue: 50, InitValue: 0, IsSave: true, MaxValue: true, MinValue: false, ResetType: 0}\n"
+        "    MainField_Obj_X_1234: {DataName: MainField_Obj_X_1234, DeleteRev: -1, HashValue: 51, InitValue: 0, IsSave: true, MaxValue: true, "
+        "MinValue: false, ResetType: 1}\n  del: [Old_Flag]\ns32_data:\n  add:\n    Mod_Count: {DataName: Mod_Count, DeleteRev: -1, HashValue: 52, "
+        "InitValue: 0, IsSave: true, MaxValue: 99, MinValue: 0, ResetType: 0}\n  del: []\nf32_data:\n  add: {}\n  del: []\n");
+    put(m / "a/logs/savedata.yml", "add:\n- {DataName: Mod_Flag, HashValue: 50}\n- {DataName: Neg, HashValue: -100}\ndel: [3]\n");
+    put(m / "a/logs/texts.json", R"({"EUen": {"EventFlowMsg/Npc.msyt": {
+        "Talk_00": {"attributes": "Npc", "contents": [{"text": "changed "}, {"control": {"kind": "pause", "length": "long"}}]},
+        "Talk_New": {"attributes": "Npc", "contents": [{"text": "new line"}]}},
+      "ActorType/Item.msyt": {"Item_New_Name": {"contents": [{"text": "New Item"}]}},
+      "EventFlowMsg/NewNpc.msyt": {"Hello": {"attributes": "NewNpc", "contents": [{"text": "hi"}]}, "Bye": {"attributes": "NewNpc", "contents": [{"text": "bye"}]}}}})");
+    put(m / "a/logs/rstb.json", "{\"Event/EventInfo.product.byml\": 10}");
+    put(m / "a/content/Pack/Bootup.pack", sarc({{"Event/EventInfo.product.sbyml", byml_bytes(Ha({{"Ev<A>", Ha({{"mode", S("CopyOfA")}})}}))}}));
+    // mod B (plain, higher): its own copies of EventInfo (Ev<B> changed) and of the French texts (Item_Name changed)
+    byml::Value events_b = events;
+    events_b.find("Ev<B>")->set("mode", S("FromB"));
+    put(m / "b/content/Pack/Bootup.pack", sarc({{"Event/EventInfo.product.sbyml", yaz(byml_bytes(events_b))}}));
+    const Bytes msg_fr = sarc({{"ActorType/Item.msbt", msbt_file("ActorType/Item.msbt", {{"Item_Name", "Objet de B"}}, 2)}});
+    put(m / "b/content/Pack/Bootup_USfr.pack", sarc({{"Message/Msg_USfr.product.ssarc", yaz(msg_fr)}}));
+    // mod C (plain, lowest): a loose copy of EventInfo (the game has it only in Bootup.pack) with an event of its own
+    byml::Value events_c = events;
+    events_c.set("Ev<D>", Ha({{"mode", S("FromC")}}));
+    put(m / "c/content/Event/EventInfo.product.sbyml", yaz(byml_bytes(events_c)));
+    const std::vector<merge::Mod> mods = {
+        {"c", "Mod C", m / "c/content", {}, {}}, {"a", "Mod A", m / "a/content", {}, m / "a/logs"}, {"b", "Mod B", m / "b/content", {}, {}}};
+    const auto t0 = std::chrono::steady_clock::now();
+    const merge::Result r = merge::build(w.vanilla(), mods, w.out);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    auto file = [&](const char* tree) {
+        auto it = r.files.find(merge::tree_key(tree));
+        assert(it != r.files.end());
+        return get(it->second);
+    };
+    const auto boot = unsarc(file("content/Pack/Bootup.pack"));
+    assert(text(boot.at("Other/Untouched.txt")) == "same");
+    // events: A's log (not its copy), B's copy's change, A's new event
+    const byml::Value merged_events = byml_of(boot.at("Event/EventInfo.product.sbyml"));
+    assert(is_yaz0(boot.at("Event/EventInfo.product.sbyml").data(), 16));
+    assert(merged_events.find("Ev<A>")->str("mode") == "FromA" && merged_events.find("Ev<A>")->find("subfile")->array[0].str("file") == "A.bfevfl");
+    assert(merged_events.find("Ev<B>")->str("mode") == "FromB" && merged_events.find("Ev<C>")->str("mode") == "New");
+    assert(merged_events.find("Ev<D>")->str("mode") == "FromC" && merged_events.hash.size() == 4);
+    assert(!r.files.count(merge::tree_key("content/Event/EventInfo.product.sbyml")));  // not read loose instead of the merge
+    // flags: changed in place, deleted, new ones at the end of their kind; the full revival file gets a new file after it
+    const auto gd = unsarc(unyaz(boot.at("GameData/gamedata.ssarc")));
+    const auto bools = flags_in(gd.at("/bool_data_0.bgdata"));
+    assert(bools.size() == 2 && bools[0].str("DataName") == "Existing_Flag" && *bools[0].find("InitValue") == N(1) && bools[1].str("DataName") == "Mod_Flag");
+    assert(gd.at("/revival_bool_data_0.bgdata") == byml_bytes(Ha({{"bool_data", Ar(full)}})));  // untouched: the game's bytes
+    const auto revival = flags_in(gd.at("/revival_bool_data_1.bgdata"));
+    assert(revival.size() == 1 && revival[0].str("DataName") == "MainField_Obj_X_1234");
+    assert(flags_in(gd.at("/s32_data_0.bgdata")).size() == 2 && flags_in(gd.at("/s32_data_0.bgdata"))[1].str("DataName") == "Mod_Count");
+    assert(gd.size() == 5);
+    // save data: added, deleted, sorted by hash (signed); the other formats keep their names and bytes
+    const auto sv = unsarc(unyaz(boot.at("GameData/savedataformat.ssarc")));
+    const byml::Value saved = byml_of(sv.at("/saveformat_0.bgsvdata"));
+    std::vector<int32_t> hashes;
+    for (const auto& e : saved.find("file_list")->array[1].array) hashes.push_back(e.find("HashValue")->as_s32());
+    assert((hashes == std::vector<int32_t>{-100, -5, 9, 50}));
+    assert(sv.size() == 3 && byml_of(sv.at("/saveformat_1.bgsvdata")).find("file_list")->array[0].str("file_name") == "caption.sav");
+    // texts: English from A's EUen (its region differs), French too (BCML falls back to English), and B's French change
+    const auto en = unsarc(unyaz(unsarc(file("content/Pack/Bootup_USen.pack")).at("Message/Msg_USen.product.ssarc")));
+    assert(msbt_text(en.at("EventFlowMsg/Npc.msbt"), "Talk_00") == "changed <pause>" && msbt_text(en.at("EventFlowMsg/Npc.msbt"), "Talk_New") == "new line");
+    assert(msbt_text(en.at("ActorType/Item.msbt"), "Item_New_Name") == "New Item" && msbt_text(en.at("ActorType/Item.msbt"), "Item_Name") == "Item USen");
+    msbt::File npc;
+    assert(msbt::parse(en.at("EventFlowMsg/NewNpc.msbt").data(), en.at("EventFlowMsg/NewNpc.msbt").size(), npc));
+    assert(npc.atr_strings && npc.groups == 2 && npc.entries.size() == 2 && msbt::find(npc, "Bye")->attribute == msbt::encode_string("NewNpc", true, true));
+    const auto fr = unsarc(unyaz(unsarc(file("content/Pack/Bootup_USfr.pack")).at("Message/Msg_USfr.product.ssarc")));
+    assert(msbt_text(fr.at("ActorType/Item.msbt"), "Item_Name") == "Objet de B" && msbt_text(fr.at("EventFlowMsg/Npc.msbt"), "Talk_00") == "changed <pause>");
+    assert(msbt_text(fr.at("ActorType/Item.msbt"), "Item_New_Name") == "New Item");
+    // sizes: the rebuilt files' entries hold them (A's own EventInfo size is BCML's, too small for this merge)
+    const Rstb table = table_of(w.out / merge::kSizeTable);
+    assert(entry(table, "Event/EventInfo.product.byml") >= unyaz(boot.at("Event/EventInfo.product.sbyml")).size());
+    assert(entry(table, "GameData/gamedata.sarc") >= unyaz(boot.at("GameData/gamedata.ssarc")).size());
+    assert(entry(table, "Message/Msg_USen.product.sarc") >= unyaz(unsarc(file("content/Pack/Bootup_USen.pack")).at("Message/Msg_USen.product.ssarc")).size());
+    // what the Mods page says
+    assert(has_note(r.mods[1], "BCML merge data: 2 events, 5 game data flags, 3 save data flags, 5 texts in 3 files"));
+    assert(has_note(r.mods[2], "Event/EventInfo.product.sbyml: its changes (1 event) are merged"));
+    assert(has_note(r.mods[2], "Message/Msg_USfr.product.ssarc: its changes (texts) are merged"));
+    assert(has_note(r.mods[0], "Event/EventInfo.product.sbyml: its changes (1 event) are merged") && r.mods[0].merged == 1);
+    assert(r.log.size() >= 2 && r.log[1].find("Rebuilt from BCML merge data: events, game data flags, save data, texts USen, USfr") == 0);
+    printf("content merge: game data tables merged in %.0f ms\n", ms);
+
+    // the merges on their own: a full flag file gets a new one; save data that grows past a file renumbers the others
+    bcml::Files game_flags{{"/bool_data_0.bgdata", byml_bytes(Ha({{"bool_data", Ar(full)}}))}}, changed;
+    byml::Value add = yaml("bool_data:\n  add:\n    New_1: {DataName: New_1, HashValue: 7}\n  del: [Bulk_5]\n");
+    size_t count = 0;
+    std::string why;
+    assert(bcml::merge_flags(game_flags, {&add}, changed, count, why) && count == 2 && changed.size() == 2);
+    assert(flags_in(changed.at("/bool_data_0.bgdata")).size() == 4095 && flags_in(changed.at("/bool_data_1.bgdata")).size() == 1);
+    std::vector<byml::Value> many;
+    for (int k = 0; k < 8192; k++) many.push_back(save_entry("S" + std::to_string(k), k * 2));
+    bcml::Files game_save{{"/saveformat_0.bgsvdata", byml_bytes(save_file("game_data.sav", many))},
+                          {"/saveformat_1.bgsvdata", byml_bytes(save_file("caption.sav", {}))}},
+        result;
+    bcml::SaveDiff grow;
+    grow.add.push_back(save_entry("Odd", 3));
+    assert(bcml::merge_save(game_save, {&grow}, result, count, why) && count == 1 && result.size() == 3);
+    assert(byml_of(result.at("/saveformat_0.bgsvdata")).find("file_list")->array[1].array.size() == 8192);
+    assert(byml_of(result.at("/saveformat_1.bgsvdata")).find("file_list")->array[1].array.size() == 1);
+    assert(result.at("/saveformat_2.bgsvdata") == game_save.at("/saveformat_1.bgsvdata"));  // caption.sav, renumbered
+    bcml::SaveDiff none;
+    none.add.push_back(save_entry("S1", 2));  // already there
+    assert(!bcml::merge_save(game_save, {&none}, result, count, why) && why.empty());
+    // BCML's language mapping
+    std::map<std::string, bcml::TextFiles> langs{{"EUde", {}}, {"USen", {}}, {"JPja", {}}};
+    assert(bcml::texts_for(langs, "USen") == &langs["USen"] && bcml::texts_for(langs, "USde") == &langs["EUde"]);
+    assert(bcml::texts_for(langs, "USfr") == &langs["USen"] && bcml::texts_for({}, "USen") == nullptr);
+}
+
 // ---------------------------------------------------------------- folder layouts
 void test_layouts(const fs::path& root) {
     const std::string usa = "00050000101C9400";
@@ -542,9 +930,11 @@ void test_layouts(const fs::path& root) {
     l = loader::detect(root / "unpacked-bnp", usa);
     assert(l.kind == "BCML mod" && l.problem.empty() && l.logs == root / "unpacked-bnp/logs");
     assert(l.name == "Some BCML Mod 1.0" && l.description == "About it");
-    put(root / "unpacked-bnp/logs/gamedata.yml", "flags");  // merge data the loader can't apply
+    for (const char* log : {"eventinfo.yml", "gamedata.yml", "savedata.yml", "texts.json"}) put(root / "unpacked-bnp/logs" / log, "{}");
+    assert(loader::detect(root / "unpacked-bnp", usa).problem.empty());  // merge data the loader applies
+    put(root / "unpacked-bnp/logs/future.yml", "x");  // merge data the loader can't apply
     l = loader::detect(root / "unpacked-bnp", usa);
-    assert(l.problem.find("gamedata.yml") != std::string::npos && l.problem.find("deepmerge.aamp") == std::string::npos);
+    assert(l.problem.find("future.yml") != std::string::npos && l.problem.find("gamedata.yml") == std::string::npos);
     // options as BCML's dev tools write them: switches ("multi", with a default) and groups ("single": one
     // choice, none unless required; no defaults, but a hand-written one is taken)
     put(root / "options-bnp/content/a", "a");
@@ -558,7 +948,7 @@ void test_layouts(const fs::path& root) {
                    {"name": "Hat", "required": false,
                     "options": [{"name": "Cap", "folder": "Cap"}, {"name": "Crown", "folder": "Crown", "default": true}]}]}})");
     for (const char* o : {"Extra", "Off", "Red", "Blue", "Cap", "Crown"}) put(root / "options-bnp/options" / o / "content/b", o);
-    put(root / "options-bnp/options/Bad/logs/texts.json", "{}");
+    put(root / "options-bnp/options/Bad/logs/future.yml", "{}");
     l = loader::detect(root / "options-bnp", usa);
     assert(l.kind == "BCML mod" && l.problem.empty() && l.options.size() == 6 && l.groups.size() == 2);
     const char* const keys[] = {"Extra", "Off", "Red", "Blue", "Cap", "Crown"};
@@ -747,7 +1137,7 @@ int options_start(const fs::path& root, const std::string& old_table) {  // a st
 // ---------------------------------------------------------------- a real dump (by hand)
 // every archive in a merged file reads back, keeps all of the game's files, and how many changed
 struct Check {
-    size_t archives = 0, files = 0, changed = 0, lost = 0, params = 0, small = 0;
+    size_t archives = 0, files = 0, changed = 0, lost = 0, params = 0, small = 0, tables = 0, texts = 0;
     const Rstb* table = nullptr;  // the merged size table
     std::string aoc;              // "Aoc/0010/" for DLC files
     // a changed file's size-table entry (if it has one) must hold at least the file
@@ -771,6 +1161,24 @@ void check_params(const Bytes& data, Check& c) {  // a parameter file: reads, wr
     assert(ok && f.root == g.root);
     c.params++;
 }
+void check_table(const Bytes& data, Check& c) {  // a BYML document: reads, writes and reads back the same
+    byml::Document d, again;
+    Bytes out;
+    std::string why;
+    const bool ok = byml::parse(data.data(), data.size(), d, &why) && byml::write(d, out, &why) && byml::parse(out.data(), out.size(), again, &why);
+    if (!ok) fprintf(stderr, "BYML file: %s\n", why.c_str());
+    assert(ok && again.root == d.root);
+    c.tables++;
+}
+void check_text(const Bytes& data, Check& c) {  // an MSBT file: reads and writes back byte for byte
+    msbt::File f;
+    Bytes out;
+    std::string why;
+    const bool ok = msbt::parse(data.data(), data.size(), f, &why) && msbt::write(f, out, &why);
+    if (!ok) fprintf(stderr, "MSBT file: %s\n", why.c_str());
+    assert(ok && out == data);
+    c.texts++;
+}
 void check_archive(const Bytes& merged, const Bytes* game, int depth, Check& c) {
     const auto files = unsarc(merged);
     c.archives++;
@@ -792,9 +1200,156 @@ void check_archive(const Bytes& merged, const Bytes* game, int depth, Check& c) 
             c.sized(name, unpacked.size());
         }
         if (unpacked.size() >= 4 && !memcmp(unpacked.data(), "AAMP", 4)) check_params(unpacked, c);
+        if ((!old || *old != unpacked) && byml::is_byml(unpacked.data(), unpacked.size())) check_table(unpacked, c);
+        if ((!old || *old != unpacked) && unpacked.size() >= 8 && !memcmp(unpacked.data(), "MsgStdBn", 8)) check_text(unpacked, c);
         if (depth < 4 && is_sarc(unpacked.data(), unpacked.size()) && (!old || *old != unpacked))
             check_archive(unpacked, old && is_sarc(old->data(), old->size()) ? old : nullptr, depth + 1, c);
     }
+}
+// BCML merge data for game data tables (the Mods folder's and its unpacked .bnp files' logs/, not their options): every
+// logged event, flag, save data flag and text is in the merged files; one that only one mod logs is as logged
+void check_tables(const fs::path& cache, const fs::path& mods, const merge::Vanilla& game) {
+    std::vector<fs::path> logs;
+    auto scan = [&](const fs::path& root) {
+        if (!fs::exists(root)) return;
+        for (auto it = fs::recursive_directory_iterator(root); it != fs::recursive_directory_iterator(); ++it) {
+            const std::string n = it->path().filename().string();
+            if (!it->is_directory()) continue;
+            if (it.depth() > 3 || n == "options" || n == "content" || n == "aoc") {
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (n == "logs") {
+                logs.push_back(it->path());
+                it.disable_recursion_pending();
+            }
+        }
+    };
+    scan(mods);
+    scan(mods.parent_path() / "Mods unpacked");
+    fs::path merged;
+    for (const auto& e : fs::directory_iterator(cache))
+        if (fs::exists(e.path() / "merged")) merged = e.path() / "merged";
+    auto file = [&](const std::string& tree) {
+        const fs::path m = merged / tree;
+        return fs::exists(m) ? get(m) : get(game.find(tree));
+    };
+    auto read = [](const fs::path& p) {
+        const Bytes b = get(p);
+        return std::string(b.begin(), b.end());
+    };
+    std::vector<byml::Value> events, flags;
+    std::vector<bcml::SaveDiff> saves;
+    std::vector<std::map<std::string, bcml::TextFiles>> texts;
+    for (const auto& l : logs) {
+        std::string why;
+        if (fs::exists(l / "eventinfo.yml")) assert(bcml::read_events(read(l / "eventinfo.yml"), events.emplace_back(), why));
+        if (fs::exists(l / "gamedata.yml")) assert(bcml::read_flags(read(l / "gamedata.yml"), flags.emplace_back(), why));
+        if (fs::exists(l / "savedata.yml")) assert(bcml::read_save(read(l / "savedata.yml"), saves.emplace_back(), why));
+        if (fs::exists(l / "texts.json")) assert(bcml::read_texts(read(l / "texts.json"), texts.emplace_back(), why));
+    }
+    if (events.empty() && flags.empty() && saves.empty() && texts.empty()) return;
+    const auto boot = unsarc(file("content/Pack/Bootup.pack"));
+    size_t n_events = 0, n_flags = 0, n_saves = 0, n_texts = 0, n_languages = 0;
+    if (!events.empty()) {
+        byml::Document d;
+        const Bytes u = unyaz(boot.at("Event/EventInfo.product.sbyml"));
+        assert(byml::parse(u.data(), u.size(), d));
+        std::map<std::string, int> count;
+        for (const auto& e : events)
+            for (const auto& [k, v] : e.hash) count[k]++;
+        for (const auto& e : events)
+            for (const auto& [k, v] : e.hash) {
+                const byml::Value* m = d.root.find(k);
+                assert(m && (count[k] > 1 || *m == v));
+                n_events++;
+            }
+    }
+    if (!flags.empty()) {
+        std::map<std::string, std::map<std::string, byml::Value>> all;  // type -> name -> flag
+        for (const auto& [name, data] : unsarc(unyaz(boot.at("GameData/gamedata.ssarc")))) {
+            byml::Document d;
+            assert(byml::parse(data.data(), data.size(), d));
+            for (const auto& [type, list] : d.root.hash)
+                for (const auto& f : list.array) all[type][f.str("DataName")] = f;
+        }
+        std::map<std::pair<std::string, std::string>, int> count;
+        for (const auto& f : flags)
+            for (const auto& [type, d] : f.hash) {
+                if (const byml::Value* add = d.find("add"))
+                    for (const auto& [name, flag] : add->hash) count[{type, name}]++;
+                if (const byml::Value* del = d.find("del"))
+                    for (const auto& name : del->array) count[{type, name.text}]++;
+            }
+        for (const auto& f : flags)
+            for (const auto& [type, d] : f.hash) {
+                if (const byml::Value* add = d.find("add"))
+                    for (const auto& [name, flag] : add->hash) {
+                        auto it = all[type].find(name);
+                        const int logged = count[std::make_pair(type, name)];
+                        assert(it != all[type].end() && (logged > 1 || it->second == flag));
+                        n_flags++;
+                    }
+                if (const byml::Value* del = d.find("del"))
+                    for (const auto& name : del->array) {
+                        const int logged = count[std::make_pair(type, name.text)];
+                        assert(logged > 1 || !all[type].count(name.text));
+                        n_flags++;
+                    }
+            }
+    }
+    if (!saves.empty()) {
+        std::vector<std::pair<int, std::string>> order;  // game_data.sav files by number
+        const auto sv = unsarc(unyaz(boot.at("GameData/savedataformat.ssarc")));
+        for (const auto& [name, data] : sv) order.push_back({std::atoi(name.c_str() + name.rfind('_') + 1), name});
+        std::sort(order.begin(), order.end());
+        std::vector<int32_t> hashes;
+        for (const auto& [index, name] : order) {
+            byml::Document d;
+            const Bytes& data = sv.at(name);
+            assert(byml::parse(data.data(), data.size(), d));
+            const auto& list = d.root.find("file_list")->array;
+            if (list[0].str("file_name") != "game_data.sav") continue;
+            for (const auto& e : list[1].array) hashes.push_back(e.find("HashValue")->as_s32());
+        }
+        assert(std::is_sorted(hashes.begin(), hashes.end()));  // the game looks them up by hash
+        const std::set<int32_t> have(hashes.begin(), hashes.end());
+        for (const auto& s : saves)
+            for (const auto& e : s.add) {
+                assert(have.count(e.find("HashValue")->as_s32()));
+                n_saves++;
+            }
+    }
+    if (!texts.empty())
+        for (const auto& e : fs::directory_iterator(game.update_content / "Pack")) {
+            const std::string n = e.path().filename().string();
+            if (n.size() != 16 || n.rfind("Bootup_", 0) != 0) continue;
+            const std::string lang = n.substr(7, 4);
+            const auto pack = unsarc(file("content/Pack/" + n));
+            const auto msg = unsarc(unyaz(pack.at("Message/Msg_" + lang + ".product.ssarc")));
+            std::map<std::pair<std::string, std::string>, int> count;
+            for (const auto& t : texts)
+                if (const bcml::TextFiles* f = bcml::texts_for(t, lang))
+                    for (const auto& [file, entries] : *f)
+                        for (const auto& [label, entry] : entries) count[{file, label}]++;
+            for (const auto& t : texts)
+                if (const bcml::TextFiles* f = bcml::texts_for(t, lang))
+                    for (const auto& [file, entries] : *f) {
+                        msbt::File m;
+                        const Bytes& data = msg.at(file);
+                        assert(msbt::parse(data.data(), data.size(), m));
+                        for (const auto& [label, entry] : entries) {
+                            const msbt::Entry* x = msbt::find(m, label);
+                            const int logged = count[std::make_pair(file, label)];
+                            assert(x && (logged > 1 || x->text == entry.text));
+                            assert(!m.atr_strings || !entry.has_attribute || logged > 1 || x->attribute == entry.attribute);
+                            n_texts++;
+                        }
+                    }
+            n_languages++;
+        }
+    printf("BCML merge data in the merged files: %zu events, %zu flags, %zu save data flags, %zu texts in %zu languages\n", n_events, n_flags,
+           n_saves, n_texts, n_languages);
 }
 int dump_check(char** argv) {
     config::game_dir = argv[2];
@@ -852,12 +1407,14 @@ int dump_check(char** argv) {
         c.sized(tree.substr(tree.find('/', tree.rfind("aoc/", 0) == 0 ? 4 : 0) + 1), unpacked.size());
         check_archive(unpacked, vanilla.empty() ? nullptr : &vunpacked, 1, c);
         small += c.small;
-        printf("%s: %zu bytes (game %zu): %zu archives, %zu files read back (%zu parameter files), %zu changed, %zu of the game's missing\n",
-               tree.c_str(), data.size(), vbytes.size(), c.archives, c.files, c.params, c.changed, c.lost);
+        printf("%s: %zu bytes (game %zu): %zu archives, %zu files read back (%zu parameter files, %zu data tables, %zu text files), %zu changed, "
+               "%zu of the game's missing\n",
+               tree.c_str(), data.size(), vbytes.size(), c.archives, c.files, c.params, c.tables, c.texts, c.changed, c.lost);
         assert(c.lost == 0);
     }
     printf("size entries smaller than their files: %zu\n", small);
     assert(small == 0);
+    check_tables(cache, fs::path(argv[5]), game);
     return 0;
 }
 
@@ -875,8 +1432,11 @@ int main(int argc, char** argv) {
     test_sarc();
     test_rstb();
     test_aamp();
+    test_byml();
+    test_msbt();
     test_merge(work / "merge");
     test_bcml(work / "bcml");
+    test_bcml_tables(work / "tables");
     test_layouts(work / "layouts");
     test_loader(work / "loader", argv[0]);
     printf("content merge: all tests passed\n");

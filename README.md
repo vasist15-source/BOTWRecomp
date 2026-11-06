@@ -49,10 +49,10 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
 - Content mods made for the Wii U version: put each one (a BCML `.bnp`, a Cemu graphic pack with
   `content`/`aoc` folders, an SDCafiine folder, or just `content`/`aoc`) in
   `~/Library/Application Support/BotW/Mods` and switch it on in Settings > Mods. Packs that several
-  mods change are merged file by file, BCML's parameter, animation list and size changes are applied,
-  and the resource size table is updated; saves are backed up when the set of mods changes. Not yet:
-  `.bnp` options other than BCML's defaults, BCML's text, flag, ActorInfo and map merges, and shaders in
-  a mod.
+  mods change are merged file by file, BCML's parameter, animation list, event, game data flag, save data,
+  text and size changes are applied (`.bnp` options can be chosen there too), and the resource size table
+  is updated; saves are backed up when the set of mods changes. Not yet: BCML's ActorInfo, map, shop, drop,
+  quest and other table merges, and shaders in a mod.
 - Code mods: Cemu graphic packs' code patches (`patch_*.asm` with v208 groups, such as Day Time, Camera
   Sensitivity or Draw Distance) in the same Mods folder. They are built into the game code (Settings > Mods
   rebuilds it when one is added or changed, a few minutes), then each one switches on and off at once, and
