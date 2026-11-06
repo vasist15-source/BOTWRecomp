@@ -44,6 +44,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../input.h"
 #include "../input_map.h"
 #include "../mods/mods.h"
+#include "../mods/cheats.h"
 #include "../mods/manager.h"
 #include "../mods/packages.h"
 #include "../mods/graphic_packs.h"
@@ -144,10 +145,10 @@ ImGuiKey imgui_key(int code) {
 }
 
 // ---------------------------------------------------------------- UI state (render thread)
-// no Mods: Wind Waker code mods and cheats; no Saves: save states have no menu or shortcut (removed 2026-11-06)
-enum Tab { kGraphics, kDisplay, kAudio, kControls, kKeyboard, kAbout, kTabs };
-const char* const kTabNames[kTabs] = {"Graphics", "Display", "Audio", "Controls", "Keyboard & Mouse", "Language & About"};
-const char* const kTabIds[kTabs] = {"graphics", "display", "audio", "controls", "keyboard", "about"};
+// no Mods: Wind Waker code mods; no Saves: save states have no menu or shortcut (removed 2026-11-06)
+enum Tab { kGraphics, kDisplay, kAudio, kControls, kKeyboard, kCheats, kAbout, kTabs };
+const char* const kTabNames[kTabs] = {"Graphics", "Display", "Audio", "Controls", "Keyboard & Mouse", "Cheats", "Language & About"};
+const char* const kTabIds[kTabs] = {"graphics", "display", "audio", "controls", "keyboard", "cheats", "about"};
 
 struct Ui {
     bool init = false;
@@ -1665,6 +1666,38 @@ void tab_audio() {
     note("Plays each active channel in turn at a low level. Subwoofer uses an 80 Hz tone.");
 }
 
+// Cheats (mods/cheats.cpp): each switch applies at once, in game or in a menu
+void cheat_switch(int id) {
+    const mods::cheats::Info& c = mods::cheats::info(id);
+    bool v = mods::cheats::on(id);
+    if (toggle(c.name, &v)) mods::cheats::set(id, v);
+    help(c.help);
+}
+void tab_cheats() {
+    heading("Items");
+    cheat_switch(BOTW_CHEAT_ARROWS);
+    cheat_switch(BOTW_CHEAT_WEAPONS);
+    cheat_switch(BOTW_CHEAT_SHIELDS);
+    heading("Champion abilities");
+    cheat_switch(BOTW_CHEAT_REVALI);
+    cheat_switch(BOTW_CHEAT_DARUK);
+    cheat_switch(BOTW_CHEAT_URBOSA);
+    cheat_switch(BOTW_CHEAT_MIPHA);
+    note("Ready again straight after each use. An ability that is already recharging finishes that recharge first.");
+    heading("Link");
+    cheat_switch(BOTW_CHEAT_HEARTS);
+    cheat_switch(BOTW_CHEAT_STAMINA);
+    heading("Master Cycle Zero");
+    cheat_switch(BOTW_CHEAT_CYCLE_FUEL);
+    cheat_switch(BOTW_CHEAT_CYCLE_ANYWHERE);
+    heading("amiibo");
+    cheat_switch(BOTW_CHEAT_AMIIBO);
+    close_card();
+    if (mods::cheats::from_env()) note("WWHD_CHEATS chose these switches for this run; changes here are not saved.");
+    else note("Switches take effect at once and are remembered for the next start. They are not part of your save: "
+              "switch one off and the game plays as normal again.");
+}
+
 // sidebar icons: a coloured rounded tile with a white glyph, as System Settings draws them
 void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
     static const ImVec4 tiles[kTabs] = {
@@ -1673,6 +1706,7 @@ void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
         ImVec4(1.00f, 0.22f, 0.37f, 1),  // Audio: pink
         ImVec4(0.19f, 0.78f, 0.35f, 1),  // Controls: green
         ImVec4(0.56f, 0.56f, 0.58f, 1),  // Keyboard & Mouse: gray
+        ImVec4(1.00f, 0.58f, 0.00f, 1),  // Cheats: orange
         ImVec4(0.37f, 0.36f, 0.90f, 1),  // Language & About: indigo
     };
     const ImVec4 tile = tiles[tab];
@@ -1721,6 +1755,13 @@ void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
             for (int c = 0; c < 5; c++) dl->AddRectFilled(P(5.2f + c * 2.5f, 8.4f + r * 2.3f), P(6.6f + c * 2.5f, 9.6f + r * 2.3f), white, 0.3f * k);
         dl->AddRectFilled(P(7.5f, 13), P(14.5f, 14), white, 0.4f * k);
         break;
+    case kCheats: {  // heart
+        dl->AddCircleFilled(P(8.1f, 8.9f), 3.5f * k, white, 20);
+        dl->AddCircleFilled(P(13.9f, 8.9f), 3.5f * k, white, 20);
+        const ImVec2 tip[3] = {P(4.75f, 9.9f), P(17.25f, 9.9f), P(11, 17.2f)};
+        dl->AddConvexPolyFilled(tip, 3, white);
+        break;
+    }
     default:  // info
         dl->AddCircle(P(11, 11), 7 * k, white, 24, 1.6f * k);
         dl->AddCircleFilled(P(11, 7.6f), 1.15f * k, white);
@@ -1856,6 +1897,7 @@ void settings_window() {
         case kAudio: tab_audio(); break;
         case kControls: tab_controls(); break;
         case kKeyboard: tab_keyboard(); break;
+        case kCheats: tab_cheats(); break;
         default: tab_about(); break;
         }
         close_card();
@@ -2014,6 +2056,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         // the saved dynamic resolution (WWHD_DYNRES_MIN wins)
         if (!dynres::min_from_env() && hostui::get("dynResMin", v)) dynres::set_min(strtof(v.c_str(), nullptr));
         mfx::load_saved();  // the saved MetalFX choices (WWHD_METALFX_* win)
+        mods::cheats::load_saved();  // the saved cheat switches (WWHD_CHEATS wins)
         // (no saved aspect ratio: the wider pictures need Wind Waker's camera hooks)
         // the saved gyro settings (WWHD_GYRO overrides the source)
         hostui::post([] { load_gyro(); });

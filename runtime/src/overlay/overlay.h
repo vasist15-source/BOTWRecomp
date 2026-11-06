@@ -13,7 +13,7 @@
 //
 // Test switches:
 //   WWHD_TEST_OVERLAY=open[:<tab>][@<frame>]   open the overlay (tab: graphics, display, audio, controls,
-//                                              keyboard, about) at TV frame <frame> (default 1)
+//                                              keyboard, cheats, about) at TV frame <frame> (default 1)
 //   WWHD_TEST_MOD_DISABLE/WWHD_TEST_MOD_REMOVE=<id>  normal package actions in headless runs
 //   WWHD_TEST_CATALOGUE_INSTALL=<id>         refresh and install through the normal catalogue UI worker
 //                                              (headless tests only; open the Mods tab separately)

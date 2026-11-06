@@ -155,6 +155,27 @@ have failed the same way with a macOS 13/14 SDK. The four are now looked up by n
 with any weak import (0.1.7's kit: 4, now 0). Not run on macOS 15 yet: there the guarded paths should
 fall back to the device's shader compiler and our own frame generation.
 
+### 2026-11-06: cheats in the settings menu
+Settings > Cheats: infinite arrows, weapons and bows don't break, shields don't break, Revali's Gale /
+Daruk's Protection / Urbosa's Fury / Mipha's Grace without recharge, infinite hearts, infinite stamina,
+Master Cycle Zero fuel and summoning anywhere, amiibo more than once a day. All off by default; each
+switch applies at once (no restart) and is saved (`cheatArrows`, ...; `WWHD_CHEATS=arrows,shields|all`
+decides for a run without saving). The sites are those of the v208 patches in Cemu's BotW Cheats
+graphic packs (CC0), in `tools/botw_cheat_patches.py`: the translator keeps the game's instruction and
+puts a switch around it (`botw_cheats[]`, `runtime/include/botw_cheats.h`; a byte load and a branch),
+so with a cheat off the code runs as before. The 11 functions holding the 11 sites (both durability
+switches share one) are kept plain (no crlive/leaflocal), like the FPS sites; regenerating changed 9
+code files and nothing else.
+Durability is ours, not the pack's (its patch replaces the `mtctr` of the next virtual call): the
+weapon class (vtable 100C54AC, method 024AC534) passes its durability loss in f1 at 024ACC60, which
+is zeroed by the weapon's type (+0x938: 0 one-handed, 1 two-handed, 2 spear, 3 bow, 4 shield,
+5 other, from the profile names at 104FBAAC), so shields have their own switch. Urbosa's count is
+"decremented" by 0 so cr0 stays right (the pack's nop leaves it stale). The translator change makes
+installs re-translate (`recomp_stamp`, the kit lists the new file). Play-tested by the user
+(2026-11-06): works. Not checked on their own: shield-surfing wear (it may take another path) and the
+last arrow of a kind (still used up, as with the pack). Frame time / CPU % not measured (11 sites,
+none in per-frame code with the cheats off beyond a byte load and a branch).
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

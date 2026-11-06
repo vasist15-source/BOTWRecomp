@@ -8,6 +8,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "recomp"))
 import builds as game_builds
 import recomp
+import botw_cheat_patches
 import botw_fps_patches
 
 game_builds.hook_files = lambda: []
@@ -36,9 +37,15 @@ class BotwRecompiler(recomp.Recompiler):
             if self.p.word(address) != instruction:
                 raise ValueError(f"Unexpected v208 FPS instruction at {address:08X}")
             self.fps_sites.setdefault(self.func_of(address), []).append(address)
+        self.cheat_sites = {}
+        for address, (instruction, _, _) in botw_cheat_patches.SITES.items():
+            if self.p.word(address) != instruction or address in self.imm_override:
+                raise ValueError(f"Unexpected v208 cheat instruction at {address:08X}")
+            self.cheat_sites.setdefault(self.func_of(address), []).append(address)
         # emit_function patches these functions' C text, which expects the plain struct accesses
         # (c->r[N], c->f[N]): keep them out of crlive.py / leaflocal.py
-        self.plain_funcs |= set(self.fps_sites) | {0x030BD694, 0x02F62A6C, 0x03053BD4, 0x03C70C04, 0x03C70EE4, 0x0420EBB4}
+        self.plain_funcs |= set(self.fps_sites) | set(self.cheat_sites) | {
+            0x030BD694, 0x02F62A6C, 0x03053BD4, 0x03C70C04, 0x03C70EE4, 0x0420EBB4}
         words = list(self.p.words)
         # lfs f13, 0x1C(r31): VFR's pending 30/fps ratio, instead of constant 1.
         words[(0x037DC360 - self.p.text_lo) // 4] = 0xC1BF001C
@@ -51,6 +58,8 @@ class BotwRecompiler(recomp.Recompiler):
     def emit_function(self, start):
         source, count = super().emit_function(start)
         source = fix_guest_jumps(source, start)
+        source = botw_cheat_patches.apply(source, self.cheat_sites.get(start, []),
+                                          lambda address, word: recomp.translate(address, word, self))
         source = botw_fps_patches.apply(source, self.fps_sites.get(start, []))
         if start == 0x030BD694:
             lines = source.splitlines()

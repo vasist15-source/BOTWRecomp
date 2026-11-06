@@ -40,7 +40,10 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   Champions' Ballad).
 - Controllers through macOS GameController (Xbox, PlayStation, Switch Pro and Joy-Con, with Nintendo
   buttons by position), keyboard and mouse.
-- Settings overlay: graphics, audio (master volume), controls.
+- Settings overlay: graphics, audio (master volume), controls, and cheats you can switch on and off
+  while playing (infinite arrows, unbreakable weapons and shields, champion abilities without
+  recharge, infinite hearts and stamina, Master Cycle Zero fuel and summoning anywhere, amiibo more
+  than once a day).
 - Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`).
 
 ## What you need
