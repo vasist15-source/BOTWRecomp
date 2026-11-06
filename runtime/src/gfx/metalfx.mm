@@ -258,7 +258,7 @@ static Gen g_gen;
 void init() {
     bool up = [MTLFXSpatialScalerDescriptor supportsDevice:R.device];
     bool fxi = false;
-    if (@available(macOS 26.0, *)) fxi = [MTLFXFrameInterpolatorDescriptor supportsDevice:R.device];
+    if (@available(macOS 26.0, *)) fxi = [NEWER_CLASS(MTLFXFrameInterpolatorDescriptor) supportsDevice:R.device];
     const bool fg = g_use_fx_interpolator ? fxi : true;  // the halfway picture of our own needs nothing more
     mfx::set_available(up, fg);
     LOG("[metalfx] spatial upscaling %s, frame generation %s (%s)", up ? "available" : "not available", fg ? "available" : "not available",
@@ -316,7 +316,7 @@ static bool gen_resources(NSUInteger w, NSUInteger h, MTLPixelFormat fmt) {
     if (!g_use_fx_interpolator) {
         // nothing more
     } else if (@available(macOS 26.0, *)) {
-        MTLFXFrameInterpolatorDescriptor* d = [MTLFXFrameInterpolatorDescriptor new];
+        MTLFXFrameInterpolatorDescriptor* d = [NEWER_CLASS(MTLFXFrameInterpolatorDescriptor) new];
         d.colorTextureFormat = fmt;
         d.outputTextureFormat = fmt;
         d.depthTextureFormat = MTLPixelFormatDepth32Float;

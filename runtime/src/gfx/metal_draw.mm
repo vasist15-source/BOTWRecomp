@@ -385,7 +385,7 @@ static id mtl4_compiler() {  // id<MTL4Compiler>, or nil
         const char* e = getenv("WWHD_MTL4_COMPILER");
         if (e && !strcmp(e, "0")) return nil;
         if (@available(macOS 26.0, *)) {
-            MTL4CompilerDescriptor* d = [MTL4CompilerDescriptor new];
+            MTL4CompilerDescriptor* d = [NEWER_CLASS(MTL4CompilerDescriptor) new];
             d.label = @"translated shaders";
             NSError* err = nil;
             id<MTL4Compiler> comp = [R.device newCompilerWithDescriptor:d error:&err];
@@ -622,7 +622,7 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
         if (!injectFailure) {
             if (@available(macOS 26.0, *)) {
                 if (id<MTL4Compiler> comp = mtl4_compiler()) {
-                    MTL4LibraryDescriptor* ld = [MTL4LibraryDescriptor new];
+                    MTL4LibraryDescriptor* ld = [NEWER_CLASS(MTL4LibraryDescriptor) new];
                     ld.source = source;
                     ld.options = opt;
                     lib = [comp newLibraryWithDescriptor:ld error:&err];
@@ -650,7 +650,7 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
     };
     if (@available(macOS 26.0, *)) {
         if (id<MTL4Compiler> comp = mtl4_compiler()) {
-            MTL4LibraryDescriptor* ld = [MTL4LibraryDescriptor new];
+            MTL4LibraryDescriptor* ld = [NEWER_CLASS(MTL4LibraryDescriptor) new];
             ld.source = source;
             ld.options = opt;
             [comp newLibraryWithDescriptor:ld completionHandler:^(id<MTLLibrary> lib, NSError* err) {

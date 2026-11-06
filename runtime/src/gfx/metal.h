@@ -13,6 +13,13 @@
 
 #include "formats.h"
 
+// A class newer than the kit's deployment target (macOS 13), for use inside its @available block: looked
+// up by name when the game runs. A direct reference ([MTL4CompilerDescriptor new]) is a weak import, which
+// the player's own SDK must still have when the installer links the game (0.1.7 named macOS 26 classes,
+// and a macOS 15 SDK could not link it). sizeof checks the name at compile time without referencing the
+// class; tools/release/botw_dmg.py refuses a kit with weak imports.
+#define NEWER_CLASS(name) ((void)sizeof(name*), NSClassFromString(@#name))
+
 namespace gfx {
 // layers of a texture (array slices, cube faces): render-pass slice, blit and upload indices
 inline NSUInteger layer_count(id<MTLTexture> t) {

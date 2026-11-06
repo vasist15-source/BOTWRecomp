@@ -111,7 +111,7 @@ static void make_guest_residency() {
     const char* e = getenv("WWHD_RESIDENCY_SET");
     if (e && !strcmp(e, "0")) return;
     if (@available(macOS 15.0, *)) {
-        MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
+        MTLResidencySetDescriptor* d = [NEWER_CLASS(MTLResidencySetDescriptor) new];
         d.label = @"guest memory";
         d.initialCapacity = R.guest.size();
         NSError* err = nil;

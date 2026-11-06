@@ -109,6 +109,25 @@ def build_kit(version, work):
     return kit
 
 
+def check_kit_imports(kit):
+    """The installer links the kit with the player's Command Line Tools, against whatever SDK they have
+    (macOS 13's at the oldest). A weak import is an API newer than the deployment target: @available makes
+    it optional when the game runs, but the linker still has to find it in the player's SDK (0.1.7 named
+    Metal 4 and MetalFX classes of the macOS 26 SDK, and a macOS 15 SDK could not link it). Such a class
+    is looked up by name instead: NEWER_CLASS in runtime/src/gfx/metal.h."""
+    weak = set()
+    for n in sorted(os.listdir(os.path.join(kit, "lib"))):
+        out = subprocess.run(["nm", "-mA", os.path.join(kit, "lib", n)], check=True, capture_output=True,
+                             text=True).stdout
+        for l in out.splitlines():
+            m = re.match(r"^.*?:([^:]+):\s+\(undefined\) weak external (\S+)", l)
+            if m:
+                weak.add("%s (%s)" % (m.group(2), m.group(1)))
+    if weak:
+        raise SystemExit("the kit has weak imports, which an older SDK on the player's Mac cannot link: %s"
+                         % ", ".join(sorted(weak)))
+
+
 def check_package(res):
     """Allow list: our scripts, the kit, docs. Nothing else (in particular nothing from a dump)."""
     allowed = re.compile(r"^(tools/installer/botw_setup\.py|tools/probe_recomp\.py|tools/botw_fps_patches\.py|tools/rpx\.py|"
@@ -135,6 +154,7 @@ def main():
     a = ap.parse_args()
     work = os.path.join(ROOT, "build", "kit")
     kit = build_kit(a.version, work)
+    check_kit_imports(kit)
 
     stage = os.path.join(a.out, "stage")
     shutil.rmtree(stage, ignore_errors=True)

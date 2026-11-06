@@ -144,6 +144,17 @@ functions (a check at every non-leaf call), decided against for that per-call co
 for scripted runs (`tools/bench/run_bench.py` loads a state with `WWHD_STATE_LOAD_AT`); this change
 touches no per-frame or per-call code.
 
+### 2026-11-06: the release kit links with older SDKs again (issue #4)
+0.1.7's installer stopped at "Linking the game" for players whose Command Line Tools have an SDK older
+than macOS 26 (reported on macOS 15.8.2, M1 Air): `MTL4CompilerDescriptor`, `MTL4LibraryDescriptor` and
+`MTLFXFrameInterpolatorDescriptor` were undefined. The installer links the kit against the player's own
+SDK, and a class newer than the deployment target (13.0) is a weak import that this SDK must still list;
+`@available` only makes it optional when the game runs. `MTLResidencySetDescriptor` (macOS 15) would
+have failed the same way with a macOS 13/14 SDK. The four are now looked up by name (`NEWER_CLASS` in
+`gfx/metal.h`, which checks the name at compile time), and `tools/release/botw_dmg.py` refuses a kit
+with any weak import (0.1.7's kit: 4, now 0). Not run on macOS 15 yet: there the guarded paths should
+fall back to the device's shader compiler and our own frame generation.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
