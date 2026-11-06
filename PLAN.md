@@ -349,9 +349,11 @@ empty `code_patches.c` included). Rebuilding the dev checkout for Day Time and C
 translator's) and `code_patches` (startup, presets at once, the game's data back when switched off, which
 packs need a rebuild, on a hand-written manifest), `content_merge`, `tools/test_botw_translator_package.py`.
 Not done: Master Mode Options (code words from presets), Menu Navigation Speed has no effect (it sets values
-only Cemu's FPS++ pack reads), packs with only data patches still need the rebuild. Not play-tested yet; frame
-time and CPU % not measured (the runtime does no per-frame work for code mods; built in, a patched function
-loses the register passes and reads its mod's switch byte at each changed instruction).
+only Cemu's FPS++ pack reads), packs with only data patches still need the rebuild. Play-tested by the user
+(2026-11-06) with Day Time and Camera Sensitivity from the Mods folder, switched and set in Settings > Mods:
+they work. Frame time and CPU % not measured (the runtime does no per-frame work for code mods; built in, a
+patched function loses the register passes and reads its mod's switch byte at each changed instruction).
+The Rebuild button also covers an app `tools/make_app.sh` made (it runs make_app.sh again after the build).
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
