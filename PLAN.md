@@ -293,13 +293,15 @@ Armoury: 28 of 28 files used, 7 parameter files changed (every file its `deepmer
 merged, 664 ms; with the Umbrella Glider as well, its partial TitleBG.pack merges over the mod's (its
 `Player_Animation.sbfres` wins), 822 files read back, 812 ms, 265 MB peak; no size entry smaller than its
 file. `content_merge_test` passes (switches, groups, saved choices, a start with other options merging a new
-set). Not play-tested yet.
+set). Play-tested by the user (2026-11-06) with Royal Guards Armoury and the Umbrella Glider on (merged in
+837 ms at that start): it works.
 Restart now (Settings > Mods, under the restart note; `hostui::restart_game`): while a game is in progress it
 asks as Quit does ("Restart Breath of the Wild?", `gfx/quit_prompt.mm`), then `render::restart()` does the
 quit's teardown (`render::shutdown`: audio dump, screenshots, renderer caches; settings, `mods.json` and saves
 are written when they change) and `execv`s the same executable with the same arguments (the app's
 `--game/--base/--save/--aoc`, same log). If that fails it says so and quits. macOS only (the SDL host has no
-prompt for it). Not play-tested yet.
+prompt for it). Play-tested by the user (2026-11-06): twice, once asked in gameplay and once without asking
+before it; the game came back each time and played on: it works.
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
