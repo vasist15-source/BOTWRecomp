@@ -1844,9 +1844,9 @@ void tab_mods() {
     const std::vector<mods::loader::ModView> list = mods::loader::list();
     heading("Mods");
     if (list.empty())
-        note("No mods yet. Put each mod in its own folder in the Mods folder (Show in Finder below): a Cemu "
-             "graphic pack (rules.txt with content and aoc folders, or code patches), an SDCafiine folder, or a "
-             "folder with content and aoc folders, made for the Wii U version.");
+        note("No mods yet. Put each mod in the Mods folder (Show in Finder below), made for the Wii U version: a "
+             "BCML .bnp, a .zip, .7z or .rar as downloaded, or a folder of its own: a Cemu graphic pack (rules.txt "
+             "with content and aoc folders, or code patches), an SDCafiine folder, or one with content and aoc folders.");
     for (size_t i = 0; i < list.size(); i++) {
         const mods::loader::ModView& m = list[i];
         ImGui::PushID(m.id.c_str());

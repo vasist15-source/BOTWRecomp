@@ -14,7 +14,7 @@ Wild are trademarks of Nintendo.
 
 **Status: Fully playable.** It boots, plays the intro and the Great Plateau, with menus, NPCs,
 sound, movie cutscenes, saving and the DLC, at the game's own 30 fps, 60 fps, 120 fps and uncapped on an M4 MacBook Air. Expect
-rough edges: stutter the first time new effects are drawn (shaders are compiled then, and cached),
+rough edges: stutter the first time new effects are drawn (shaders are compiled then, and cached).
 
 ## Play it on your Mac
 
@@ -46,18 +46,20 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   choice, Master Cycle Zero fuel and summoning anywhere, amiibo more than once a day).
 - Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`; `101c9500` for the European
   release).
-- Content mods made for the Wii U version: put each one (a BCML `.bnp`, a Cemu graphic pack with
-  `content`/`aoc` folders, an SDCafiine folder, or just `content`/`aoc`) in
-  `~/Library/Application Support/BotW/Mods` and switch it on in Settings > Mods. Packs that several
-  mods change are merged file by file, BCML's parameter, animation list, event, game data flag, save data,
-  text and size changes are applied (`.bnp` options can be chosen there too), and the resource size table
-  is updated; saves are backed up when the set of mods changes. Not yet: BCML's ActorInfo, map, shop, drop,
-  quest and other table merges, and shaders in a mod.
+- Content mods made for the Wii U version: put each one in `~/Library/Application Support/BotW/Mods`,
+  as downloaded (a BCML `.bnp`, or a `.zip`, `.7z` or `.rar`) or as a folder (a Cemu graphic pack with
+  `content`/`aoc` folders, an SDCafiine folder, or just `content`/`aoc`), and switch it on in Settings > Mods.
+  Packs that several mods change are merged file by file, BCML's merge data is applied (parameters,
+  animation lists, events, game data and save data flags, texts, ActorInfo, map units, shops, drop tables,
+  quests and BCML's other tables; a `.bnp`'s options can be chosen there too), and the resource size table
+  is updated; saves are backed up when the set of mods changes. Not yet: shaders in a mod, mods packaged
+  for UKMM; mods for the Switch version can't work.
 - Code mods: Cemu graphic packs' code patches (`patch_*.asm` with v208 groups, such as Day Time, Camera
-  Sensitivity or Draw Distance) in the same Mods folder. They are built into the game code (Settings > Mods
-  rebuilds it when one is added or changed, a few minutes), then each one switches on and off at once, and
-  its presets apply as you choose them. Packs that change what the port changes itself (FPS++, the cheats)
-  are listed with the reason they can't be used.
+  Sensitivity or Draw Distance) in the same Mods folder, as a folder. They are built into the game code
+  (Settings > Mods rebuilds it when one is added or changed: a few minutes, 10-20 the first time unless the
+  installer kept its build files), then each one switches on and off at once, and its presets apply as you
+  choose them. Packs that change what the port changes itself (FPS++, the cheats) are listed with the reason
+  they can't be used.
 
 ## What you need
 

@@ -1500,6 +1500,77 @@ void test_loader(const fs::path& root, const char* self) {
     assert(loader::restart_needed());
     assert(std::system((self_work + "--options \"" + table + "\"").c_str()) == 0);
 }
+
+// mods as downloaded (.zip, .7z, .rar): unpacked at startup with the system's tar, as .bnp files are
+bool archive(const fs::path& from, const char* format, const fs::path& to) {  // tar --format zip/7zip
+    const std::string make = "cd \"" + from.string() + "\" && tar --format " + format + " -cf \"" + to.string() + "\" * 2>/dev/null";
+    return std::system(make.c_str()) == 0;
+}
+const char* const kCodePatch = "[BotW]\nmoduleMatches = 0x6267BFD0\n0x02000000 = nop\n";
+void test_archives(const fs::path& root, const char* self) {
+    make_world(root);
+    const fs::path mods = root / "user/Mods", src = root / "sources";
+    // a graphic pack with content and code patches, in a folder around it (as zipped by Finder)
+    put(src / "g/Zip Pack/rules.txt", "[Definition]\ntitleIds = 00050000101C9400\nname = \"Zipped Pack\"\n");
+    put(src / "g/Zip Pack/content/Loose/Zip.bin", "from the zip");
+    put(src / "g/Zip Pack/patch_Zip.asm", kCodePatch);
+    put(src / "g/__MACOSX/Zip Pack/._rules.txt", "AppleDouble");
+    // plain content in a .7z; a .bnp in a .zip with a read-me; code patches alone; two mods in one archive
+    put(src / "h/content/Loose/Seven.bin", "from the 7z");
+    put(src / "bnp/content/Loose/Inner.bin", "from the bnp in the zip");
+    put(src / "bnp/logs/rstb.json", "{\"Loose/Inner.bin\": 96}");
+    put(src / "bnp/info.json", "{\"name\": \"Inner Mod\"}");
+    put(src / "j/Code Pack/rules.txt", "[Definition]\ntitleIds = 00050000101C9400\nname = \"Code Pack\"\n");
+    put(src / "j/Code Pack/patch_Code.asm", kCodePatch);
+    put(src / "k/A/content/Loose/A.bin", "a");
+    put(src / "k/B/content/Loose/B.bin", "b");
+    put(src / "m/meta.yml", "name: UKMM Mod\n");  // UKMM's package: its files are not the game's
+    put(src / "m/manifest.yml", "content_files: []\n");
+    put(src / "m/content/Actor/Pack/A.sbactorpack", "minicbor");
+    put(src / "i/Inner/Read me.txt", "read me");
+    fs::create_directories(mods);
+    if (!archive(src / "g", "zip", mods / "g-pack.zip") || !archive(src / "h", "7zip", mods / "h-plain.7z") ||
+        !archive(src / "bnp", "7zip", src / "i/Inner/i.bnp") || !archive(src / "i", "zip", mods / "i-bnp.zip") ||
+        !archive(src / "j", "zip", mods / "j-code.zip") || !archive(src / "k", "zip", mods / "k-two.zip") ||
+        !archive(src / "m", "zip", mods / "m-ukmm.zip")) {
+        fprintf(stderr, "content merge: this tar can't write zip and 7z; the archive part is skipped\n");
+        return;
+    }
+    put(mods / "l-broken.rar", "Rar!\x1a\x07 not an archive");
+    const std::string self_work = "\"" + std::string(self) + "\" \"" + root.parent_path().string() + "\" ";
+    assert(std::system((self_work + "--archives").c_str()) == 0);
+}
+int archives_start(const fs::path& root) {
+    setup_loader(root);
+    loader::startup();
+    std::map<std::string, loader::ModView> by_id;
+    for (const auto& m : loader::list()) by_id[m.id] = m;
+    assert(by_id.size() == 7);
+    assert(by_id.at("m-ukmm.zip").problem.find("UKMM") != std::string::npos && !by_id.at("m-ukmm.zip").active);
+    const loader::ModView& g = by_id.at("g-pack.zip");
+    assert(g.kind == "Cemu graphic pack (.zip)" && g.name == "Zipped Pack" && g.problem.empty() && g.active && !g.code);
+    assert(g.warning.find("code patches are only used from a folder") != std::string::npos);
+    const std::string zip = loader::replacement(guest_of("Loose/Zip.bin"));
+    assert(zip.find("Mods unpacked") != std::string::npos && text(get(zip)) == "from the zip");
+    const loader::ModView& h = by_id.at("h-plain.7z");
+    assert(h.kind == "Content folder (.7z)" && h.name == "h-plain" && h.active);
+    assert(text(get(loader::replacement(guest_of("Loose/Seven.bin")))) == "from the 7z");
+    const loader::ModView& i = by_id.at("i-bnp.zip");
+    assert(i.kind == "BCML mod (.bnp in a .zip)" && i.name == "Inner Mod" && i.problem.empty() && i.active);
+    assert(text(get(loader::replacement(guest_of("Loose/Inner.bin")))) == "from the bnp in the zip");
+    const std::string table = loader::replacement(guest_of("System/Resource/ResourceSizeTable.product.srsizetable"));
+    assert(!table.empty() && entry(table_of(table), "Loose/Inner.bin") == 96);  // the inner .bnp's merge data
+    const loader::ModView& j = by_id.at("j-code.zip");
+    assert(j.problem.find("only used from a folder") != std::string::npos && !j.active && !j.code);
+    assert(by_id.at("k-two.zip").problem.find("several mods") != std::string::npos && !by_id.at("k-two.zip").active);
+    assert(by_id.at("l-broken.rar").problem.find("can't be unpacked") != std::string::npos);
+    // a rescan (Settings > Mods) keeps what was unpacked
+    loader::rescan();
+    assert(loader::list().size() == 7 && !loader::restart_needed());
+    for (const auto& m : loader::list())
+        if (m.id == "i-bnp.zip") assert(m.kind == "BCML mod (.bnp in a .zip)" && m.name == "Inner Mod");
+    return 0;
+}
 int reuse(const fs::path& root, const std::string& time) {
     setup_loader(root);
     loader::startup();
@@ -2141,6 +2212,7 @@ int main(int argc, char** argv) {
     const fs::path work = argv[1];
     if (argc == 4 && std::string(argv[2]) == "--reuse") return reuse(work / "loader", argv[3]);
     if (argc == 4 && std::string(argv[2]) == "--options") return options_start(work / "loader", argv[3]);
+    if (argc == 3 && std::string(argv[2]) == "--archives") return archives_start(work / "archives");
     fs::remove_all(work);
     fs::create_directories(work);
     test_yaz0();
@@ -2155,6 +2227,7 @@ int main(int argc, char** argv) {
     test_bcml_files(work / "files");
     test_layouts(work / "layouts");
     test_loader(work / "loader", argv[0]);
+    test_archives(work / "archives", argv[0]);
     printf("content merge: all tests passed\n");
     return 0;
 }

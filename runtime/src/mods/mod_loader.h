@@ -18,7 +18,9 @@
 namespace mods::loader {
 
 struct Layout {  // what a mod folder holds
-    std::string kind;  // "Cemu graphic pack", "SDCafiine folder", "Content folder", "BCML mod", "BCML mod (.bnp)"
+    // "Cemu graphic pack", "SDCafiine folder", "Content folder", "BCML mod", "BCML mod (.bnp)"; from an archive
+    // "Cemu graphic pack (.zip)", ..., "BCML mod (.bnp in a .7z)", or "Archive (.rar)" when it holds no usable mod
+    std::string kind;
     std::string name, description;
     std::filesystem::path content, aoc;  // empty when absent
     std::filesystem::path logs;          // a BCML mod's merge data (deepmerge.aamp, rstb.json, texts.json, ...)

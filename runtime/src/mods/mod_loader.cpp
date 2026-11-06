@@ -249,30 +249,33 @@ void save_locked() {
     }
 }
 fs::path cache_root();
-fs::path unpack_root() {  // unpacked .bnp files, next to the merge caches
+fs::path unpack_root() {  // unpacked .bnp files and archives, next to the merge caches
     if (const char* e = std::getenv("BOTW_MODS_CACHE")) return fs::path(e).parent_path() / "Mods unpacked";
     return cache_root().parent_path() / "Mods unpacked";
 }
-std::string unpack_name(const fs::path& bnp) {  // changes with the file
+// files in the Mods folder that are unpacked at startup: BCML mods, and mods as downloaded
+bool packed(const std::string& ext) { return ext == ".bnp" || ext == ".zip" || ext == ".7z" || ext == ".rar"; }
+std::string unpack_name(const fs::path& file) {  // changes with the file
     std::error_code ec;
-    std::string stem = bnp.stem().string();
+    std::string stem = file.stem().string();
     for (char& c : stem)
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != ' ' && c != '.') c = '_';
-    return stem + "-" + std::to_string(fs::file_size(bnp, ec)) + "-" +
-           std::to_string((long long)fs::last_write_time(bnp, ec).time_since_epoch().count());
+    const std::string ext = lower(file.extension().string());
+    return stem + (ext == ".bnp" || ext.size() < 2 ? "" : "-" + ext.substr(1)) + "-" + std::to_string(fs::file_size(file, ec)) + "-" +
+           std::to_string((long long)fs::last_write_time(file, ec).time_since_epoch().count());
 }
-bool unpack_bnp(const fs::path& bnp, const fs::path& dest, std::string& why) {
+bool unpack_file(const fs::path& file, const fs::path& dest, std::string& why) {
     std::error_code ec;
     const fs::path tmp = dest.string() + ".partial";
     fs::remove_all(tmp, ec);
     fs::create_directories(tmp, ec);
 #ifdef __APPLE__
-    const char* tar = "/usr/bin/tar";  // bsdtar: reads 7z (.bnp), refuses absolute and .. paths
+    const char* tar = "/usr/bin/tar";  // bsdtar: reads 7z (.bnp), zip and rar, refuses absolute and .. paths
 #else
     const char* tar = "bsdtar";
 #endif
     const auto t0 = std::chrono::steady_clock::now();
-    const host::ProcessResult r = host::run_process({tar, "-xf", bnp.string(), "-C", tmp.string()});
+    const host::ProcessResult r = host::run_process({tar, "-xf", file.string(), "-C", tmp.string()});
     if (r.code != 0 || !r.error.empty()) {
         std::string text = r.error.empty() ? r.output : r.error;
         if (const size_t nl = text.find('\n'); nl != std::string::npos) text.resize(nl);
@@ -294,33 +297,90 @@ bool unpack_bnp(const fs::path& bnp, const fs::path& dest, std::string& why) {
         return false;
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    LOG("[mods] unpacked %s in %.0f ms (%s)", bnp.filename().string().c_str(), ms, dest.string().c_str());
+    LOG("[mods] unpacked %s in %.0f ms (%s)", file.filename().string().c_str(), ms, dest.string().c_str());
     return true;
 }
-// a .bnp in the Mods folder: unpacked at startup (unpack), else only listed
-Layout bnp_layout(const fs::path& bnp, const std::string& title, bool unpack, std::vector<std::string>& unpacked) {
+// files that could not be unpacked at startup, by unpack folder (a changed file gets a new one), and why:
+// later scans show that instead of unpacking them at the next start (under g_mutex, as scan_locked)
+std::map<std::string, std::string> g_unpack_failed;
+std::vector<fs::path> bnps_in(const fs::path& dir) {  // the .bnp files an unpacked archive holds
+    std::vector<fs::path> out;
     std::error_code ec;
-    const std::string name = unpack_name(bnp);
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (hidden(it->path().filename().string()) || it.depth() >= 3) {
+            if (it->is_directory(ec)) it.disable_recursion_pending();
+            if (hidden(it->path().filename().string())) continue;
+        }
+        if (it->is_regular_file(ec) && lower(it->path().extension().string()) == ".bnp") out.push_back(it->path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+// a .bnp, .zip, .7z or .rar in the Mods folder: unpacked at startup (unpack), else only listed. An archive
+// holds a mod as a folder would (also inside a folder around it), or one .bnp; the code patches of a pack
+// in an archive are not used (mods::patches and the translator read them from folders).
+Layout packed_layout(const fs::path& file, const std::string& title, bool unpack, std::vector<std::string>& unpacked) {
+    std::error_code ec;
+    const std::string ext = lower(file.extension().string());
+    const std::string name = unpack_name(file);
     const fs::path dest = unpack_root() / name;
     unpacked.push_back(name);
     Layout l;
-    l.kind = "BCML mod (.bnp)";
-    l.name = bnp.stem().string();
-    if (!fs::is_directory(dest, ec)) {
+    l.kind = ext == ".bnp" ? "BCML mod (.bnp)" : "Archive (" + ext + ")";
+    l.name = file.stem().string();
+    auto unpacked_to = [&](const fs::path& from, const fs::path& to) {  // `from` unpacked into `to` (now or before)
+        if (fs::is_directory(to, ec)) return true;
+        if (auto f = g_unpack_failed.find(to.string()); f != g_unpack_failed.end()) {  // this start, this file
+            l.problem = f->second;
+            return false;
+        }
         if (!unpack) {
             l.warning = "It is unpacked when the game starts next";
-            return l;
+            return false;
         }
         std::string why;
-        if (!unpack_bnp(bnp, dest, why)) {
-            l.problem = "This .bnp can't be unpacked: " + why;
-            return l;
+        if (!unpack_file(from, to, why)) {
+            l.problem = "This " + lower(from.extension().string()) + " can't be unpacked: " + why;
+            g_unpack_failed[to.string()] = l.problem;
+            return false;
         }
+        return true;
+    };
+    auto as = [&](Layout d, const fs::path& dir, const std::string& kind) {
+        if (d.name == dir.filename().string()) d.name = l.name;  // no name in its rules.txt or info.json
+        d.kind = kind;
+        return d;
+    };
+    if (!unpacked_to(file, dest)) return l;
+    if (ext == ".bnp") {
+        Layout d = detect(dest, title);
+        if (d.problem.empty() && d.content.empty() && d.aoc.empty()) d.problem = "There is no content/ or aoc/ folder in this .bnp";
+        return as(d, dest, l.kind);
     }
     Layout d = detect(dest, title);
-    if (d.problem.empty() && d.content.empty() && d.aoc.empty()) d.problem = "There is no content/ or aoc/ folder in this .bnp";
-    d.kind = "BCML mod (.bnp)";
-    return d;
+    if (d.problem.empty()) {
+        if (d.code) {
+            d.code = false;
+            const std::string unpack_it = "unpack this " + ext + " into its own folder here";
+            if (d.content.empty() && d.aoc.empty()) d.problem = "Its code patches are only used from a folder: " + unpack_it;
+            else d.warning = (d.warning.empty() ? "" : d.warning + ". ") + "Its code patches are only used from a folder: " + unpack_it + " for them";
+        }
+        return as(d, dest, (d.kind.empty() ? "Mod" : d.kind) + " (" + ext + ")");
+    }
+    const std::vector<fs::path> bnps = bnps_in(dest);
+    if (bnps.size() > 1) {
+        l.problem = "It holds several .bnp files: unpack it and move the one you want into the Mods folder";
+        return l;
+    }
+    if (bnps.size() == 1) {  // unpacked next to it, in a folder the detection of `dest` skips
+        const fs::path inner = dest / ".bnp";
+        if (!unpacked_to(bnps.front(), inner)) return l;
+        Layout b = detect(inner, title);
+        if (b.problem.empty() && b.content.empty() && b.aoc.empty()) b.problem = "There is no content/ or aoc/ folder in its .bnp";
+        return as(b, inner, "BCML mod (.bnp in a " + ext + ")");
+    }
+    if (d.problem == "No content/ or aoc/ folder in it") d.problem += " (several mods in one archive: unpack it and move each into its own folder here)";
+    return as(d, dest, l.kind);
 }
 void scan_locked(bool unpack = false) {
     g.layouts.clear();
@@ -330,8 +390,8 @@ void scan_locked(bool unpack = false) {
     for (fs::directory_iterator it(g.dir, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string name = it->path().filename().string();
         if (hidden(name)) continue;
-        if (!it->is_directory(ec) && lower(it->path().extension().string()) == ".bnp")
-            g.layouts[name] = bnp_layout(it->path(), title, unpack, unpacked);
+        if (!it->is_directory(ec) && packed(lower(it->path().extension().string())))
+            g.layouts[name] = packed_layout(it->path(), title, unpack, unpacked);
         else
             g.layouts[name] = detect(it->path(), title);
     }
@@ -604,6 +664,13 @@ Layout detect(const fs::path& folder, const std::string& title) {
             if (lower(d.filename().string()).rfind("01007ef00011", 0) == 0) switch_mod = true;  // the Switch title's folders
         if (switch_mod) {
             l.problem = "A mod for the Switch version: it doesn't work with the Wii U game";
+            return l;
+        }
+        auto file = [&](const char* name) {
+            return std::any_of(files.begin(), files.end(), [&](const fs::path& f) { return lower(f.filename().string()) == name; });
+        };
+        if (file("meta.yml") && file("manifest.yml")) {  // UKMM's package (a .zip): its own resource format
+            l.problem = "A mod packaged for UKMM: its files are in UKMM's own format, which the Mods folder can't read yet";
             return l;
         }
         fs::path rules;
