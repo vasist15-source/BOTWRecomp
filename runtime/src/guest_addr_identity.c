@@ -14,3 +14,8 @@ __attribute__((weak)) const uint32_t g_guest_code_lo = 0, g_guest_code_hi = 0;
 __attribute__((weak)) const uint32_t g_guest_data_lo = 0, g_guest_data_hi = 0;
 __attribute__((weak)) const GuestChanged g_guest_changed_code[] = {{0u, 0u}};
 __attribute__((weak)) const unsigned g_guest_changed_code_count = 0;
+
+/* The installed game's title ID (runtime/src/game_release.h): game_release.cpp reads it from the dump and
+ * its definition wins where it is linked; without it (unit tests) this is the build's title. */
+const char* game_title_id(void);
+__attribute__((weak)) const char* game_title_id(void) { return g_guest_build_title_id; }

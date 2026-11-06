@@ -4,6 +4,7 @@
 #include "../crashrec.h"
 #include "../game_languages.h"
 #include "../console_language.h"
+#include "../game_release.h"
 #include <cstdlib>
 #include <cstring>
 #include "../true60.h"
@@ -352,7 +353,8 @@ HLE(coreinit, UCReadSysConfig) {
         uint32_t size = ld32(e + 0x4C), data = ld32(e + 0x50);
         uint32_t value = 0;
         if (name == "cafe.language") value = console_language();  // WWHD_LANGUAGE or saved, default English
-        else if (name == "cafe.cntry_reg") value = 49;   // USA
+        else if (name == "cafe.cntry_reg")  // the release's (game_release.h; BotW reads only cafe.language)
+            value = game_release::country(game_release::current().region, (int)console_language());
         else if (name == "cafe.eula_agree") value = 1;
         else if (name == "cafe.initial_launch") value = 2;
         else if (name == "parent.enable") value = 0;
@@ -371,16 +373,16 @@ HLE(coreinit, UCReadSysConfig) {
 
 // MCP (system settings service): the console and game region (Cemu: coreinit_MCP.cpp). The game reads
 // its product settings once at start; returning success without filling them left the regions 0.
-extern "C" const char g_guest_build_title_id[];
 HLE(coreinit, MCP_Open) { ret(c, 1); }  // a handle; nothing is opened
 HLE(coreinit, MCP_Close) { ret(c, 0); }
 HLE(coreinit, MCP_GetSysProdSettings) {  // (handle, SysProdSettings* 0x46 bytes)
     const uint32_t out = arg(c, 1);
     if (!out) { ret(c, 0xFFFFFFFF); return; }
     memset(mem::ptr(out), 0, 0x46);
-    // Wii U region bits from the title ID's region digits (BotW: 101C9300 Japan, 101C9400 USA, 101C9500 Europe)
-    const std::string id = g_guest_build_title_id;
-    const uint8_t region = id.size() == 16 && id[13] == '3' ? 1 : id.size() == 16 && id[13] == '5' ? 4 : 2;
+    // the installed release's Wii U region bits (2 USA, 4 Europe; game_release.h): the game's region comes
+    // from the platform region (0x03C707DC, 0x030AC9C4) and with cafe.language names the text packs it
+    // loads (Bootup_USen.pack, Bootup_EUde.pack, ...); the code is the same for both releases
+    const uint8_t region = (uint8_t)game_release::current().region;
     st8(out + 0x03, region);  // platform region
     st8(out + 0x0B, region);  // game region
     ret(c, 0);

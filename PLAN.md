@@ -190,6 +190,24 @@ either. The overlay's navigation and the Controls window still read the ungated 
 The SDL host (`platform/input_sdl.cpp`, Vulkan-only builds, not ours) is not gated: it now has no
 release wait at all (upstream's commits have that half).
 
+### 2026-11-06: the European release accepted (untested)
+The installer takes the European release (base 00050000101C9500, update 0005000E101C9500, DLC
+0005000C101C9500) as well as the USA one: BotW-Native's region.cpp says both v208 updates ship the same
+U-King.rpx, the SHA-256 the installer checks, so the translated code is the same. Base game, update and
+DLC must be of one release; Japan stays refused. The game takes its region from MCP_GetSysProdSettings'
+platform region (byte 3 read at 03C707DC; 030AC9C4 makes 1/2/4 its Japan/USA/Europe) and its language
+from UCReadSysConfig `cafe.language`, checks them against `content/System/RegionLangMask.txt` (USA:
+`USen USes USfr`, RomType `US`; the update's copy is in `content/Local/System`) and loads
+`Pack/Bootup_<USen|EUde|...>.pack`. MCP used to report the translated build's region (USA, always), so a
+European dump would have been told it is the USA one; `game_release.cpp` now reads the dump's: the title
+ID in meta.xml, else the RomType, the Bootup packs, meta.xml's region bits. MCP gets that region,
+`cafe.cntry_reg` the language's country in Europe (110 UK, 78 Germany, 77 France, ...; 49 for the USA as
+before), and the mods' title checks (SDCafiine folders, Cemu `titleIds`) the dump's title. The languages
+on Language & About come from the update's Bootup packs as before; a new install starts in English. Cemu
+saves are also looked for under `101c9500` (the same save files). `tools/run.sh` / `make_app.sh` use the
+European folders when there are no USA ones. `game_release_test` covers the decision. **Not run with a
+European dump yet**: check the `[config] release:` log line, the text language, the DLC and a Cemu save.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

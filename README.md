@@ -44,17 +44,27 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   while playing (infinite arrows, unbreakable weapons and shields, champion abilities without
   recharge, infinite hearts and stamina, Master Cycle Zero fuel and summoning anywhere, amiibo more
   than once a day).
-- Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`).
+- Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`; `101c9500` for the European
+  release).
 
 ## What you need
 
 - An Apple Silicon Mac with macOS 13 or newer and about 3 GB free.
 - Apple's Command Line Tools (`xcode-select --install`; the installer offers it).
-- Your dump of the USA release, extracted (folders with `code`, `content` and `meta`):
-  base game `00050000101C9400`, update v208 `0005000E101C9400` (its `U-King.rpx` has SHA-256
-  `ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30`; the installer checks it) and
-  optionally the DLC `0005000C101C9400`. Titles installed in Cemu (`mlc01/usr/title/...`) work as they
-  are. Other regions are not supported yet.
+- Your dump of the USA or the European release, extracted (folders with `code`, `content` and
+  `meta`), all three of one release:
+
+  | | USA | Europe |
+  |---|---|---|
+  | base game | `00050000101C9400` | `00050000101C9500` |
+  | update v208 | `0005000E101C9400` | `0005000E101C9500` |
+  | DLC (optional) | `0005000C101C9400` | `0005000C101C9500` |
+
+  Both v208 updates have the same game code, `U-King.rpx` with SHA-256
+  `ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30` (the installer checks it); the game
+  is told its region by your dump. The European release is not play-tested yet: it starts in English,
+  and its other languages are in Settings (Cmd+,) > Language & About. Titles installed in Cemu
+  (`mlc01/usr/title/...`) work as they are. The Japanese release is not supported.
 
 ## Build it by hand (for development)
 

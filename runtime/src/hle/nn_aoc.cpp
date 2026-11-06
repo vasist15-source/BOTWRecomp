@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 
+#include "../game_release.h"
 #include "../runtime.h"
 
 namespace {
@@ -14,7 +15,8 @@ enum : uint32_t { AOC_OK = 0, AOC_INVALID = (uint32_t)-1 };
 // AOCTitle (0x68 bytes): u64 titleId, u32 groupId, u16 titleVersion, char path[88], 2 bytes pad
 constexpr uint32_t kTitleSize = 0x68;
 
-// the DLC's title id, from <aoc>/meta/meta.xml (<title_id ...>0005000C101C9400</title_id>); 0 if none
+// the DLC's title id, from <aoc>/meta/meta.xml (<title_id ...>0005000C101C9400</title_id>, 0005000C101C9500
+// for the European release); 0 if none
 uint64_t aoc_title_id() {
     static uint64_t id = [] {
         if (config::aoc_dir.empty()) return (uint64_t)0;
@@ -29,6 +31,11 @@ uint64_t aoc_title_id() {
             }
         fclose(f);
         LOG("[aoc] %s: title %016llX", config::aoc_dir.c_str(), (unsigned long long)v);
+        // the installer takes the DLC of the game's release only (the game, not this, decides what it accepts)
+        const std::string game = game_release::current().title_id;
+        if (v && game.size() == 16 && (uint32_t)v != (uint32_t)strtoul(game.c_str() + 8, nullptr, 16))
+            LOG("[aoc] warning: this DLC is not of the installed release (%s, title %s)",
+                game_release::name(game_release::current().region), game.c_str());
         return v;
     }();
     return id;

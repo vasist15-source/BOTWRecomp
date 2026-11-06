@@ -1,6 +1,7 @@
 #include "../exception_report.h"
 #include "cemu_pack.h"
 #include "guest_addr.h"
+#include "../game_release.h"
 #include "mod_archive.h"
 #include <algorithm>
 #include <atomic>
@@ -118,7 +119,7 @@ Pack parse(const fs::path& folder){
     Pack pack;auto sections=ini(read(folder/"rules.txt"));bool definition=false;
     for(const auto& section:sections){auto field=[&](const char* key){auto it=section.fields.find(key);return it==section.fields.end()?std::string{}:unquote(it->second);};
         if(section.name=="definition"){
-            require(!definition,"Multiple Cemu definitions");definition=true;require(targets_title(field("titleids"),g_guest_build_title_id),std::string("Cemu pack does not target this version of the game (")+g_guest_build_name+", title "+g_guest_build_title_id+")");
+            require(!definition,"Multiple Cemu definitions");definition=true;require(targets_title(field("titleids"),game_title_id()),std::string("Cemu pack does not target this version of the game (title ")+game_title_id()+")");
             auto version=field("version");require(version=="4"||version=="5","Only Cemu graphics pack versions 4 and 5 are supported");
             pack.name=field("name");require(!pack.name.empty(),"Cemu pack has no name");pack.description=field("description");
         }else if(section.name=="default"){

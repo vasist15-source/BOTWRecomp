@@ -8,10 +8,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-/Applications}"
 APP="$DEST/Breath of the Wild.app"
 DUMP="${BOTW_DUMP:-$HOME/Hermes/Wii U ROM}/The Legend of Zelda Breath of the Wild"
+# as tools/run.sh: the USA release's folders (101c9400), else the European release's (BOTW_TITLE= chooses)
+T="${BOTW_TITLE:-101c9400}"
+[ -n "$BOTW_TITLE" ] || [ -d "$DUMP [Game] [00050000$T]" ] || T=101c9500
 TMP="$(mktemp -d)"
 mkdir -p "$TMP/c/MacOS" "$TMP/c/Resources"
 cp "$ROOT/build/rt/wwhd" "$TMP/c/MacOS/wwhd"
-ICON="$DUMP [Game] [00050000101c9400]/meta/iconTex.tga"
+ICON="$DUMP [Game] [00050000$T]/meta/iconTex.tga"
 if [ -f "$ICON" ]; then
     mkdir -p "$TMP/i.iconset"
     sips -s format png "$ICON" --out "$TMP/icon.png" >/dev/null
@@ -39,9 +42,9 @@ cat > "$TMP/c/Info.plist" <<PL
 <key>LSSupportsGameMode</key><true/>
 <key>GCSupportsGameMode</key><true/>
 <key>BotWLaunch</key><dict>
-<key>game</key><string>$DUMP [Update] [0005000e101c9400]</string>
-<key>base</key><string>$DUMP [Game] [00050000101c9400]</string>
-<key>aoc</key><string>$DUMP [DLC] [0005000c101c9400]</string>
+<key>game</key><string>$DUMP [Update] [0005000e$T]</string>
+<key>base</key><string>$DUMP [Game] [00050000$T]</string>
+<key>aoc</key><string>$DUMP [DLC] [0005000c$T]</string>
 <key>save</key><string>$ROOT/build/save</string>
 <key>dir</key><string>$ROOT</string>
 </dict>

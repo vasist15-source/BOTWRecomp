@@ -85,10 +85,10 @@ enum Kind: String, CaseIterable, Identifiable {
     var optional: Bool { self == .dlc || self == .save }
     var hint: String {
         switch self {
-        case .base: return "Title 00050000101C9400: the folder with code, content and meta in it"
-        case .update: return "Title 0005000E101C9400, version 208"
-        case .dlc: return "Title 0005000C101C9400: The Master Trials and The Champions' Ballad"
-        case .save: return "For example Cemu's mlc01/usr/save/00050000/101c9400/user/80000001"
+        case .base: return "Title 00050000101C9400 (USA) or 00050000101C9500 (Europe): the folder with code, content and meta in it"
+        case .update: return "Title 0005000E101C9400 or 0005000E101C9500, version 208, of the same release"
+        case .dlc: return "Title 0005000C101C9400 or 0005000C101C9500: The Master Trials and The Champions' Ballad"
+        case .save: return "For example Cemu's mlc01/usr/save/00050000/101c9400/user/80000001 (101c9500 for Europe)"
         }
     }
     var symbol: String {
@@ -519,7 +519,7 @@ struct ItemRow: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.message = kind == .save ? "Choose the save folder (Cemu: mlc01/usr/save/00050000/101c9400/user/80000001)"
+        panel.message = kind == .save ? "Choose the save folder (Cemu: mlc01/usr/save/00050000/101c9400 or 101c9500/user/80000001)"
                                       : "Choose the \(kind.label.lowercased()) folder (it contains code, content and meta)"
         panel.prompt = "Choose"
         if let p = m.paths[kind], !p.isEmpty { panel.directoryURL = URL(fileURLWithPath: p).deletingLastPathComponent() }

@@ -8,7 +8,7 @@
 #include <vector>
 namespace mods::cemu {
 // Whether a Cemu rules.txt "titleIds" list (comma-separated, any case, spaces allowed) names `title`,
-// the installed game's title ID (g_guest_build_title_id: USA 0005000010143500, EU 0005000010143600).
+// the installed game's title ID (game_title_id(): the dump's, USA 00050000101C9400, Europe 00050000101C9500).
 inline bool targets_title(const std::string& titleids,const std::string& title) {
     std::string want;for(char c:title)want+=(char)std::tolower((unsigned char)c);
     size_t start=0;

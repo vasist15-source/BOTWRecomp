@@ -1,9 +1,10 @@
 # Installing BOTWRecomp (Breath of the Wild for Mac)
 
 BOTWRecomp contains no game files and no game code. The installer builds the game on your Mac from
-**your own** Wii U dump of *The Legend of Zelda: Breath of the Wild* (USA): it translates the
-game's code to C, compiles it with Apple's compiler and puts the result in a normal Mac app,
-**Breath of the Wild.app**. Nothing is downloaded and nothing from your dump leaves your Mac.
+**your own** Wii U dump of *The Legend of Zelda: Breath of the Wild* (the USA or the European
+release): it translates the game's code to C, compiles it with Apple's compiler and puts the result
+in a normal Mac app, **Breath of the Wild.app**. Nothing is downloaded and nothing from your dump
+leaves your Mac.
 
 ## What you need
 
@@ -13,15 +14,18 @@ game's code to C, compiles it with Apple's compiler and puts the result in a nor
   `xcode-select --install`).
 - From a source checkout only (not with the release): **CMake**, `brew install cmake ninja` with
   [Homebrew](https://brew.sh) or the CMake app from [cmake.org](https://cmake.org/download/).
-- Your dump, extracted (folders with `code`, `content` and `meta` in them):
-  - the **base game**, title `00050000101C9400`
-  - the **update v208** (game version 1.5.0), title `0005000E101C9400`
-  - optionally the **DLC** (v80: The Master Trials and The Champions' Ballad), title `0005000C101C9400`
+- Your dump, extracted (folders with `code`, `content` and `meta` in them), all of one release:
+  - the **base game**, title `00050000101C9400` (USA) or `00050000101C9500` (Europe)
+  - the **update v208** (game version 1.5.0), title `0005000E101C9400` or `0005000E101C9500`
+  - optionally the **DLC** (v80: The Master Trials and The Champions' Ballad), title
+    `0005000C101C9400` or `0005000C101C9500`
 
   Dump them from your own console (for example with Dumpling). Games installed in Cemu work as
   they are: they are in `mlc01/usr/title/00050000/101c9400`, `.../0005000e/101c9400` and
-  `.../0005000c/101c9400`. Disc images (`.wud`, `.wux`) and Cemu archives (`.wua`) have to be
-  extracted first.
+  `.../0005000c/101c9400` (`101c9500` for the European release). Disc images (`.wud`, `.wux`) and
+  Cemu archives (`.wua`) have to be extracted first. The European release is new and not
+  play-tested yet (please report how it runs); the game starts in English, and its other languages
+  are in the game's Settings (Cmd+,) > Language & About. The Japanese release is not supported.
 
 ## Install
 
@@ -34,10 +38,12 @@ game's code to C, compiles it with Apple's compiler and puts the result in a nor
    the installer app (a few seconds) and opens it.
 2. **Your game files**: click *Find in a Folder…* and choose the folder that holds your dump, or
    choose (or drag in) the base game, update and DLC folders one by one. Each one is checked: a
-   green check means it is right; otherwise the row says what is wrong (another region, an older
-   update, encrypted files, a missing folder, …).
+   green check means it is right; otherwise the row says what is wrong (the Japanese release, an
+   update or DLC of another release than the base game, an older update, encrypted files, a missing
+   folder, …).
 3. **Save** (optional): choose a save to bring along, for example Cemu's
-   `mlc01/usr/save/00050000/101c9400/user/80000001`.
+   `mlc01/usr/save/00050000/101c9400/user/80000001` (`101c9500` for the European release; the
+   saves of the two releases are the same files).
 4. **Where to put the game**: `~/Applications` by default; `/Applications` or any other folder if
    you prefer. *Copy the game files to this Mac* makes the app independent of where your dump is
    now (an external drive, say); otherwise the app reads them where they are.

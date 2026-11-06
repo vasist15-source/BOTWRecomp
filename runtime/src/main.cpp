@@ -41,6 +41,7 @@
 #include "build_info.h"
 #include "crashrec.h"
 #include "crash_context.h"
+#include "game_release.h"
 #include "input.h"
 #include "mods/manager.h"
 #include "mods/packages.h"
@@ -518,8 +519,10 @@ int main(int argc, char** argv) {
     std::string rpx = config::game_dir + "/code/U-King.rpx";
     if (!load_rpx(rpx, m)) fatal("cannot load %s", rpx.c_str());
     if (m.entry != g_recomp_entry_point) fatal("%s does not match the recompiled code", rpx.c_str());
-    LOG("[boot] loaded %s (%s build, title %s): entry %08X sda %08X sda2 %08X data end %08X", rpx.c_str(),
-        g_guest_build_name, g_guest_build_title_id, m.entry, m.sda_base, m.sda2_base, m.data_end);
+    // the code is the translation's (g_guest_build_name); the release is the dump's (game_release.h)
+    LOG("[boot] loaded %s (%s code build; %s release, title %s): entry %08X sda %08X sda2 %08X data end %08X",
+        rpx.c_str(), g_guest_build_name, game_release::name(game_release::current().region),
+        game_release::current().title_id.c_str(), m.entry, m.sda_base, m.sda2_base, m.data_end);
 
     dispatch::init();
     guestmods::init();  // trusted manager packages, before guest threads start

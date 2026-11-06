@@ -73,7 +73,7 @@ std::string host_path_exact(const std::string& guest) {
     if (map("/vol/code", config::game_dir + "/code")) return p;
     if (map("/vol/meta", "")) return layered("/meta");
     if (map("/vol/save", config::save_dir)) return p;
-    if (p.compare(0, 8, "/vol/aoc") == 0) {  // /vol/aoc0005000c101c9400/... (AOC_OpenTitle)
+    if (p.compare(0, 8, "/vol/aoc") == 0) {  // /vol/aoc<DLC title id>/... (AOC_OpenTitle; any id: one DLC)
         size_t slash = p.find('/', 8);
         return config::aoc_dir + "/content" + (slash == std::string::npos ? "" : p.substr(slash));
     }

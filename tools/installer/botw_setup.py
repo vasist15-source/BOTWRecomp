@@ -50,14 +50,17 @@ GAME_COPY = os.path.join(SUPPORT, "game")
 APP_NAME = "Breath of the Wild.app"
 BUNDLE_ID = "local.botw-mac"  # same as tools/make_app.sh: settings kept by bundle id are shared
 
-# The Mac port is built for the USA release with update v208 (game version 1.5.0)
-TITLE_LOW = "101C9400"
-BASE_TID, UPDATE_TID, DLC_TID = "00050000" + TITLE_LOW, "0005000E" + TITLE_LOW, "0005000C" + TITLE_LOW
+# The Mac port runs update v208 (game version 1.5.0) of the USA or the European release. Their v208
+# updates ship the same U-King.rpx (RPX_SHA256), so the code translated from either runs both, and the
+# runtime tells the game its region from the dump (runtime/src/game_release.h). Europe is untested so far.
+RELEASES = {"101C9400": "USA", "101C9500": "Europe"}  # the title ID's low half -> release
+USA = "101C9400"
+OTHER_REGIONS = {"101C9300": "Japanese"}  # its v208 U-King.rpx is not known to be the same
 UPDATE_VERSION = 208
 DLC_LATEST = 80  # DLC v80: The Master Trials and The Champions' Ballad
 RPX_SHA256 = "ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30"  # U-King.rpx of v208
-OTHER_REGIONS = {"101C9500": "European", "101C9300": "Japanese"}
 KINDS = {"00050000": "base", "0005000E": "update", "0005000C": "dlc"}
+HIGH = {kind: hi for hi, kind in KINDS.items()}
 KIND_NAMES = {"base": "base game", "update": "update", "dlc": "DLC"}
 GEN_WEIGHT = 4.0  # compile time of a generated code file relative to a runtime source file
 FUNCS_PER_FILE = 30000  # as tools/probe_recomp.py; build/gen of the dev checkout uses the same
@@ -68,6 +71,11 @@ EST_COMPILE_CPU = 2600.0  # CPU seconds: the generated code ~2200, the runtime ~
 
 
 # ---------------------------------------------------------------- dump checks
+
+def title_id(kind, low):
+    """A title ID from its kind and low half: title_id("update", "101C9500") is 0005000E101C9500."""
+    return HIGH[kind] + low
+
 
 def read_title(d):
     """(title id, title version) of an extracted title folder, from code/app.xml (meta/meta.xml as fallback)."""
@@ -136,10 +144,12 @@ def check_title(path, kind):
     hi, lo = tid[:8], tid[8:]
     found = KINDS.get(hi)
     if lo in OTHER_REGIONS:
-        return fail("This is the %s release (title %s). The Mac port supports the USA release (%s) only for now."
-                    % (OTHER_REGIONS[lo], tid, BASE_TID), "Unsupported region")
-    if lo != TITLE_LOW:
+        return fail("This is the %s release (title %s). The Mac port supports the USA and European releases "
+                    "(%s, %s) only for now." % (OTHER_REGIONS[lo], tid, title_id("base", USA),
+                                                title_id("base", "101C9500")), "Unsupported region")
+    if lo not in RELEASES:
         return fail("This is not Breath of the Wild (title %s)." % tid, "Different game")
+    r["release"] = RELEASES[lo]
     if found != kind:
         return fail("This is the %s, not the %s. Choose it in the %s row." % (
             KIND_NAMES.get(found, "title " + tid), KIND_NAMES[kind], KIND_NAMES.get(found, "right")), "Wrong folder")
@@ -150,7 +160,12 @@ def check_title(path, kind):
         if missing:
             return fail("Files are missing: %s. The dump looks incomplete; dump or extract it again." % ", ".join(missing),
                         "Incomplete")
-        r.update(status="ok", title="Breath of the Wild (USA)", detail="Title %s" % tid)
+        r.update(status="ok", title="Breath of the Wild (%s)" % r["release"], detail="Title %s" % tid)
+        if lo != USA:
+            r["status"] = "warn"
+            r["messages"].append("The European release is new to the Mac port and not play-tested yet: please report "
+                                 "how it runs. The game starts in English; its other languages are in the game's "
+                                 "settings (Cmd+,), Language & About.")
     elif kind == "update":
         rpx = os.path.join(path, "code", "U-King.rpx")
         if ver != UPDATE_VERSION:
@@ -161,12 +176,13 @@ def check_title(path, kind):
         if file_sha256(rpx) != RPX_SHA256:
             return fail("code/U-King.rpx differs from the v208 game code (it may be modified or damaged). "
                         "Dump the update again; mods go in later, not into the dump.", "Unexpected game code")
-        r.update(status="ok", title="Version %d (game version 1.5.0)" % ver, detail="Title %s, game code verified" % tid)
+        r.update(status="ok", title="Version %d (game version 1.5.0)" % ver,
+                 detail="Title %s (%s), game code verified" % (tid, r["release"]))
     else:
         if not os.path.isdir(os.path.join(path, "content", "0010")):
             return fail("content/0010 is missing; the DLC dump looks incomplete.", "Incomplete")
         packs = [p for p, n in (("0010", "The Master Trials"), ("0011", "The Champions' Ballad")) if os.path.isdir(os.path.join(path, "content", p))]
-        r.update(status="ok", title="Version %s" % ver, detail="Title %s" % tid)
+        r.update(status="ok", title="Version %s" % ver, detail="Title %s (%s)" % (tid, r["release"]))
         if ver is not None and ver < DLC_LATEST:
             r["status"] = "warn"
             r["messages"].append("This is DLC v%d; v%d is the last one (with The Champions' Ballad). It may still work."
@@ -177,6 +193,37 @@ def check_title(path, kind):
     if r["status"] == "ok":
         r["size"] = folder_size(path)
     return r
+
+
+def same_release(titles):
+    """The base game, update and DLC must be of one release. A row of another release than the base game's
+    (the update's while no base game is chosen) becomes an error. titles: check_title results by kind."""
+    ref = next((titles[k] for k in ("base", "update") if k in titles and titles[k].get("release")
+                and titles[k]["status"] != "error"), None)
+    if not ref:
+        return titles
+    low = next(lo for lo, name in RELEASES.items() if name == ref["release"])
+    for kind in ("update", "dlc"):
+        r = titles.get(kind)
+        if not r or r is ref or r["status"] == "error" or r.get("release", ref["release"]) == ref["release"]:
+            continue
+        r.update(status="error", title="Another release")
+        r.pop("size", None)
+        adjective = {"Europe": "European"}
+        r["messages"] = ["This %s is from the %s release, but the %s is the %s one: choose the %s %s (title %s)." % (
+            KIND_NAMES[kind], adjective.get(r["release"], r["release"]), KIND_NAMES[ref["kind"]],
+            adjective.get(ref["release"], ref["release"]), adjective.get(ref["release"], ref["release"]),
+            KIND_NAMES[kind], title_id(kind, low))]
+    return titles
+
+
+def release_low(titles):
+    """The title ID's low half of the base game's release (the update's while no base game is chosen), else USA's."""
+    for kind in ("base", "update"):
+        r = titles.get(kind) or {}
+        if r.get("release") and r["status"] != "error":
+            return r["title_id"][8:]
+    return USA
 
 
 def folder_size(path):
@@ -199,9 +246,16 @@ def file_sha256(path):
 
 
 def scan(top, depth=4):
-    """Finds BotW title folders under top (an extracted dump, a folder of dumps or Cemu's mlc01)."""
-    found = {"base": [], "update": [], "dlc": []}
+    """Finds BotW title folders under top (an extracted dump, a folder of dumps or Cemu's mlc01) of one
+    release: the supported one with the most of base game, update and DLC (USA on a tie); the Japanese one
+    only when no other is there, so that the check says why it is refused."""
+    found = {}  # (kind, title low) -> folders
     top = os.path.abspath(top)
+    lows = list(RELEASES) + list(OTHER_REGIONS)
+
+    def add(kind, low, d):
+        if d not in found.setdefault((kind, low), []):
+            found[(kind, low)].append(d)
 
     def visit(d, level):
         try:
@@ -210,8 +264,8 @@ def scan(top, depth=4):
             return
         if os.path.isfile(os.path.join(d, "code", "app.xml")):
             tid, _ = read_title(d)
-            if tid and tid[8:] == TITLE_LOW and tid[:8] in KINDS:
-                found[KINDS[tid[:8]]].append(d)
+            if tid and tid[8:] in lows and tid[:8] in KINDS:
+                add(KINDS[tid[:8]], tid[8:], d)
             return
         if level >= depth:
             return
@@ -226,17 +280,25 @@ def scan(top, depth=4):
     # Cemu: mlc01/usr/title/<hi>/<lo>
     mlc = os.path.join(top, "usr", "title")
     if os.path.isdir(mlc):
-        for hi, kind in KINDS.items():
-            p = os.path.join(mlc, hi.lower(), TITLE_LOW.lower())
-            if os.path.isdir(p) and p not in found[kind]:
-                found[kind].append(p)
-    return {k: (v[0] if v else "") for k, v in found.items()}
+        for low in lows:
+            for hi, kind in KINDS.items():
+                p = os.path.join(mlc, hi.lower(), low.lower())
+                if os.path.isdir(p):
+                    add(kind, low, p)
+
+    def rank(low):
+        kinds = [k for k in KINDS.values() if (k, low) in found]
+        return bool(kinds), low in RELEASES, "base" in kinds and "update" in kinds, len(kinds), low == USA
+    best = max(lows, key=rank)
+    return {k: found.get((k, best), [""])[0] for k in KINDS.values()}
 
 
 # ---------------------------------------------------------------- saves
 
-def save_user_dir(path):
-    """The folder that holds the save slots (0..5, option.sav): Cemu's user/80000001 or what leads to it."""
+def save_user_dir(path, prefer=USA):
+    """The folder that holds the save slots (0..5, option.sav): Cemu's user/80000001 or what leads to it.
+    The USA and European releases keep the same save files; of a Cemu mlc01 with both, `prefer`'s (the
+    title ID's low half of the game's release) is taken."""
     def is_user(d):
         if not os.path.isdir(d):
             return False
@@ -244,12 +306,13 @@ def save_user_dir(path):
             return True
         return any(os.path.isfile(os.path.join(d, str(i), "game_data.sav")) for i in range(6))
 
-    cands = [path,
-             os.path.join(path, "user"),
-             os.path.join(path, "usr", "save", "00050000", TITLE_LOW.lower(), "user"),
-             os.path.join(path, "save", "00050000", TITLE_LOW.lower(), "user"),
-             os.path.join(path, "00050000", TITLE_LOW.lower(), "user"),
-             os.path.join(path, TITLE_LOW.lower(), "user")]
+    cands = [path, os.path.join(path, "user")]
+    for low in [prefer] + [lo for lo in RELEASES if lo != prefer]:
+        low = low.lower()
+        cands += [os.path.join(path, "usr", "save", "00050000", low, "user"),
+                  os.path.join(path, "save", "00050000", low, "user"),
+                  os.path.join(path, "00050000", low, "user"),
+                  os.path.join(path, low, "user")]
     for c in cands:
         if is_user(c):
             return c
@@ -260,20 +323,22 @@ def save_user_dir(path):
     return None
 
 
-def check_save(path):
+def check_save(path, prefer=USA):
     r = {"kind": "save", "path": path or "", "status": "empty", "title": "Optional", "detail": "", "messages": []}
     if not path:
         return r
     if not os.path.isdir(path):
         r.update(status="error", title="Not a folder")
-        r["messages"].append("Choose the save folder, for example Cemu's mlc01/usr/save/00050000/101c9400/user/80000001.")
+        r["messages"].append("Choose the save folder, for example Cemu's mlc01/usr/save/00050000/101c9400/user/80000001 "
+                             "(101c9500 for the European release).")
         return r
     path = os.path.abspath(path)
-    u = save_user_dir(path)
+    u = save_user_dir(path, prefer)
     if not u:
         r.update(status="error", title="No save found")
         r["messages"].append("No Breath of the Wild save is in this folder (no option.sav and no 0..5 slots with "
-                             "game_data.sav). In Cemu it is mlc01/usr/save/00050000/101c9400/user/80000001.")
+                             "game_data.sav). In Cemu it is mlc01/usr/save/00050000/101c9400/user/80000001 "
+                             "(101c9500 for the European release).")
         return r
     slots, newest = [], 0
     for i in range(6):
@@ -565,18 +630,17 @@ class Installer:
         a = self.args
         self.step("check")
         problems = []
-        for kind, path in (("base", a.base), ("update", a.update), ("dlc", a.dlc)):
-            if kind == "dlc" and not path:
-                continue
-            r = check_title(path, kind)
+        titles = same_release({kind: check_title(path, kind) for kind, path in
+                               (("base", a.base), ("update", a.update), ("dlc", a.dlc)) if path or kind != "dlc"})
+        for kind, r in titles.items():
             if r["status"] == "error" or r["status"] == "empty":
                 problems.append("%s: %s" % (KIND_NAMES[kind].capitalize(), " ".join(r["messages"]) or r["title"]))
             else:
-                self.log("%s: %s (%s)" % (KIND_NAMES[kind], r["title"], path))
+                self.log("%s: %s (%s)" % (KIND_NAMES[kind], r["title"], r["path"]))
                 for m in r["messages"]:
                     self.log("  note: " + m)
         if a.save:
-            r = check_save(a.save)
+            r = check_save(a.save, release_low(titles))
             if r["status"] == "error":
                 problems.append("Save: " + " ".join(r["messages"]))
             else:
@@ -981,10 +1045,8 @@ def main(argv):
     if a.cmd == "scan":
         out(scan(a.dir))
     elif a.cmd == "check":
-        res = {}
-        for kind in ("base", "update", "dlc"):
-            res[kind] = check_title(getattr(a, kind), kind)
-        res["save"] = check_save(a.save)
+        res = same_release({kind: check_title(getattr(a, kind), kind) for kind in ("base", "update", "dlc")})
+        res["save"] = check_save(a.save, release_low(res))
         res["existing_save"] = existing_save()
         out(res)
     elif a.cmd == "requirements":
