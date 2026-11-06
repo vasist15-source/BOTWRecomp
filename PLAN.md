@@ -436,6 +436,34 @@ change is in the merged files (3 actors, 5 map entries, 2 shop items, 11 drop ta
 1 status effect, 2 static entries, 1 shrine entrance). No per-frame work; frame time and CPU % not measured. Not
 play-tested yet.
 
+### 2026-11-07: release 0.2.0: the mod loader (Settings > Mods), archives as downloaded, the installer kept for Rebuild
+BOTWRecomp 0.2.0 (tag v0.2.0 at e92eb02, BOTWRecomp-0.2.0.dmg 6,231,356 bytes, SHA-256
+ceeede58765aa8ae316f4e7e19a4ff5bd358ee843af1058dfe0ce83720485e9c) has everything since 0.1.8: the cheats, controllers back
+at once after Settings, the European release (untested), and Settings > Mods with content mods, BCML mods and their
+options, every BCML merge log, code mods, Restart now. Two changes came from checking the player's path:
+- The installer's files are kept: a release copies its Resources/botwrecomp (botw_setup.py, the translator, the kit; 15 MB)
+  to `~/Library/Application Support/BotW/installer`, and install.plist's `source` names that copy. Before, it named the
+  installer app where it ran (on the DMG, or Gatekeeper's translocated copy), so an installed app's Rebuild the game code
+  (code mods) failed once the DMG was ejected. The kit compile's stamp hashes the flags and the kit's headers instead of
+  the kit's path, so a kept build survives a new mount point and the Rebuild compiles only what changed.
+- `.zip`, `.7z` and `.rar` files in the Mods folder are unpacked at startup with `/usr/bin/tar`, as `.bnp` files are
+  (`Mods unpacked/<stem>-<ext>-<size>-<time>`), and read as a folder; one `.bnp` inside an archive is unpacked too
+  (`<archive's folder>/.bnp`). Code patches inside an archive are not used (mods::patches and the translator read pack
+  folders): a code-only pack is refused, one with content gets a warning. Mods packaged for UKMM (`meta.yml` with
+  `manifest.yml`, its own resource format) are refused by name. An unpack failure is kept for later scans of that file.
+Checked: ctest 120 of 130 (the 10 known failures: mod_content_fs_off/on, language_sources and pad_delivery don't link,
+`hle_traced`; build_coverage, guest_png, perf_metrics, catalogue_pilots, guest_original_art, setup_code_mods);
+content_merge_test --dump with the user's Mods folder (Linkle 3.0.1 with both options, Gerudo Hero): 146 archives merged in
+1.29 s, 398 MB peak, 5 ms from the cache, no size entry smaller than its file, every logged change present; the same two
+mods as a .zip and as a .bnp in a .7z merge the same (unpacked in 0.95 s). The system tar (macOS 27, libarchive 3.7.4,
+empty environment) unpacks the user's .bnp, a RAR5 and a 7-Zip download. The player's path from the DMG, mounted
+read-only, in a scratch home with an empty environment: install with Day Time in the Mods folder (translation 114 s, 307
+files compiled in 253 s), DMG detached, then the game's own Rebuild command with Camera Sensitivity added: it ran from the
+kept copy, compiled 4 of 307 files and replaced the app in 1:50, and the new binary's manifest has both packs.
+Released without a play-test of the release build, at the user's word (2026-11-07). Content mods, BCML options, the
+part 1 merges and code mods were play-tested on dev builds (entries above); archives, the part 2 merges and a Rebuild from
+the kept installer copy have not been played yet. The release build is installed in /Applications.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
