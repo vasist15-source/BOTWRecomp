@@ -78,7 +78,6 @@ std::atomic<bool> g_perf{false};
 std::atomic<bool> g_metal_hud{false};
 PerfAverage g_average;
 std::atomic<float> g_density{1.0f};
-std::atomic<bool> g_wait_release{false};  // just closed: the game sees no buttons until all are released
 std::atomic<double> g_last_frame{0};      // frame() ran (alive(): the game's text prompt can show)
 const bool g_no_host = getenv("WWHD_NO_HOST_INPUT") != nullptr;  // test runs ignore the user's input
 // ... except keys a test posts itself (WWHD_TEST_POST_KEYS, gfx/input.mm; the hidden test window never
@@ -444,7 +443,6 @@ void read_controller() {
     std::copy(std::begin(U.values), std::end(U.values), std::begin(U.prev));
     if (g_no_host) {
         std::fill(std::begin(U.values), std::end(U.values), 0.0f);
-        if (g_wait_release.load()) g_wait_release = false;
         return;
     }
     input::host_controller_values(U.values);
@@ -468,11 +466,6 @@ void read_controller() {
     } else {
         U.options_since = -1;
         U.options_latched = false;
-    }
-    if (g_wait_release.load()) {
-        bool any = false;
-        for (int p = 1; p < kPadCount; p++) any |= U.values[p] > 0.3f;
-        if (!any) g_wait_release = false;
     }
 }
 
@@ -940,9 +933,10 @@ void apply_capture() {
     }
     if (!done && now_s() - U.cap_started > 8) done = true;  // nothing pressed: give up
     if (done) {
+        // the controller input just assigned was pressed while the menu had the input: it stays from
+        // the game until released (gfx/input.mm's release gates, release_gate.h)
         U.cap_action = -1;
         g_capturing_keys = false;
-        g_wait_release = true;  // the controller input just assigned does not also act in the menu
     }
 }
 
@@ -1951,7 +1945,6 @@ void set_open(bool open) {
     if (g_open.exchange(open) == open) return;
     for (auto& k : g_held_keys) k = false;
     input::release_keys();  // keys held now belong to the menu (opening) or are not stuck in the game (closing)
-    if (!open) g_wait_release = true;
     if (open) {
         mods::fast_forward_reset();
         mods::mouse_release();
@@ -1959,7 +1952,10 @@ void set_open(bool open) {
     }
     LOG("[overlay] %s", open ? "opened" : "closed");
 }
-bool blocks_input() { return captures() || g_wait_release.load(std::memory_order_relaxed); }
+// controller inputs still held when the overlay closes stay from the game in the host's input pump, each
+// until released (gfx/input.mm, release_gate.h); keys held then were released by set_open, and their
+// repeats press nothing
+bool blocks_input() { return captures(); }
 bool captures() { return is_open() || text_entry::active(); }
 bool alive() { return now_s() - g_last_frame.load(std::memory_order_relaxed) < 1.0; }
 bool perf_shown() { return g_perf.load(std::memory_order_relaxed); }
@@ -2181,9 +2177,8 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         std::copy(std::begin(U.values), std::end(U.values), pad);
         if (g_no_host) test_pad(pad);  // WWHD_TEST_PAD drives the on-screen keyboard in test runs
         if (text_entry::draw(pad)) {
-            // answered: the game sees no buttons until the one that confirmed is released
+            // answered: the button that confirmed stays from the game until released (release_gate.h)
             for (auto& k : g_held_keys) k = false;
-            g_wait_release = true;
         }
     }
     if (perf) perf_window(open);

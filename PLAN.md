@@ -176,6 +176,20 @@ installs re-translate (`recomp_stamp`, the kit lists the new file). Play-tested 
 last arrow of a kind (still used up, as with the pack). Frame time / CPU % not measured (11 sites,
 none in per-frame code with the cheats off beyond a byte load and a branch).
 
+### 2026-11-06: controllers back at once after the settings menu (upstream #153)
+Closing Settings (or answering the text prompt) kept every game input, keyboard included, until every
+input of every controller read 0.3 or less (`g_wait_release`): a trigger or stick resting above that
+left the game without input until the pad was unplugged, and a button held on one pad held back the
+same button on another. Ported upstream WWHD's per-device release gate (003465b4, 7fa8823a;
+`overlay/release_gate.h`): `gfx/input.mm` reads each GCController on its own and gives each a gate, so
+only the inputs held while the overlay had the input stay from the game, each until it reads 0.5 or
+less (the game's press threshold), and everything else reaches it at once; a controller missing from
+a poll loses its gate. `overlay::blocks_input()` is `captures()` now, so the gyro no longer waits
+either. The overlay's navigation and the Controls window still read the ungated values.
+`release_gate_test` (ctest `overlay_release_gate`) passes; play-tested by the user (2026-11-06): works.
+The SDL host (`platform/input_sdl.cpp`, Vulkan-only builds, not ours) is not gated: it now has no
+release wait at all (upstream's commits have that half).
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

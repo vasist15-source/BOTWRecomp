@@ -23,6 +23,7 @@
 #include "../true60.h"
 #include "../motion/motion.h"
 #include "../overlay/overlay.h"
+#include "../overlay/release_gate.h"
 #include "../mouse_look.h"
 
 #include <memory>
@@ -56,33 +57,51 @@ static PadState keyboard_state(bool use_host) {
     return input_map::keyboard_state(input_map::current(), keys);
 }
 
-// every mappable controller input, 0..1, the strongest over all connected controllers
-void controller_values(float* v) {
+// every mappable controller input of one controller, 0..1; false: not a gamepad
+static bool device_values(GCController* c, float* v) {
     using namespace input_map;
     for (int i = 0; i < kPadCount; i++) v[i] = 0;
     auto put = [&](int p, float x) { if (x > v[p]) v[p] = x; };
+    GCExtendedGamepad* g = c.extendedGamepad;
+    if (!g) return false;
+    // Nintendo pads report their printed letters as A/B/X/Y; Pad inputs are positions (upstream #181)
+    const auto layout = input_map::apple_face_layout(c.productCategory.UTF8String, c.vendorName.UTF8String);
+    auto b = [&](GCControllerButtonInput* in, int p) {
+        if (in) put(apple_face_input(layout, p), in.isPressed ? std::max(in.value, 0.51f) : std::min(in.value, 0.5f));
+    };
+    b(g.buttonA, kPadA); b(g.buttonB, kPadB); b(g.buttonX, kPadX); b(g.buttonY, kPadY);
+    b(g.leftShoulder, kPadLB); b(g.rightShoulder, kPadRB);
+    b(g.leftTrigger, kPadLT); b(g.rightTrigger, kPadRT);
+    b(g.buttonMenu, kPadMenu); b(g.buttonOptions, kPadOptions); b(g.buttonHome, kPadHome);
+    b(g.leftThumbstickButton, kPadL3); b(g.rightThumbstickButton, kPadR3);
+    b(g.dpad.up, kPadDUp); b(g.dpad.down, kPadDDown); b(g.dpad.left, kPadDLeft); b(g.dpad.right, kPadDRight);
+    auto stick = [&](GCControllerDirectionPad* d, int up, int down, int left, int right) {
+        float x = d.xAxis.value, y = d.yAxis.value;
+        put(right, std::max(x, 0.f)); put(left, std::max(-x, 0.f));
+        put(up, std::max(y, 0.f)); put(down, std::max(-y, 0.f));
+    };
+    stick(g.leftThumbstick, kPadLSUp, kPadLSDown, kPadLSLeft, kPadLSRight);
+    stick(g.rightThumbstick, kPadRSUp, kPadRSDown, kPadRSLeft, kPadRSRight);
+    return true;
+}
+
+// each connected controller's values, keyed by the controller: a reconnected one is a new object
+static std::vector<std::pair<uintptr_t, overlay::PadValues>> devices_values() {
+    std::vector<std::pair<uintptr_t, overlay::PadValues>> out;
     for (GCController* c in [GCController controllers]) {
-        GCExtendedGamepad* g = c.extendedGamepad;
-        if (!g) continue;
-        // Nintendo pads report their printed letters as A/B/X/Y; Pad inputs are positions (upstream #181)
-        const auto layout = input_map::apple_face_layout(c.productCategory.UTF8String, c.vendorName.UTF8String);
-        auto b = [&](GCControllerButtonInput* in, int p) {
-            if (in) put(apple_face_input(layout, p), in.isPressed ? std::max(in.value, 0.51f) : std::min(in.value, 0.5f));
-        };
-        b(g.buttonA, kPadA); b(g.buttonB, kPadB); b(g.buttonX, kPadX); b(g.buttonY, kPadY);
-        b(g.leftShoulder, kPadLB); b(g.rightShoulder, kPadRB);
-        b(g.leftTrigger, kPadLT); b(g.rightTrigger, kPadRT);
-        b(g.buttonMenu, kPadMenu); b(g.buttonOptions, kPadOptions); b(g.buttonHome, kPadHome);
-        b(g.leftThumbstickButton, kPadL3); b(g.rightThumbstickButton, kPadR3);
-        b(g.dpad.up, kPadDUp); b(g.dpad.down, kPadDDown); b(g.dpad.left, kPadDLeft); b(g.dpad.right, kPadDRight);
-        auto stick = [&](GCControllerDirectionPad* d, int up, int down, int left, int right) {
-            float x = d.xAxis.value, y = d.yAxis.value;
-            put(right, std::max(x, 0.f)); put(left, std::max(-x, 0.f));
-            put(up, std::max(y, 0.f)); put(down, std::max(-y, 0.f));
-        };
-        stick(g.leftThumbstick, kPadLSUp, kPadLSDown, kPadLSLeft, kPadLSRight);
-        stick(g.rightThumbstick, kPadRSUp, kPadRSDown, kPadRSLeft, kPadRSRight);
+        overlay::PadValues d;
+        if (device_values(c, d.data())) out.emplace_back((uintptr_t)(__bridge void*)c, d);
     }
+    return out;
+}
+
+// every mappable controller input, 0..1, the strongest over all connected controllers (ungated: the
+// Controls window reads it)
+void controller_values(float* v) {
+    using namespace input_map;
+    for (int i = 0; i < kPadCount; i++) v[i] = 0;
+    for (const auto& [id, d] : devices_values())
+        for (int p = 0; p < kPadCount; p++) v[p] = std::max(v[p], d[p]);
 }
 
 // ---- the labels printed on a pad's face buttons (issue #78's Automatic preset)
@@ -393,9 +412,14 @@ void init() {
     note_dominant_labels();
     // GameController values are polled on the main thread
     [NSTimer scheduledTimerWithTimeInterval:1.0 / 240 repeats:YES block:^(NSTimer*) {
-        float v[input_map::kPadCount];
-        controller_values(v);
-        PadState s = input_map::controller_state(input_map::current(), v);
+        // v: every controller combined, as the settings overlay reads it; game: the same with each
+        // controller's inputs that were held while the overlay or the text prompt had the input left out
+        // until released, one gate per controller (overlay/release_gate.h, upstream #153). The overlay
+        // polls the Home / Select shortcut on its frame, from v, after this poll saw the press as captured.
+        float v[input_map::kPadCount], game[input_map::kPadCount];
+        static overlay::DeviceGates<uintptr_t> gates;
+        gates.combine(devices_values(), overlay::captures(), v, game);
+        PadState s = input_map::controller_state(input_map::current(), game);
         {
             std::lock_guard<std::mutex> lk(g_mu);
             g_pad = s;
@@ -410,14 +434,14 @@ void init() {
                 std::lock_guard<std::mutex> lk(g_mu);
                 std::copy(g_keys, g_keys + 256, keys);
             }
-            motion::poll_recalibrate(v, keys);
-            screenshot::poll_controller(v);  // a controller input bound to Screenshot
+            motion::poll_recalibrate(game, keys);
+            screenshot::poll_controller(game);  // a controller input bound to Screenshot
             // controller inputs bound to quick select step it once per press
             static bool quick_held[2] = {};
             const input_map::Mapping m = input_map::current();
             for (int i = 0; i < 2; i++) {
                 const int p = m.pad[i ? input_map::kQuickNext : input_map::kQuickPrev];
-                const bool held = p != input_map::kPadNone && v[p] > 0.5f;
+                const bool held = p != input_map::kPadNone && game[p] > 0.5f;
                 if (held && !quick_held[i]) mouse_look::quick_step(i ? 1 : -1);
                 quick_held[i] = held;
             }
