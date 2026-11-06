@@ -334,6 +334,8 @@ void set_pro_controller(bool on) {
 }
 const char* name() { return "SDL"; }
 void set_clipboard(const std::string& text) { SDL_SetClipboardText(text.c_str()); }
+bool can_restart() { return false; }  // no prompt to ask first on this host yet
+void restart_game() {}
 #ifdef __ANDROID__
 bool can_open_folder() { return false; }  // app-private storage: no file manager shows it
 void open_folder(const std::string&) {}

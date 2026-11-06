@@ -1825,7 +1825,11 @@ void tab_mods() {
         ImGui::SameLine();
     }
     if (ImGui::Button("Look for new mods")) mods::loader::rescan();
-    if (mods::loader::restart_needed()) warn("Restart the game to apply these changes.");
+    if (mods::loader::restart_needed()) {
+        warn("Restart the game to apply these changes.");
+        // asks first while a game is in progress, as Quit does (gfx/quit_prompt.mm)
+        if (hostui::can_restart() && primary_button("Restart now")) hostui::post([] { hostui::restart_game(); });
+    }
     const std::string summary = mods::loader::summary();
     if (!summary.empty()) note("This start: %s", summary.c_str());
     note("Mods higher in the list win where two change the same file. Archives that several mods change are "

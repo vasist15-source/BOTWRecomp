@@ -50,6 +50,10 @@ void set_pro_controller(bool on);  // Input: keyboard and controllers act as a P
 
 const char* name();                // "AppKit" or "SDL"
 void set_clipboard(const std::string& text);  // main thread: put text on the system clipboard
+bool can_restart();                // restart_game works on this host (macOS)
+// main thread: quit and start the game again with the same arguments (Settings > Mods > Restart now);
+// while a game is in progress it asks first, as Quit does
+void restart_game();
 bool can_open_folder();            // open_folder works on this host (not on Android)
 void open_folder(const std::string& path);    // main thread: show a folder in the file manager (Finder, Explorer, ...)
 

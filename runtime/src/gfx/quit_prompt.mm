@@ -5,7 +5,8 @@
 //   Cancel               keeps playing (Esc)
 //   (Save State and Quit, slot 1 then quit: not offered until save states run in BotW; save_and_quit is kept)
 // Before that (boot, title screen, file select) and in test runs nothing asks (quit_prompt.h decides).
-// Closing the GamePad window still only hides it.
+// Closing the GamePad window still only hides it. Settings > Mods > Restart now asks the same way
+// ("Restart Breath of the Wild?"), then starts the game again (request_restart).
 //
 // Test aids: WWHD_TEST_QUIT_ANSWER=quit|cancel|save shows the prompt also in scripted runs and answers
 // it after 1.5 s; WWHD_TEST_CLOSE_TV_AT=frame closes the TV window (its close button) at that frame.
@@ -121,6 +122,44 @@ void ask() {
     });
 }
 
+// Restart (Settings > Mods > Restart now): render::restart() does what quitting does (render::shutdown:
+// the audio dump, screenshots, the renderer's caches; settings, mods.json and saves are written when they
+// change), then starts this executable again with the same arguments (execv: the same log and folders)
+void restart_now() {
+    LOG("[quit] restarting the game");
+    render::restart();  // returns only when the game could not start again
+    LOG("[quit] the restart failed; quitting instead");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSAlert* a = [NSAlert new];
+        a.messageText = @"Breath of the Wild could not start again.";
+        a.informativeText = @"It quits now. Open it again to start with the changes.";
+        a.alertStyle = NSAlertStyleWarning;
+        [a addButtonWithTitle:@"Quit"];
+        [a runModal];
+        quit_now();
+    });
+}
+
+void ask_restart() {
+    LOG("[quit] asking before restarting");
+    NSAlert* a = [NSAlert new];
+    a.messageText = @"Restart Breath of the Wild?";
+    a.informativeText = @"Progress since your last in-game save is lost.";
+    a.alertStyle = NSAlertStyleWarning;
+    [a addButtonWithTitle:@"Restart"];  // default (Return)
+    [a addButtonWithTitle:@"Cancel"];   // Esc
+    g_asking = true;
+    [a beginSheetModalForWindow:g_tv completionHandler:^(NSModalResponse r) {
+        g_asking = false;
+        if (r == NSAlertFirstButtonReturn) {
+            LOG("[quit] answer: Restart");
+            restart_now();
+        } else {
+            LOG("[quit] answer: Cancel; the game keeps running");
+        }
+    }];
+}
+
 // a quit request: true if the app may terminate now
 bool quit_request(const char* from) {
     quitprompt::Request r = request();
@@ -165,6 +204,21 @@ bool quit_request(const char* from) {
 
 namespace gfx {
 Class tv_window_class() { return [WWTvWindow class]; }
+
+// hostui::restart_game (main thread): asks as a quit request does (while a game is in progress, one
+// prompt at a time), then restarts
+void request_restart() {
+    if (g_confirmed) return;  // already quitting
+    quitprompt::Request r = request();
+    switch (quitprompt::decide(r)) {
+    case quitprompt::Action::Quit:
+        LOG("[quit] restart (%s)", !r.game_window ? "game not started" : !r.gameplay ? "no game in progress" : "test run");
+        restart_now();
+        return;
+    case quitprompt::Action::Ignore: return;
+    case quitprompt::Action::Ask: ask_restart(); return;
+    }
+}
 
 // with the windows (display.mm): the TV window's delegate and the application's
 void install_quit_prompt(NSWindow* tv) {
