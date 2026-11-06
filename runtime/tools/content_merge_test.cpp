@@ -3,6 +3,7 @@
 // the loader's startup, settings and cache (mods/mod_loader.h).
 //   content_merge_test WORK            all tests (WORK is emptied)
 //   content_merge_test WORK --reuse T  (run by the test itself) a second start must take the cached merge
+//   content_merge_test WORK --options TABLE  (run by the test itself) a start with other BCML options
 //   content_merge_test --dump GAME BASE AOC MODS   by hand: the loader on a real dump and Mods folder; every
 //                      merged archive is read back (BOTW_MODS_DIR=MODS; its cache is MODS/../Mods cache)
 #include <cassert>
@@ -535,16 +536,48 @@ void test_layouts(const fs::path& root) {
     put(root / "unpacked-bnp/logs/gamedata.yml", "flags");  // merge data the loader can't apply
     l = loader::detect(root / "unpacked-bnp", usa);
     assert(l.problem.find("gamedata.yml") != std::string::npos && l.problem.find("deepmerge.aamp") == std::string::npos);
+    // options as BCML's dev tools write them: switches ("multi", with a default) and groups ("single": one
+    // choice, none unless required; no defaults, but a hand-written one is taken)
     put(root / "options-bnp/content/a", "a");
-    put(root / "options-bnp/info.json", "{\"name\": \"With options\", \"options\": {\"multi\": [{\"name\": \"Extra\", \"folder\": \"Extra\", "
-                                          "\"default\": true}, {\"name\": \"Off\", \"folder\": \"Off\", \"default\": false}, {\"name\": \"Bad\", "
-                                          "\"folder\": \"Bad\", \"default\": true}]}}");
-    put(root / "options-bnp/options/Extra/content/b", "b");
-    put(root / "options-bnp/options/Off/content/c", "c");
+    put(root / "options-bnp/info.json", R"({"name": "With options", "options": {
+        "multi": [{"name": "Extra", "desc": "More things", "folder": "Extra", "default": true},
+                  {"name": "Off", "folder": "Off", "default": false}, {"name": "Bad", "folder": "Bad", "default": true},
+                  {"name": "Gone", "folder": "Gone"}, {"name": "Outside", "folder": "../options-bnp/options/Off"}],
+        "single": [{"name": "Colour", "desc": "Pick one", "required": true,
+                    "options": [{"name": "Red", "folder": "Red"}, {"name": "Blue", "folder": "Blue"}, {"name": "Again", "folder": "Extra"}]},
+                   {"name": "Missing", "required": true, "options": [{"name": "Nowhere", "folder": "Nowhere"}]},
+                   {"name": "Hat", "required": false,
+                    "options": [{"name": "Cap", "folder": "Cap"}, {"name": "Crown", "folder": "Crown", "default": true}]}]}})");
+    for (const char* o : {"Extra", "Off", "Red", "Blue", "Cap", "Crown"}) put(root / "options-bnp/options" / o / "content/b", o);
     put(root / "options-bnp/options/Bad/logs/texts.json", "{}");
     l = loader::detect(root / "options-bnp", usa);
-    assert(l.kind == "BCML mod" && l.problem.empty() && l.options.size() == 2 && l.options[0].on && !l.options[1].on);
-    assert(l.warning.find("Extra") != std::string::npos && l.warning.find("Off") != std::string::npos && l.warning.find("Bad") != std::string::npos);
+    assert(l.kind == "BCML mod" && l.problem.empty() && l.options.size() == 6 && l.groups.size() == 2);
+    const char* const keys[] = {"Extra", "Off", "Red", "Blue", "Cap", "Crown"};
+    const int groups[] = {-1, -1, 0, 0, 1, 1};
+    for (size_t k = 0; k < 6; k++)
+        assert(l.options[k].key == keys[k] && l.options[k].name == keys[k] && l.options[k].group == groups[k] &&
+               l.options[k].folder == root / "options-bnp/options" / keys[k]);
+    assert(l.options[0].by_default && !l.options[1].by_default && l.options[0].description == "More things");
+    assert(l.groups[0].name == "Colour" && l.groups[0].required && l.groups[0].description == "Pick one");
+    assert(l.groups[1].name == "Hat" && !l.groups[1].required);  // Missing: no option left
+    assert(l.warning.find("Bad") != std::string::npos && l.warning.find("Extra") == std::string::npos && l.warning.find("Off") == std::string::npos);
+    // what a start uses: saved choices over the defaults, one per group
+    using Saved = std::map<std::string, bool>;
+    auto uses = [&](const Saved& saved) {
+        const std::vector<bool> on = loader::chosen(l, saved);
+        assert(on.size() == l.options.size());
+        std::string out;
+        for (size_t k = 0; k < on.size(); k++)
+            if (on[k]) out += (out.empty() ? "" : " ") + l.options[k].key;
+        return out;
+    };
+    assert(uses({}) == "Extra Red Crown");  // a required group without a default: its first
+    assert(uses({{"Extra", false}, {"Off", true}, {"Unknown", true}}) == "Off Red Crown");
+    assert(uses({{"Red", false}, {"Blue", true}}) == "Extra Blue Crown");
+    assert(uses({{"Red", false}, {"Blue", false}}) == "Extra Red Crown");  // required: never none
+    assert(uses({{"Cap", false}, {"Crown", false}}) == "Extra Red");       // None chosen
+    assert(uses({{"Cap", true}, {"Crown", false}}) == "Extra Red Cap");
+    assert(uses({{"Blue", true}, {"Red", true}}) == "Extra Red Crown");  // hand-edited: the first one
     put(root / "packs-only/content/Actor/Pack/A.sbactorpack", "x");  // only the list of its packs: usable
     put(root / "packs-only/logs/packs.json", "{}");
     assert(loader::detect(root / "packs-only", usa).problem.empty());
@@ -554,6 +587,12 @@ void test_layouts(const fs::path& root) {
 
 // ---------------------------------------------------------------- the loader
 std::string guest_of(const char* p) { return std::string("/vol/content/") + p; }
+loader::ModView options_mod() {
+    for (const auto& m : loader::list())
+        if (m.id == "f-options") return m;
+    assert(!"f-options is listed");
+    return {};
+}
 
 void setup_loader(const fs::path& root) {
     config::game_dir = (root / "game/update").string();
@@ -581,12 +620,21 @@ void test_loader(const fs::path& root, const char* self) {
                              "\" content logs info.json options 2>/dev/null";
     const bool with_bnp = std::system(make.c_str()) == 0;
     if (!with_bnp) fprintf(stderr, "content merge: this tar can't write 7z; the .bnp part is skipped\n");
+    // f-options: an unpacked BCML mod with a switch (off by default) and a required group (Red at first);
+    // Blue has its own sizes
+    put(mods / "f-options/content/Loose/Options.bin", "options mod");
+    put(mods / "f-options/info.json", R"({"name": "Options Mod", "options": {"multi": [{"name": "Switch", "folder": "Switch", "default": false}],
+        "single": [{"name": "Colour", "required": true, "options": [{"name": "Red", "folder": "Red"}, {"name": "Blue", "folder": "Blue"}]}]}})");
+    put(mods / "f-options/options/Switch/content/Loose/Switch.bin", "switch");
+    put(mods / "f-options/options/Red/content/Loose/Colour.bin", "red");
+    put(mods / "f-options/options/Blue/content/Loose/Colour.bin", "blue");
+    put(mods / "f-options/options/Blue/logs/rstb.json", "{\"Loose/Colour.bin\": 4321}");
     put(root / "save/user/1/game_data.sav", "save data");
     setup_loader(root);
     loader::startup();
     // new mods are listed first, in name order: b-cemu wins over c-plain
     const auto list = loader::list();
-    assert(list.size() == (with_bnp ? 4 : 3) && list[0].id == "b-cemu" && list[0].name == "Big Pack" && list[0].active && list[0].enabled);
+    assert(list.size() == (with_bnp ? 5 : 4) && list[0].id == "b-cemu" && list[0].name == "Big Pack" && list[0].active && list[0].enabled);
     assert(list[1].id == "c-plain" && list[1].active && list[2].id == "d-switch" && !list[2].problem.empty() && !list[2].active);
     if (with_bnp) {  // unpacked next to the merge caches; its default option is used
         assert(list[3].id == "e-bnp.bnp" && list[3].name == "Bnp Mod" && list[3].kind == "BCML mod (.bnp)" && list[3].active);
@@ -624,10 +672,44 @@ void test_loader(const fs::path& root, const char* self) {
     assert(loader::list()[0].id == "a-new" && loader::list()[0].enabled && loader::restart_needed());
     loader::set_enabled("a-new", false);
     assert(!loader::restart_needed());
-    // a second start with the same mods takes the merged files from the cache
+    // options: BCML's defaults at first, a group's choice merged over the mod
+    {
+        const loader::ModView f = options_mod();
+        assert(f.kind == "BCML mod" && f.name == "Options Mod" && f.active && f.groups.size() == 1 && f.groups[0].required);
+        assert(f.options.size() == 3 && f.options[0].key == "Switch" && f.options[0].group == -1 && !f.options[0].on && !f.options[0].active);
+        assert(f.options[1].key == "Red" && f.options[1].on && f.options[1].active && f.options[1].files == 1 && f.options[1].used == 1);
+        assert(f.options[2].key == "Blue" && f.options[2].group == 0 && !f.options[2].on && !f.options[2].active);
+        assert(text(get(loader::replacement(guest_of("Loose/Options.bin")))) == "options mod");
+        assert(text(get(loader::replacement(guest_of("Loose/Colour.bin")))) == "red" && loader::replacement(guest_of("Loose/Switch.bin")).empty());
+    }
+    const fs::path settings = root / "user/mods.json";
+    loader::set_option("f-options", "Switch", true);  // saved, for the next start
+    assert(loader::restart_needed() && options_mod().options[0].on && !options_mod().options[0].active);
+    assert(text(get(settings)).find("\"id\":\"f-options\",\"options\":{\"Switch\":true}") != std::string::npos);
+    loader::set_option("f-options", "Switch", false);
+    assert(!loader::restart_needed());
+    loader::set_option("f-options", "Blue", true);  // the group's other option goes off
+    assert(loader::restart_needed() && !options_mod().options[1].on && options_mod().options[2].on);
+    loader::set_option("f-options", "Blue", false);  // a required group keeps its choice
+    assert(options_mod().options[2].on);
+    loader::set_option("f-options", "Red", true);
+    loader::set_option("f-options", "Unknown", true);
+    assert(!loader::restart_needed() && options_mod().options[1].on && !options_mod().options[2].on);
+    loader::set_enabled("f-options", false);  // a mod that is off: its options don't matter
+    loader::set_option("f-options", "Switch", true);
+    assert(loader::restart_needed());
+    loader::set_option("f-options", "Switch", false);
+    loader::set_enabled("f-options", true);
+    assert(!loader::restart_needed());
+    // a second start with the same mods and options takes the merged files from the cache
     const long long time = (long long)fs::last_write_time(aoc).time_since_epoch().count();
-    const std::string command = "\"" + std::string(self) + "\" \"" + root.parent_path().string() + "\" --reuse " + std::to_string(time);
-    assert(std::system(command.c_str()) == 0);
+    const std::string self_work = "\"" + std::string(self) + "\" \"" + root.parent_path().string() + "\" ";
+    assert(std::system((self_work + "--reuse " + std::to_string(time)).c_str()) == 0);
+    // other options: merged again at the next start, with the chosen ones
+    loader::set_option("f-options", "Switch", true);
+    loader::set_option("f-options", "Blue", true);
+    assert(loader::restart_needed());
+    assert(std::system((self_work + "--options \"" + table + "\"").c_str()) == 0);
 }
 int reuse(const fs::path& root, const std::string& time) {
     setup_loader(root);
@@ -635,6 +717,21 @@ int reuse(const fs::path& root, const std::string& time) {
     const std::string aoc = loader::replacement("/vol/aoc0005000c101c9400/0010/Pack/AocPack.pack");
     assert(!aoc.empty() && std::to_string((long long)fs::last_write_time(aoc).time_since_epoch().count()) == time);
     assert(loader::list().size() >= 4 && !loader::list()[0].active);  // a-new: off
+    return 0;
+}
+int options_start(const fs::path& root, const std::string& old_table) {  // a start with the options chosen above
+    setup_loader(root);
+    loader::startup();
+    const loader::ModView f = options_mod();
+    assert(f.active && f.options[0].on && f.options[0].active && !f.options[1].on && !f.options[1].active);
+    assert(f.options[2].on && f.options[2].active && !loader::restart_needed());
+    assert(loader::summary().find(" mods with ") != std::string::npos && loader::summary().find(" options, ") != std::string::npos);
+    assert(text(get(loader::replacement(guest_of("Loose/Colour.bin")))) == "blue");
+    assert(text(get(loader::replacement(guest_of("Loose/Switch.bin")))) == "switch");
+    const std::string table = loader::replacement(guest_of("System/Resource/ResourceSizeTable.product.srsizetable"));
+    assert(entry(table_of(table), "Loose/Colour.bin") == 4321);  // the option's own merge data
+    // another set of mods (the options are part of the cache's fingerprint): the first start's merge is gone
+    assert(fs::path(table).parent_path() != fs::path(old_table).parent_path() && !fs::exists(old_table));
     return 0;
 }
 
@@ -707,6 +804,11 @@ int dump_check(char** argv) {
                m.files, m.used, m.problem.empty() ? "" : ", problem: ", m.problem.c_str());
         if (!m.warning.empty()) printf("    warning: %s\n", m.warning.c_str());
         for (const auto& n : m.notes) printf("    %s\n", n.c_str());
+        for (const auto& o : m.options) {
+            printf("    option %s (%s)%s%s: %zu files, %zu used\n", o.name.c_str(), o.group < 0 ? "switch" : m.groups[size_t(o.group)].name.c_str(),
+                   o.on ? " on" : " off", o.active ? " active" : "", o.files, o.used);
+            for (const auto& n : o.notes) printf("        %s\n", n.c_str());
+        }
     }
     const merge::Vanilla game{fs::path(argv[2]) / "content", fs::path(argv[3]) / "content", fs::path(argv[4]) / "content"};
     const fs::path cache = fs::path(argv[5]).parent_path() / "Mods cache";
@@ -757,6 +859,7 @@ int main(int argc, char** argv) {
     if (argc == 6 && std::string(argv[1]) == "--dump") return dump_check(argv);
     const fs::path work = argv[1];
     if (argc == 4 && std::string(argv[2]) == "--reuse") return reuse(work / "loader", argv[3]);
+    if (argc == 4 && std::string(argv[2]) == "--options") return options_start(work / "loader", argv[3]);
     fs::remove_all(work);
     fs::create_directories(work);
     test_yaz0();

@@ -1706,6 +1706,77 @@ void tab_cheats() {
 }
 
 // Mods (mods/mod_loader.cpp): content mods in the Mods folder, merged when the game starts
+void help_wrapped(const std::string& text) {  // a tooltip for a mod's own text, often one long line
+    if (text.empty() || !ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort | ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled) ||
+        !ImGui::BeginTooltip())
+        return;
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32);
+    ImGui::TextUnformatted(text.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+void option_status(const mods::loader::OptionView& o, bool named) {  // this run: what an option changed
+    if (!o.active) return;
+    note("%s%s %zu of its %zu files read by the game", named ? o.name.c_str() : "", named ? ": in use," : "In use,", o.used, o.files);
+    for (const auto& n : o.notes) note("%s", n.c_str());
+}
+// a BCML mod's options, under it: a switch for each of its own, a row of choices for each group (with
+// None when the group isn't required). Greyed while the mod is off.
+void mod_options(const mods::loader::ModView& m) {
+    if (m.options.empty()) return;
+    const float fh = ImGui::GetFrameHeight();
+    const float indent = std::round(std::round(fh * 0.78f) * 1.72f) + ImGui::GetStyle().ItemInnerSpacing.x + 2;  // the mod's name
+    ImGui::Indent(indent);
+    ImGui::BeginDisabled(!m.enabled);
+    for (size_t k = 0; k < m.options.size(); k++) {
+        const mods::loader::OptionView& o = m.options[k];
+        if (o.group >= 0) continue;
+        ImGui::PushID(int(k));
+        bool on = o.on;
+        if (toggle(o.name.c_str(), &on)) mods::loader::set_option(m.id, o.key, on);
+        help_wrapped(o.description);
+        option_status(o, false);
+        ImGui::PopID();
+    }
+    for (size_t g = 0; g < m.groups.size(); g++) {
+        const mods::loader::Layout::Group& group = m.groups[g];
+        ImGui::PushID(int(m.options.size() + g));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(group.name.empty() ? "Choose one" : group.name.c_str());
+        help_wrapped(group.description);
+        const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+        bool first = true;
+        auto place = [&](const char* label) {  // the next choice: on the same row while it fits
+            const float w = ImGui::CalcTextSize(label, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2;
+            if (!first) {
+                ImGui::SameLine();
+                if (ImGui::GetCursorPosX() + w > right) ImGui::NewLine();
+            }
+            first = false;
+        };
+        const mods::loader::OptionView* pick = nullptr;
+        for (const auto& o : m.options)
+            if (o.group == int(g) && o.on) pick = &o;
+        if (!group.required) {
+            place("None");
+            if (radio("None", !pick) && pick) mods::loader::set_option(m.id, pick->key, false);
+        }
+        for (size_t k = 0; k < m.options.size(); k++) {
+            const mods::loader::OptionView& o = m.options[k];
+            if (o.group != int(g)) continue;
+            ImGui::PushID(int(k));
+            place(o.name.c_str());
+            if (radio(o.name.c_str(), o.on)) mods::loader::set_option(m.id, o.key, true);
+            help_wrapped(o.description);
+            ImGui::PopID();
+        }
+        for (const auto& o : m.options)
+            if (o.group == int(g)) option_status(o, true);
+        ImGui::PopID();
+    }
+    ImGui::EndDisabled();
+    ImGui::Unindent(indent);
+}
 void tab_mods() {
     const std::vector<mods::loader::ModView> list = mods::loader::list();
     heading("Content mods");
@@ -1722,7 +1793,7 @@ void tab_mods() {
         ImGui::BeginDisabled(!m.problem.empty());
         if (toggle(m.name.c_str(), &on)) mods::loader::set_enabled(m.id, on);
         ImGui::EndDisabled();
-        if (!m.description.empty()) help(m.description.c_str());
+        help_wrapped(m.description);
         // order: higher in the list wins
         const float bw = ImGui::GetFrameHeight(), sp = ImGui::GetStyle().ItemSpacing.x;
         ImGui::SameLine(std::max(ImGui::GetCursorPosX(), right - 2 * bw - sp));
@@ -1741,6 +1812,7 @@ void tab_mods() {
             note("%s", line.c_str());
             if (!m.warning.empty()) warn("%s", m.warning.c_str());
             for (const auto& n : m.notes) note("%s", n.c_str());
+            mod_options(m);
         }
         ImGui::PopID();
     }

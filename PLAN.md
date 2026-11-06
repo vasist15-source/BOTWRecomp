@@ -256,7 +256,7 @@ formats in `mods/botw_formats.cpp`) into `~/Library/Caches/BotW/Mods/<fingerprin
   AAMP v2): `deepmerge.aamp` (values set, new objects and lists added, by name hash, into the file its
   FileTable names, `content/X.sbactorpack//Actor/Y.bphysics`, inside the merged archives), `aslist.aamp`
   (AddReses by Anim, new ones `AddRes_N` after the game's; ASDefines by Name; CFDefines by CFPre Name) and
-  `rstb.json` (sizes; 0 drops the entry). Options from `info.json` use BCML's defaults (no switches yet).
+  `rstb.json` (sizes; 0 drops the entry). Options from `info.json` use BCML's defaults (switches: next entry).
   Mods with other logs (texts, gamedata, ActorInfo, maps, ...) are refused with their names.
   Why: The Linkle Mod 3.0.1 unpacked without its merge data crashed at the title screen (null pointer in
   039742E0+0xA6C, both runs) though its 130 partial actor packs merged complete. With it (checked on the dump,
@@ -277,6 +277,23 @@ mods made from the dump (scratchpad only, synthetic edits): TitleBG.pack merged 
 shrine pack in 221 ms, 347 MB peak at startup (freed before the game starts); the next start takes the
 cache in 1 ms. `content_merge_test` (ctest `content_merge`) passes. Play-tested by the user with The Linkle
 Mod 3.0.1 (2026-11-06): it works.
+
+### 2026-11-06: BCML options in Settings > Mods
+A BCML mod's options (`info.json`) are listed under it: a switch for each `multi` option and a row of choices
+for each `single` group, with None unless the group is required; greyed while the mod is off. Choices are
+saved in `mods.json` per mod and option folder (`"options": {"Royal Weapons": true}`, a group's choice as all
+of its options) and apply at the next start. Options not chosen take BCML's default: a `multi` option's
+`default`; in a group the option marked `default`, else its first when the group is required, else none. BCML
+has no defaults for groups and asks the player instead (`Selects.jsx`). A chosen option is merged over its mod
+as an input of its own (`mod/folder`), so its files win over the mod's, archives they share merge file by
+file, its logs apply after the mod's (as BCML's install and mergers do), and each choice of options is a cache
+set of its own. BCML's defaults give the same fingerprint as before (no re-merge after the update). Checked on
+the dump with a copy of the Mods folder (`content_merge_test --dump`), The Linkle Mod 3.0.1: Royal Guards
+Armoury: 28 of 28 files used, 7 parameter files changed (every file its `deepmerge.aamp` names), 142 archives
+merged, 664 ms; with the Umbrella Glider as well, its partial TitleBG.pack merges over the mod's (its
+`Player_Animation.sbfres` wins), 822 files read back, 812 ms, 265 MB peak; no size entry smaller than its
+file. `content_merge_test` passes (switches, groups, saved choices, a start with other options merging a new
+set). Not play-tested yet.
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.

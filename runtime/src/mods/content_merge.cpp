@@ -958,8 +958,11 @@ Result build(const Vanilla& vanilla, const std::vector<Mod>& mods, const fs::pat
 
     size_t files = 0;
     for (const auto& m : r.mods) files += m.files;
-    r.log.insert(r.log.begin(), std::to_string(mods.size()) + (mods.size() == 1 ? " mod, " : " mods, ") + std::to_string(files) +
-                                    " files: " + std::to_string(r.files.size()) + " paths replaced, " +
+    const size_t options = size_t(std::count_if(mods.begin(), mods.end(), [](const Mod& m) { return m.option; }));
+    const size_t whole = mods.size() - options;
+    r.log.insert(r.log.begin(), std::to_string(whole) + (whole == 1 ? " mod" : " mods") +
+                                    (options ? " with " + std::to_string(options) + (options == 1 ? " option" : " options") : std::string()) +
+                                    ", " + std::to_string(files) + " files: " + std::to_string(r.files.size()) + " paths replaced, " +
                                     std::to_string(r.merged_archives) + " archives merged");
     return r;
 }

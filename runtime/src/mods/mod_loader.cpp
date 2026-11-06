@@ -118,8 +118,10 @@ bool bcml_logs(const fs::path& dir, std::string& unsupported) {  // whether dir/
     for (const auto& n : other) unsupported += (unsupported.empty() ? "" : ", ") + n;
     return any;
 }
-// info.json of a BCML mod: its name, description and options ({"multi": [{name, folder, default}],
-// "single": [{name, options: [...]}]}); options whose logs can't be applied are left out
+// info.json of a BCML mod: its name, description and options ({"multi": [{name, desc, folder, default}],
+// "single": [{name, desc, required, options: [{name, desc, folder}]}]}, as BCML's dev tools write them). An
+// option is its folder, as BCML selects them: a folder named twice is the first one. Options whose folder
+// is missing are left out, and so are options whose logs can't be applied (named in the warning).
 void read_bcml_info(const fs::path& dir, Layout& l) {
     const std::string info = read_text(dir / "info.json", 1 << 20);
     if (info.empty()) return;
@@ -127,28 +129,40 @@ void read_bcml_info(const fs::path& dir, Layout& l) {
         const json::Value v = json::parse(info);
         if (!v.get("name").string().empty()) l.name = v.get("name").string();
         l.description = v.get("desc").string();
-        std::vector<const json::Value*> choices;
-        for (const auto& o : v.get("options").get("multi").array) choices.push_back(&o);
-        for (const auto& group : v.get("options").get("single").array)
-            for (const auto& o : group.get("options").array) choices.push_back(&o);
+        std::vector<std::pair<const json::Value*, int>> choices;  // option, group (-1: multi)
+        std::vector<Layout::Group> groups;
+        for (const auto& o : v.get("options").get("multi").array) choices.push_back({&o, -1});
+        for (const auto& group : v.get("options").get("single").array) {
+            groups.push_back({group.get("name").string(), group.get("desc").string(), group.get("required").boolean});
+            for (const auto& o : group.get("options").array) choices.push_back({&o, int(groups.size()) - 1});
+        }
         std::string skipped;
-        for (const json::Value* o : choices) {
+        std::vector<int> group_index(groups.size(), -1);  // in l.groups: the groups left with options
+        for (const auto& [o, group] : choices) {
             const std::string folder = o->get("folder").string();
             std::error_code ec;
-            if (folder.empty() || folder.find("..") != std::string::npos || !fs::is_directory(dir / "options" / folder, ec)) continue;
+            if (folder.empty() || folder == "." || folder == ".." || folder.find_first_of("/\\") != std::string::npos ||
+                !fs::is_directory(dir / "options" / folder, ec))
+                continue;
+            if (std::any_of(l.options.begin(), l.options.end(), [&](const Layout::Option& x) { return x.key == folder; })) continue;
+            const std::string name = o->get("name").string(folder);
             std::string unsupported;
             bcml_logs(dir / "options" / folder, unsupported);
             if (!unsupported.empty()) {
-                skipped += (skipped.empty() ? "" : ", ") + o->get("name").string();
+                skipped += (skipped.empty() ? "" : ", ") + name;
                 continue;
             }
-            l.options.push_back({o->get("name").string(folder), dir / "options" / folder, o->get("default").boolean});
+            int g = -1;
+            if (group >= 0) {
+                if (group_index[size_t(group)] < 0) {
+                    group_index[size_t(group)] = int(l.groups.size());
+                    l.groups.push_back(groups[size_t(group)]);
+                }
+                g = group_index[size_t(group)];
+            }
+            l.options.push_back({folder, name, o->get("desc").string(), dir / "options" / folder, g, o->get("default").boolean});
         }
-        std::string off, on;
-        for (const auto& o : l.options) (o.on ? on : off) += ((o.on ? on : off).empty() ? "" : ", ") + o.name;
-        if (!on.empty()) l.warning = "With BCML's default options: " + on + ".";
-        if (!off.empty()) l.warning += std::string(l.warning.empty() ? "" : " ") + "Its other options are off (no switches for them yet): " + off + ".";
-        if (!skipped.empty()) l.warning += std::string(l.warning.empty() ? "" : " ") + "Options with merge data that can't be applied yet: " + skipped + ".";
+        if (!skipped.empty()) l.warning = "Options with merge data that can't be applied yet, so they can't be chosen: " + skipped + ".";
     } catch (const std::exception&) {
     }
 }
@@ -162,23 +176,29 @@ bool code_or_shaders(const fs::path& dir) {  // Cemu code patches or replacement
     return false;
 }
 
+using Choices = std::map<std::string, bool>;  // a mod's options chosen in Settings > Mods: key -> on
 struct Saved {
     std::vector<std::pair<std::string, bool>> order;  // top wins
+    std::map<std::string, Choices> options;  // by mod; options not in it take BCML's default
     std::string last_set;  // the set of mods of the last start ("none", or its fingerprint)
 };
+// the mods a start uses, top first, each with the keys of the options it uses
+using Inputs = std::vector<std::pair<std::string, std::vector<std::string>>>;
 struct State {
     bool started = false, off = false;
     fs::path dir, settings, cache;
     Saved saved;
     std::map<std::string, Layout> layouts;
-    std::vector<std::string> active;  // this run, top first
-    std::map<std::string, merge::ModReport> reports;
+    Inputs active;  // this run
+    std::map<std::string, merge::ModReport> reports;  // by input id (option_id for an option)
     std::string summary;
 };
 std::mutex g_mutex;
 State g;
 std::unordered_map<std::string, std::string> g_files;  // tree key -> host file; frozen once g_ready
 std::atomic<bool> g_ready{false};
+
+std::string option_id(const std::string& mod, const std::string& key) { return mod + "/" + key; }  // its merge input
 
 Saved load_saved(const fs::path& p) {
     Saved s;
@@ -188,7 +208,10 @@ Saved load_saved(const fs::path& p) {
         const json::Value v = json::parse(text);
         for (const auto& m : v.get("mods").array) {
             const std::string id = m.get("id").string();
-            if (!id.empty()) s.order.push_back({id, m.get("enabled").type != json::Value::Bool || m.get("enabled").boolean});
+            if (id.empty()) continue;
+            s.order.push_back({id, m.get("enabled").type != json::Value::Bool || m.get("enabled").boolean});
+            for (const auto& [key, on] : m.get("options").object)
+                if (on.type == json::Value::Bool) s.options[id][key] = on.boolean;
         }
         s.last_set = v.get("last_set").string();
     } catch (const std::exception& e) {
@@ -205,6 +228,8 @@ void save_locked() {
         json::Value m;
         m["id"] = id;
         m["enabled"] = on;
+        if (auto o = g.saved.options.find(id); o != g.saved.options.end() && !o->second.empty())
+            for (const auto& [key, chosen] : o->second) m["options"][key] = chosen;
         entries.array.push_back(m);
     }
     v["last_set"] = g.saved.last_set;
@@ -313,14 +338,36 @@ void scan_locked(bool unpack = false) {
     order.insert(order.begin(), fresh.begin(), fresh.end());  // new mods come first: they win
     if (order != g.saved.order) {
         g.saved.order = std::move(order);
+        for (auto it = g.saved.options.begin(); it != g.saved.options.end();)  // a mod that is gone takes its options along
+            it = std::any_of(g.saved.order.begin(), g.saved.order.end(), [&](const auto& o) { return o.first == it->first; })
+                     ? std::next(it)
+                     : g.saved.options.erase(it);
         save_locked();
     }
 }
-std::vector<std::string> wanted_locked() {  // the mods the saved choices use, top first
-    std::vector<std::string> ids;
-    for (const auto& [id, on] : g.saved.order)
-        if (auto it = g.layouts.find(id); on && it != g.layouts.end() && it->second.problem.empty()) ids.push_back(id);
-    return ids;
+const Choices& choices_locked(const std::string& id) {
+    static const Choices none;
+    auto it = g.saved.options.find(id);
+    return it == g.saved.options.end() ? none : it->second;
+}
+Inputs wanted_locked() {  // the mods and options the saved choices use, top first
+    Inputs out;
+    for (const auto& [id, on] : g.saved.order) {
+        auto it = g.layouts.find(id);
+        if (!on || it == g.layouts.end() || !it->second.problem.empty()) continue;
+        const Layout& l = it->second;
+        const std::vector<bool> use = chosen(l, choices_locked(id));
+        std::vector<std::string> keys;
+        for (size_t k = 0; k < l.options.size(); k++)
+            if (use[k]) keys.push_back(l.options[k].key);
+        out.push_back({id, std::move(keys)});
+    }
+    return out;
+}
+const std::vector<std::string>* active_locked(const std::string& id) {  // this run's options of the mod, null: not active
+    for (const auto& a : g.active)
+        if (a.first == id) return &a.second;
+    return nullptr;
 }
 
 fs::path content_of(const std::string& dir) {
@@ -341,7 +388,8 @@ fs::path cache_root() {
 #endif
 }
 
-// the inputs of a merge: the game's folders and every file of the mods (path, size, time), in order
+// the inputs of a merge: the game's folders and every file of the mods (path, size, time), in order. A chosen
+// option is an input of its own (option_id), so each choice of options is a set of its own.
 std::string fingerprint(const merge::Vanilla& v, const std::vector<merge::Mod>& inputs) {
     std::ostringstream s;
     s << "botw content mods " << kCacheFormat << '\n' << v.update_content.string() << '\n' << v.base_content.string() << '\n'
@@ -490,6 +538,32 @@ void backup_saves_locked(const std::string& set) {
 
 }  // namespace
 
+std::vector<bool> chosen(const Layout& l, const std::map<std::string, bool>& saved) {
+    std::vector<bool> on(l.options.size(), false);
+    for (size_t k = 0; k < l.options.size(); k++)
+        if (l.options[k].group < 0) {
+            auto s = saved.find(l.options[k].key);
+            on[k] = s != saved.end() ? s->second : l.options[k].by_default;
+        }
+    for (int group = 0; group < int(l.groups.size()); group++) {
+        long pick = -1, by_default = -1, first = -1;
+        bool touched = false;  // the player chose in this group
+        for (size_t k = 0; k < l.options.size(); k++) {
+            if (l.options[k].group != group) continue;
+            if (first < 0) first = long(k);
+            if (by_default < 0 && l.options[k].by_default) by_default = long(k);
+            auto s = saved.find(l.options[k].key);
+            if (s == saved.end()) continue;
+            touched = true;
+            if (s->second && pick < 0) pick = long(k);
+        }
+        if (pick < 0 && (!touched || l.groups[size_t(group)].required))
+            pick = by_default >= 0 ? by_default : l.groups[size_t(group)].required ? first : -1;
+        if (pick >= 0) on[size_t(pick)] = true;
+    }
+    return on;
+}
+
 Layout detect(const fs::path& folder, const std::string& title) {
     Layout l;
     l.name = folder.filename().string();
@@ -612,21 +686,22 @@ void startup() {
         LOG("[mods] %s", g.summary.c_str());
         return;
     }
-    const std::vector<std::string> ids = wanted_locked();
-    if (ids.empty()) {
+    const Inputs wanted = wanted_locked();
+    if (wanted.empty()) {
         backup_saves_locked("none");
         g.summary = g.layouts.empty() ? "" : "No mods are switched on.";
         return;
     }
     std::vector<merge::Mod> inputs;  // load order: the bottom of the list first, so the top wins
-    for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
-        const Layout& l = g.layouts.at(*it);
-        inputs.push_back({*it, l.name, l.content, l.aoc, l.logs});
-        for (const auto& o : l.options)  // BCML's default options, over the mod
-            if (o.on) {
+    for (auto it = wanted.rbegin(); it != wanted.rend(); ++it) {
+        const auto& [id, keys] = *it;
+        const Layout& l = g.layouts.at(id);
+        inputs.push_back({id, l.name, l.content, l.aoc, l.logs});
+        for (const auto& o : l.options)  // its chosen options, over the mod (in info.json's order)
+            if (std::find(keys.begin(), keys.end(), o.key) != keys.end()) {
                 std::error_code ec;
                 auto sub = [&](const char* n) { return fs::is_directory(o.folder / n, ec) ? o.folder / n : fs::path(); };
-                inputs.push_back({*it + "/" + o.name, l.name + ": " + o.name, sub("content"), sub("aoc"), sub("logs")});
+                inputs.push_back({option_id(id, o.key), l.name + ": " + o.name, sub("content"), sub("aoc"), sub("logs"), true});
             }
     }
     const merge::Vanilla vanilla{content_of(config::game_dir), content_of(config::base_dir), content_of(config::aoc_dir)};
@@ -638,7 +713,7 @@ void startup() {
         const bool cached = load_cache(g.cache / set, inputs.size(), c);
         if (!cached) c = build_cache(g.cache, set, vanilla, inputs);
         for (size_t k = 0; k < inputs.size(); k++) g.reports[inputs[k].id] = c.reports[k];
-        g.active = ids;
+        g.active = wanted;
         for (const auto& [key, host] : c.files) g_files.emplace(key, host);
         g_ready.store(!g_files.empty(), std::memory_order_release);
         std::string text;
@@ -685,13 +760,34 @@ std::vector<ModView> list() {
         v.enabled = on;
         v.problem = l.problem;
         v.warning = l.warning;
-        v.active = std::find(g.active.begin(), g.active.end(), id) != g.active.end();
+        const std::vector<std::string>* active = active_locked(id);
+        v.active = active != nullptr;
         if (auto r = g.reports.find(id); r != g.reports.end() && v.active) {
             v.files = r->second.files;
             v.used = r->second.replaced + r->second.merged;
             v.notes = r->second.notes;
         }
         if (v.active && !l.aoc.empty() && config::aoc_dir.empty()) v.notes.push_back("The DLC isn't installed, so its aoc/ files are not used");
+        if (l.problem.empty()) {
+            v.groups = l.groups;
+            const std::vector<bool> use = chosen(l, choices_locked(id));
+            for (size_t k = 0; k < l.options.size(); k++) {
+                const Layout::Option& o = l.options[k];
+                OptionView ov;
+                ov.key = o.key;
+                ov.name = o.name;
+                ov.description = o.description;
+                ov.group = o.group;
+                ov.on = use[k];
+                ov.active = active && std::find(active->begin(), active->end(), o.key) != active->end();
+                if (auto r = g.reports.find(option_id(id, o.key)); r != g.reports.end() && ov.active) {
+                    ov.files = r->second.files;
+                    ov.used = r->second.replaced + r->second.merged;
+                    ov.notes = r->second.notes;
+                }
+                v.options.push_back(std::move(ov));
+            }
+        }
         out.push_back(std::move(v));
     }
     return out;
@@ -716,6 +812,26 @@ void set_enabled(const std::string& id, bool on) {
             save_locked();
             LOG("[mods] %s %s (from the next start)", id.c_str(), on ? "on" : "off");
         }
+}
+void set_option(const std::string& id, const std::string& key, bool on) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g.layouts.find(id);
+    if (it == g.layouts.end()) return;
+    const Layout& l = it->second;
+    auto o = std::find_if(l.options.begin(), l.options.end(), [&](const Layout::Option& x) { return x.key == key; });
+    if (o == l.options.end()) return;
+    Choices next = choices_locked(id);
+    if (o->group < 0) {
+        next[key] = on;
+    } else {  // the group's choice: this option or none; the group's other options off
+        if (!on && l.groups[size_t(o->group)].required) return;
+        for (const auto& x : l.options)
+            if (x.group == o->group) next[x.key] = on && x.key == key;
+    }
+    if (next == choices_locked(id)) return;
+    g.saved.options[id] = std::move(next);
+    save_locked();
+    LOG("[mods] %s: option %s %s (from the next start)", id.c_str(), key.c_str(), on ? "on" : "off");
 }
 void move(const std::string& id, int delta) {
     std::lock_guard<std::mutex> lk(g_mutex);

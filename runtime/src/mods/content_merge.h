@@ -28,6 +28,7 @@ struct Mod {
     // BCML's merge data of a .bnp (empty: none): deepmerge.aamp and aslist.aamp (parameter changes, applied to
     // the files they name inside the merged archives) and rstb.json (sizes; 0: the entry is dropped)
     std::filesystem::path logs;
+    bool option = false;  // a BCML mod's option, after its mod (counted as an option of it)
 };
 struct ModReport {
     size_t files = 0;       // files the mod has
