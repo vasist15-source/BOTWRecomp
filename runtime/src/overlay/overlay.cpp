@@ -47,6 +47,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../mods/cheats.h"
 #include "../mods/manager.h"
 #include "../mods/mod_loader.h"
+#include "../mods/code_patches.h"
 #include "../mods/packages.h"
 #include "../mods/graphic_packs.h"
 #include "../mods/catalogue_client.h"
@@ -1777,21 +1778,89 @@ void mod_options(const mods::loader::ModView& m) {
     ImGui::EndDisabled();
     ImGui::Unindent(indent);
 }
+// a Cemu graphic pack's code patches (mods/code_patches.h), under its mod: whether the game code holds
+// them, its notes and its presets (they apply at once, as its switch does)
+void code_mod_part(const mods::loader::ModView& m, const mods::patches::View& pv) {
+    using mods::patches::Build;
+    switch (pv.build) {
+    case Build::Current:
+        note("Code patches: %zu of the game's instructions. Switching it on or off and its presets apply at once.", pv.changes);
+        break;
+    case Build::Changed:
+        warn("Its files changed since the game code was built: rebuild the game code (below) to use this version.");
+        break;
+    case Build::Missing:
+        warn("Its code patches aren't in the game code yet: rebuild the game code (below) to use them.");
+        break;
+    case Build::Refused:
+        warn("Its code patches can't be used: %s.", pv.problem.c_str());
+        break;
+    }
+    for (const auto& n : pv.notes) note("%s", n.c_str());
+    if (pv.categories.empty()) return;
+    const float fh = ImGui::GetFrameHeight();
+    const float indent = std::round(std::round(fh * 0.78f) * 1.72f) + ImGui::GetStyle().ItemInnerSpacing.x + 2;  // the mod's name
+    ImGui::Indent(indent);
+    for (size_t k = 0; k < pv.categories.size(); k++) {
+        const mods::patches::Category& c = pv.categories[k];
+        ImGui::PushID(int(k));
+        int pick = c.active;
+        ImGui::SetNextItemWidth(260);
+        auto item = [](void* data, int i) { return (*static_cast<const std::vector<std::string>*>(data))[size_t(i)].c_str(); };
+        if (ImGui::Combo(c.name.empty() ? "Preset" : c.name.c_str(), &pick, item, (void*)&c.presets, int(c.presets.size())) &&
+            pick != c.active && pick >= 0)
+            mods::patches::set_preset(m.id, c.name, c.presets[size_t(pick)]);
+        ImGui::PopID();
+    }
+    ImGui::Unindent(indent);
+}
+// rebuilding the game code for new or changed code mods, then the restart into it
+void code_mods_rebuild() {
+    const mods::patches::RebuildState s = mods::patches::rebuild_state();
+    if (!s.running && !s.done && s.error.empty() && !mods::patches::rebuild_needed()) return;
+    heading("Game code");
+    if (s.running) {
+        note("%s", s.stage.c_str());
+        ImGui::ProgressBar(float(s.progress), ImVec2(-FLT_MIN, 0));
+        if (ImGui::Button("Cancel")) mods::patches::rebuild_cancel();
+        note("The game keeps running while its code is rebuilt; it takes a few minutes.");
+    } else if (s.done) {
+        note("The game code is rebuilt with the Mods folder's code mods. Restart the game to use it.");
+        // asks first while a game is in progress, as Quit does (gfx/quit_prompt.mm)
+        if (hostui::can_restart() && primary_button("Restart now##code")) hostui::post([] { hostui::restart_game(); });
+    } else {
+        if (!s.error.empty()) warn("%s", s.error.c_str());
+        note("Code mods are built into the game code, so a new or changed one needs it rebuilt: a few minutes, and the "
+             "game keeps running meanwhile. Switching code mods on or off and choosing presets need no rebuild.");
+        ImGui::BeginDisabled(!s.possible);
+        if (primary_button("Rebuild the game code")) mods::patches::rebuild_start();
+        ImGui::EndDisabled();
+        if (s.possible) help(s.how.c_str());
+        else warn("%s", s.how.c_str());
+    }
+    close_card();
+}
 void tab_mods() {
     const std::vector<mods::loader::ModView> list = mods::loader::list();
-    heading("Content mods");
+    heading("Mods");
     if (list.empty())
         note("No mods yet. Put each mod in its own folder in the Mods folder (Show in Finder below): a Cemu "
-             "graphic pack (rules.txt with content and aoc folders), an SDCafiine folder, or a folder with "
-             "content and aoc folders, made for the Wii U version.");
+             "graphic pack (rules.txt with content and aoc folders, or code patches), an SDCafiine folder, or a "
+             "folder with content and aoc folders, made for the Wii U version.");
     for (size_t i = 0; i < list.size(); i++) {
         const mods::loader::ModView& m = list[i];
         ImGui::PushID(m.id.c_str());
         if (i) ImGui::Spacing();
-        bool on = m.enabled && m.problem.empty();
+        mods::patches::View pv;
+        const bool code = m.code && mods::patches::find(m.id, pv);
+        const bool usable = m.problem.empty() && (!code || m.content || pv.build != mods::patches::Build::Refused);
+        bool on = m.enabled && usable;
         const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;  // the card's right edge
-        ImGui::BeginDisabled(!m.problem.empty());
-        if (toggle(m.name.c_str(), &on)) mods::loader::set_enabled(m.id, on);
+        ImGui::BeginDisabled(!usable);
+        if (toggle(m.name.c_str(), &on)) {
+            mods::loader::set_enabled(m.id, on);  // saved; its content at the next start
+            if (code) mods::patches::set_on(m.id, on);  // its code patches at once
+        }
         ImGui::EndDisabled();
         help_wrapped(m.description);
         // order: higher in the list wins
@@ -1812,11 +1881,13 @@ void tab_mods() {
             note("%s", line.c_str());
             if (!m.warning.empty()) warn("%s", m.warning.c_str());
             for (const auto& n : m.notes) note("%s", n.c_str());
+            if (code) code_mod_part(m, pv);
             mod_options(m);
         }
         ImGui::PopID();
     }
     close_card();
+    code_mods_rebuild();
     if (hostui::can_open_folder()) {
         if (ImGui::Button("Show in Finder")) {
             std::string d = mods::loader::directory();
@@ -1824,7 +1895,10 @@ void tab_mods() {
         }
         ImGui::SameLine();
     }
-    if (ImGui::Button("Look for new mods")) mods::loader::rescan();
+    if (ImGui::Button("Look for new mods")) {
+        mods::loader::rescan();
+        mods::patches::rescan();
+    }
     if (mods::loader::restart_needed()) {
         warn("Restart the game to apply these changes.");
         // asks first while a game is in progress, as Quit does (gfx/quit_prompt.mm)
@@ -1833,9 +1907,10 @@ void tab_mods() {
     const std::string summary = mods::loader::summary();
     if (!summary.empty()) note("This start: %s", summary.c_str());
     note("Mods higher in the list win where two change the same file. Archives that several mods change are "
-         "merged file by file, and the resource size table is updated for you. Changes apply when the game "
-         "starts again. Mods for the Switch version don't work here. When you start with a different set of "
-         "mods, your saves are backed up first (Save backups, next to the Mods folder).");
+         "merged file by file, and the resource size table is updated for you. Changes to content mods apply when "
+         "the game starts again; code mods (Cemu graphic packs' code patches) switch at once. Mods for the Switch "
+         "version don't work here. When you start with a different set of mods, your saves are backed up first "
+         "(Save backups, next to the Mods folder).");
 }
 
 // sidebar icons: a coloured rounded tile with a white glyph, as System Settings draws them

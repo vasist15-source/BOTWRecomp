@@ -40,7 +40,9 @@ generated from the game.
 - `runtime/src/hle/`: Cafe OS (coreinit, fs, AX audio, vpad input).
 - `runtime/src/motion/`, `mouse_look.cpp`, `input_map.cpp`: gyro, mouse camera, remapping.
 - `runtime/src/mods/`: graphic packs, cheats, content mods (`mod_loader.cpp`: Mods folder and Settings > Mods;
-  `content_merge.cpp`: merging and BCML merge data; `botw_formats.cpp`: Yaz0, SARC, size table; `aamp.cpp`: parameters). `runtime/src/overlay/`: settings overlay.
+  `content_merge.cpp`: merging and BCML merge data; `botw_formats.cpp`: Yaz0, SARC, size table; `aamp.cpp`: parameters;
+  `code_patches.cpp`: code mods, Cemu `patch_*.asm` built into the game code by `tools/botw_code_mods.py` and
+  `tools/cemu_patches.py`). `runtime/src/overlay/`: settings overlay.
 - `runtime/third_party/cemu/`: Latte shader decompiler (MSL output).
 - `tools/installer/`: `botw_setup.py` and the SwiftUI installer app.
 - `tools/bench/`, `tools/verify/`: benchmarks and translator verification.

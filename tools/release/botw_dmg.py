@@ -24,7 +24,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEPLOYMENT_TARGET = "13.0"
 APP = "BOTWRecomp Installer.app"
-TRANSLATOR = ["tools/probe_recomp.py", "tools/botw_fps_patches.py", "tools/botw_cheat_patches.py", "tools/rpx.py", "tools/recomp/analyze.py", "tools/recomp/builds.py",
+TRANSLATOR = ["tools/probe_recomp.py", "tools/botw_fps_patches.py", "tools/botw_cheat_patches.py", "tools/botw_code_mods.py",
+              "tools/cemu_patches.py", "tools/rpx.py", "tools/recomp/analyze.py", "tools/recomp/builds.py",
               "tools/recomp/ppc2c.py", "tools/recomp/recomp.py", "tools/recomp/crlive.py",
               "tools/recomp/leaflocal.py"]
 
@@ -130,7 +131,8 @@ def check_kit_imports(kit):
 
 def check_package(res):
     """Allow list: our scripts, the kit, docs. Nothing else (in particular nothing from a dump)."""
-    allowed = re.compile(r"^(tools/installer/botw_setup\.py|tools/probe_recomp\.py|tools/botw_(fps|cheat)_patches\.py|tools/rpx\.py|"
+    allowed = re.compile(r"^(tools/installer/botw_setup\.py|tools/probe_recomp\.py|tools/botw_(fps|cheat)_patches\.py|"
+                         r"tools/botw_code_mods\.py|tools/cemu_patches\.py|tools/rpx\.py|"
                          r"tools/recomp/(analyze|builds|ppc2c|recomp|crlive|leaflocal)\.py|tools/recomp/builds/[a-z]+\.json|"
                          r"kit/kit\.json|kit/lib/lib(botw_runtime|cemu_latte|imgui)\.a|kit/include/[a-z_]+\.h|"
                          r"LICENSE|README\.md)$")

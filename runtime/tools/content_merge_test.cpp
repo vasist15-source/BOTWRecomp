@@ -500,11 +500,20 @@ void test_layouts(const fs::path& root) {
     put(root / "cemu-code/rules.txt", def);
     put(root / "cemu-code/patch_Something.asm", "[x]");
     put(root / "cemu-code/aoc/0010/x", "x");
-    l = loader::detect(root / "cemu-code", usa);
-    assert(l.problem.empty() && !l.warning.empty() && l.aoc == root / "cemu-code/aoc");
+    l = loader::detect(root / "cemu-code", usa);  // its code patches are a code mod (mods::patches)
+    assert(l.problem.empty() && l.warning.empty() && l.code && l.aoc == root / "cemu-code/aoc");
     put(root / "cemu-only-code/rules.txt", def);
-    put(root / "cemu-only-code/patch_Something.asm", "[x]");
-    assert(!loader::detect(root / "cemu-only-code", usa).problem.empty());
+    put(root / "cemu-only-code/patches.txt", "[x]");
+    l = loader::detect(root / "cemu-only-code", usa);
+    assert(l.problem.empty() && l.code && l.content.empty() && l.aoc.empty());
+    put(root / "cemu-shaders/rules.txt", def);
+    put(root / "cemu-shaders/0123456789abcdef_0000000000000000_ps.txt", "x");
+    put(root / "cemu-shaders/content/a", "a");
+    l = loader::detect(root / "cemu-shaders", usa);
+    assert(l.problem.empty() && !l.warning.empty() && !l.code);
+    put(root / "cemu-nothing/rules.txt", def);
+    put(root / "cemu-nothing/0123456789abcdef_0000000000000000_ps.txt", "x");
+    assert(!loader::detect(root / "cemu-nothing", usa).problem.empty());
     put(root / "cemu-other/rules.txt", "[Definition]\ntitleIds = 0005000010143500\nname = Other\n");
     put(root / "cemu-other/content/a", "a");
     assert(!loader::detect(root / "cemu-other", usa).problem.empty());

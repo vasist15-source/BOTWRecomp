@@ -166,14 +166,17 @@ void read_bcml_info(const fs::path& dir, Layout& l) {
     } catch (const std::exception&) {
     }
 }
-bool code_or_shaders(const fs::path& dir) {  // Cemu code patches or replacement shaders next to rules.txt
+bool cemu_files(const fs::path& dir, bool code) {  // Cemu code patches (code) or replacement shaders next to rules.txt
     std::error_code ec;
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string n = lower(it->path().filename().string());
-        if ((n.rfind("patch_", 0) == 0 && n.size() > 4 && n.substr(n.size() - 4) == ".asm") || n == "patches.txt") return true;
-        if (n.size() > 7 && (n.substr(n.size() - 7) == "_ps.txt" || n.substr(n.size() - 7) == "_vs.txt")) return true;
+        if (code && ((n.rfind("patch_", 0) == 0 && n.size() > 4 && n.substr(n.size() - 4) == ".asm") || n == "patches.txt")) return true;
+        if (!code && n.size() > 7 && (n.substr(n.size() - 7) == "_ps.txt" || n.substr(n.size() - 7) == "_vs.txt")) return true;
     }
     return false;
+}
+bool merged(const Layout& l) {  // it takes part in the merge at startup (a code mod alone doesn't)
+    return !l.content.empty() || !l.aoc.empty() || !l.logs.empty() || !l.options.empty();
 }
 
 using Choices = std::map<std::string, bool>;  // a mod's options chosen in Settings > Mods: key -> on
@@ -354,7 +357,7 @@ Inputs wanted_locked() {  // the mods and options the saved choices use, top fir
     Inputs out;
     for (const auto& [id, on] : g.saved.order) {
         auto it = g.layouts.find(id);
-        if (!on || it == g.layouts.end() || !it->second.problem.empty()) continue;
+        if (!on || it == g.layouts.end() || !it->second.problem.empty() || !merged(it->second)) continue;
         const Layout& l = it->second;
         const std::vector<bool> use = chosen(l, choices_locked(id));
         std::vector<std::string> keys;
@@ -604,9 +607,10 @@ Layout detect(const fs::path& folder, const std::string& title) {
         if (!rules.empty()) {
             l.kind = "Cemu graphic pack";
             read_rules(rules, l);
-            if (code_or_shaders(cur)) l.warning = "Its code patches and shaders are not used, only its content/ and aoc/ files";
-            if (content.empty() && aoc.empty() && l.problem.empty())
-                l.problem = "This graphic pack has no content/ or aoc/ folder (code patches and shaders alone are not supported yet)";
+            l.code = cemu_files(cur, true);  // its code patches: mods::patches (the translated game code)
+            if (cemu_files(cur, false) && !l.code) l.warning = "Its shaders are not used, only its content/ and aoc/ files";
+            if (content.empty() && aoc.empty() && !l.code && l.problem.empty())
+                l.problem = "This graphic pack has no content/ or aoc/ folder and no code patches (shaders alone are not supported yet)";
             l.content = content;
             l.aoc = aoc;
             return l;
@@ -689,7 +693,7 @@ void startup() {
     const Inputs wanted = wanted_locked();
     if (wanted.empty()) {
         backup_saves_locked("none");
-        g.summary = g.layouts.empty() ? "" : "No mods are switched on.";
+        g.summary = g.layouts.empty() ? "" : "No content mods are switched on.";
         return;
     }
     std::vector<merge::Mod> inputs;  // load order: the bottom of the list first, so the top wins
@@ -760,6 +764,8 @@ std::vector<ModView> list() {
         v.enabled = on;
         v.problem = l.problem;
         v.warning = l.warning;
+        v.code = l.code;
+        v.content = merged(l);
         const std::vector<std::string>* active = active_locked(id);
         v.active = active != nullptr;
         if (auto r = g.reports.find(id); r != g.reports.end() && v.active) {

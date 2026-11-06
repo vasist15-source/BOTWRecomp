@@ -17,6 +17,7 @@
 #include "guest_addr.h"
 #include "mods/guest_mods.h"
 #include "mods/code_mods.h"
+#include "mods/code_patches.h"
 #include "platform/host.h"
 #include "platform/app_launch.h"
 #ifdef _WIN32
@@ -527,6 +528,13 @@ int main(int argc, char** argv) {
         game_release::current().title_id.c_str(), m.entry, m.sda_base, m.sda2_base, m.data_end);
 
     dispatch::init();
+    // Settings > Mods: the Cemu graphic packs' code patches the game code holds (mods/code_patches.h): their
+    // code caves, presets and switches, before the game runs
+    mods::patches::startup(argc, argv, mods::loader::directory(), [](const std::string& id) {
+        for (const auto& m : mods::loader::list())
+            if (m.id == id) return m.enabled;
+        return false;
+    });
     guestmods::init();  // trusted manager packages, before guest threads start
     init_data_imports();
     mem_setup_heaps(m.data_end);

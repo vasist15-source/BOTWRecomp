@@ -303,6 +303,56 @@ are written when they change) and `execv`s the same executable with the same arg
 prompt for it). Play-tested by the user (2026-11-06): twice, once asked in gameplay and once without asking
 before it; the game came back each time and played on: it works.
 
+### 2026-11-06: code mods: Cemu graphic packs' code patches in the game code (Settings > Mods)
+A Cemu graphic pack with `patch_*.asm` (or a Cemuhook `patches.txt`) in the Mods folder is a code mod. Its groups
+for v208 (`moduleMatches = 0x6267BFD0`, or `rpx`) are read when the game code is translated, the way Cemu reads
+them (`tools/cemu_patches.py`, after Cemu's GraphicPack2PatchesParser/Apply, ExpressionParser and PPCAssembler):
+groups, `.origin = codecave`, labels that stick to the next item after its alignment, `name = expression`
+variables, `<address> = ...` lines, `.float/.int/.byte/.string/.align` data, Cemu's expressions (a leading 0
+without a decimal point anywhere after it is hex, one @ha/@l that applies to the whole value, division by 0 is
+0, comparisons) and a PowerPC assembler for what the BotW packs use (97 encodings checked against known words,
+the game's own from the FPS++ and cheat site tables among them). `tools/botw_code_mods.py` builds them in
+(called from `tools/probe_recomp.py`):
+- an instruction a pack changes keeps the game's own, behind the mod's switch (`botw_patch_on`,
+  `runtime/include/botw_patches.h`), as the cheats do; the functions with such sites stay in plain form.
+- code caves become functions of their own in `build/gen/code_patches.c`, at 0x01800000 and up (below the
+  game's code, so `bla` reaches them), 256-aligned one after another; calls into the game, to its imports
+  (`bl import.coreinit.OSReport`) and between cave functions are direct C calls. The runtime writes the caves'
+  bytes at startup and adds their functions to the dispatcher (`runtime/src/mods/code_patches.cpp`).
+- what depends on presets the runtime computes from the chosen presets, at startup and when one changes: cave
+  data (`.float $timeMultiplier`), the game data a pack changes (written while the mod is on, the game's bytes
+  put back when it is switched off) and 16-bit immediates (`li r12, $dayTimeEnum` reads `botw_patch_value(slot)`;
+  its place in ppc2c's C is found by translating with two sentinel immediates). The translator compiles those
+  expressions to postfix programs; `mods/code_patch_rules.cpp` runs them with Cemu's arithmetic and chooses
+  presets by Cemu's rules (one active preset per category, the saved choice or the default; a preset whose
+  condition fails is hidden; values come from active visible presets, then active hidden ones, then
+  [Default]). Presets are saved in `code_mods.json` next to the Mods folder, the switch in `mods.json`.
+- `code_patches.c` holds a manifest of the packs (JSON), each with a SHA-256 of its `rules.txt` and patch
+  files. A pack in the Mods folder that the game code doesn't hold, or holds in another version, is shown as
+  needing a rebuild: Settings > Mods > Rebuild the game code runs, in a source checkout,
+  `botw_setup.py recomp` into the build's GEN_DIR and `cmake --build`; in the installed app,
+  `botw_setup.py install --keep-build` (a kept build is now translated in place, so only the changed files
+  compile again). Then Restart now. The installer's translation stamp includes the code mods' fingerprints.
+- refused, with the reason in Settings > Mods: packs that change game code the port changes itself (FPS++,
+  Weather, the cheat packs; the Durability pack's site too, Settings > Cheats has it without the pack's bug),
+  a second mod at the same instruction (by name), jumps into the middle of a game function (FPS++-style
+  branches back), a code word computed from presets (Master Mode Options' `.int` trick), `[RAM]` (Extended
+  Memory), shaders, `[TextureRedefine]` sizes. Draw Distance's LOD bias rule is noted as not used.
+Checked: all 26 BotW v208 code packs of Cemu's graphic packs parse. With 16 of them in a test Mods folder,
+9 are built in (Day Time, Camera Sensitivity, Draw Distance, Xbox Controller Button Layout, Menu Navigation
+Speed, Arrow Draw Speed, 9999 Map Stamps Limit, LWZX Crash, NPC Stuttering Fix: 14 cave functions, 27
+instructions in 14 functions) and 7 refused as above; the 11 changed code files and `code_patches.c` compile.
+With no code mods the translation is byte-identical to before (`diff -rq` of all 310 files of build/gen, the
+empty `code_patches.c` included). Rebuilding the dev checkout for Day Time and Camera Sensitivity: translation
+1:47, build 5 s (3 game code files, `code_patches.c`, link). Tests: `tools/test_cemu_patches.py` (ctest
+`cemu_patches`), ctest `code_patch_rules` (the runtime's programs, presets and fingerprints match the
+translator's) and `code_patches` (startup, presets at once, the game's data back when switched off, which
+packs need a rebuild, on a hand-written manifest), `content_merge`, `tools/test_botw_translator_package.py`.
+Not done: Master Mode Options (code words from presets), Menu Navigation Speed has no effect (it sets values
+only Cemu's FPS++ pack reads), packs with only data patches still need the rebuild. Not play-tested yet; frame
+time and CPU % not measured (the runtime does no per-frame work for code mods; built in, a patched function
+loses the register passes and reads its mod's switch byte at each changed instruction).
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

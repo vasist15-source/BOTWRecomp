@@ -52,12 +52,28 @@ else:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_patch_module_invalidates_translation_cache(self):
-        for name in ('botw_fps_patches.py', 'botw_cheat_patches.py'):
+        for name in ('botw_fps_patches.py', 'botw_cheat_patches.py', 'botw_code_mods.py', 'cemu_patches.py'):
             with self.subTest(name), mock.patch.object(setup, 'ROOT', str(self.root)):
                 before = setup.recomp_stamp(str(self.rpx))
                 patch = self.root / 'tools' / name
                 patch.write_text(patch.read_text() + '\n# changed patch input\n')
                 self.assertNotEqual(before, setup.recomp_stamp(str(self.rpx)))
+
+    def test_code_mods_invalidate_translation_cache(self):
+        mods = pathlib.Path(self.temp.name) / 'Mods'
+        pack = mods / 'DayTime'
+        pack.mkdir(parents=True)
+        with mock.patch.object(setup, 'ROOT', str(self.root)), mock.patch.dict('os.environ', {'BOTW_MODS_DIR': str(mods)}):
+            empty = setup.recomp_stamp(str(self.rpx))
+            (pack / 'rules.txt').write_text('[Definition]\nname = Day Time\n')
+            self.assertEqual(empty, setup.recomp_stamp(str(self.rpx)))  # no patch files: a content pack
+            (pack / 'patch_DayTime.asm').write_text('[T]\nmoduleMatches = 0x6267BFD0\n0x02000000 = nop\n')
+            with_mod = setup.recomp_stamp(str(self.rpx))
+            self.assertNotEqual(empty, with_mod)
+            (pack / 'patch_DayTime.asm').write_text('[T]\nmoduleMatches = 0x6267BFD0\n0x02000004 = nop\n')
+            self.assertNotEqual(with_mod, setup.recomp_stamp(str(self.rpx)))
+            with mock.patch.dict('os.environ', {'BOTW_CODE_MODS': '0'}):
+                self.assertEqual(empty, setup.recomp_stamp(str(self.rpx)))
 
     def test_cheat_sites_keep_the_original_instruction(self):
         cheats = module('botw_cheat_patches', ROOT / 'tools/botw_cheat_patches.py')

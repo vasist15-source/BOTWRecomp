@@ -715,8 +715,17 @@ class Installer:
             self.log("The game code was translated before with the same translator; reusing %s" % gen)
             self.step_done("recompile", "skipped", "already up to date")
             return
-        tmp = gen + ".tmp"
-        shutil.rmtree(tmp, ignore_errors=True)
+        # a kept build (--keep-build) is translated in place: only the files that change are written, so only
+        # those compile again (a rebuild for code mods); its stamp goes first, so a cancelled run isn't taken
+        # as up to date
+        in_place = a.keep_build and os.path.isfile(os.path.join(gen, "funcs.h"))
+        tmp = gen if in_place else gen + ".tmp"
+        if in_place:
+            if os.path.isfile(stamp_file):
+                os.remove(stamp_file)
+            self.log("Translating into the kept build %s (only changed files are written)" % gen)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
         t0 = time.time()
 
         def on_line(line):
@@ -735,8 +744,9 @@ class Installer:
         self.run([sys.executable, "-u", os.path.abspath(__file__), "recomp", rpx, tmp], cwd=ROOT, on_line=on_line)
         with open(os.path.join(tmp, ".installer-stamp"), "w") as f:
             f.write(stamp)
-        shutil.rmtree(gen, ignore_errors=True)
-        os.replace(tmp, gen)
+        if not in_place:
+            shutil.rmtree(gen, ignore_errors=True)
+            os.replace(tmp, gen)
         self.step_done("recompile")
 
     def do_configure(self):
@@ -932,14 +942,29 @@ def build_env():
     return env
 
 
+TRANSLATOR_SCRIPTS = ("probe_recomp.py", "botw_fps_patches.py", "botw_cheat_patches.py", "botw_code_mods.py", "cemu_patches.py",
+                      "rpx.py")
+
+
 def recomp_stamp(rpx):
+    """What the translated code depends on: the game's code, the translator, and the code mods in the Mods
+    folder (each pack's name and fingerprint, tools/botw_code_mods.py)."""
     h = hashlib.sha256()
     h.update(file_sha256(rpx).encode())
     for d in (os.path.join(ROOT, "tools", "recomp"), os.path.join(ROOT, "tools")):
         for n in sorted(os.listdir(d)):
-            if n.endswith(".py") and (d.endswith("recomp") or n in ("probe_recomp.py", "botw_fps_patches.py", "botw_cheat_patches.py", "rpx.py")):
+            if n.endswith(".py") and (d.endswith("recomp") or n in TRANSLATOR_SCRIPTS):
                 with open(os.path.join(d, n), "rb") as f:
                     h.update(n.encode() + f.read())
+    mods = os.path.join(ROOT, "tools", "botw_code_mods.py")
+    if os.path.isfile(mods) and os.environ.get("BOTW_CODE_MODS") != "0":
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import botw_code_mods  # noqa: E402
+        for mod_id, pack in botw_code_mods.find_packs(botw_code_mods.mods_dir()):
+            try:
+                h.update(("code mod %s %s\n" % (mod_id, botw_code_mods.fingerprint(pack))).encode())
+            except OSError:
+                h.update(("code mod %s unreadable\n" % mod_id).encode())
     return h.hexdigest()
 
 

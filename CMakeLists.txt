@@ -409,6 +409,19 @@ add_executable(content_merge_test runtime/tools/content_merge_test.cpp runtime/s
 target_include_directories(content_merge_test PRIVATE runtime/src runtime/include)
 target_compile_options(content_merge_test PRIVATE -UNDEBUG)
 target_link_libraries(content_merge_test PRIVATE ZLIB::ZLIB Threads::Threads)
+# code mods (Settings > Mods): preset values with Cemu's arithmetic, Cemu's presets, pack folders and their
+# fingerprints, as tools/botw_code_mods.py has them (runtime/src/mods/code_patch_rules.cpp)
+add_executable(code_patch_rules_test runtime/tools/code_patch_rules_test.cpp runtime/src/mods/code_patch_rules.cpp)
+target_include_directories(code_patch_rules_test PRIVATE runtime/src runtime/include)
+target_compile_options(code_patch_rules_test PRIVATE -UNDEBUG)
+# ... and the runtime that switches them (runtime/src/mods/code_patches.cpp), on a hand-written manifest
+if(NOT WIN32)
+  add_executable(code_patches_test runtime/tools/code_patches_test.cpp runtime/src/mods/code_patches.cpp
+      runtime/src/mods/code_patch_rules.cpp)
+  target_include_directories(code_patches_test PRIVATE runtime/src runtime/include)
+  target_compile_options(code_patches_test PRIVATE -UNDEBUG)
+  target_link_libraries(code_patches_test PRIVATE Threads::Threads)
+endif()
 # the installed release (USA or Europe) and the region the game is told (runtime/src/game_release.cpp)
 add_executable(game_release_test runtime/tools/game_release_test.cpp runtime/src/game_release.cpp)
 target_include_directories(game_release_test PRIVATE runtime/src runtime/include)
@@ -603,6 +616,8 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME build_coverage COMMAND "${Python3_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_SOURCE_DIR}/tools/recomp" -p "test*.py")
+  # Cemu graphic packs' code patches: expressions, presets, the assembler, packs and their sites (no game needed)
+  add_test(NAME cemu_patches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_cemu_patches.py")
   add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/guest_map_fixture.c"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/recomp/write_map_fixture.py"
       "${CMAKE_BINARY_DIR}/guest_map_fixture.c"
@@ -657,6 +672,10 @@ add_test(NAME rtl_text COMMAND rtl_text_test)
 add_test(NAME game_languages COMMAND game_languages_test ${CMAKE_BINARY_DIR}/game_languages_test_work)
 add_test(NAME game_release COMMAND game_release_test ${CMAKE_BINARY_DIR}/game_release_test_work)
 add_test(NAME content_merge COMMAND content_merge_test ${CMAKE_BINARY_DIR}/content_merge_test_work)
+add_test(NAME code_patch_rules COMMAND code_patch_rules_test ${CMAKE_BINARY_DIR}/code_patch_rules_test_work)
+if(NOT WIN32)
+  add_test(NAME code_patches COMMAND code_patches_test ${CMAKE_BINARY_DIR}/code_patches_test_work)
+endif()
 add_test(NAME language_sources COMMAND language_source_test)
 add_test(NAME interp_pacing COMMAND interp_pacing_test)
 add_test(NAME quit_prompt COMMAND quit_prompt_test)

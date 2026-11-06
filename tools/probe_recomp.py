@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(HERE, "recomp"))
 import builds as game_builds
 import recomp
 import botw_cheat_patches
+import botw_code_mods
 import botw_fps_patches
 
 game_builds.hook_files = lambda: []
@@ -44,8 +45,10 @@ class BotwRecompiler(recomp.Recompiler):
             self.cheat_sites.setdefault(self.func_of(address), []).append(address)
         # emit_function patches these functions' C text, which expects the plain struct accesses
         # (c->r[N], c->f[N]): keep them out of crlive.py / leaflocal.py
-        self.plain_funcs |= set(self.fps_sites) | set(self.cheat_sites) | {
-            0x030BD694, 0x02F62A6C, 0x03053BD4, 0x03C70C04, 0x03C70EE4, 0x0420EBB4}
+        rewritten = {0x030BD694: "the controller repeat clock", 0x02F62A6C: "the map motion clock",
+                     0x03053BD4: "the menu countdown", 0x03C70C04: "the JPEG error handling",
+                     0x03C70EE4: "the JPEG error handling", 0x0420EBB4: "the JPEG error handling"}
+        self.plain_funcs |= set(self.fps_sites) | set(self.cheat_sites) | set(rewritten)
         words = list(self.p.words)
         # lfs f13, 0x1C(r31): VFR's pending 30/fps ratio, instead of constant 1.
         words[(0x037DC360 - self.p.text_lo) // 4] = 0xC1BF001C
@@ -54,6 +57,16 @@ class BotwRecompiler(recomp.Recompiler):
         # request; keep the preceding null-object guard and the virtual method.
         words[(0x0307CCE0 - self.p.text_lo) // 4] = 0x60000000
         self.p.words = tuple(words)
+        # Cemu graphic packs' code patches from the Mods folder, each behind its own switch (none: every
+        # file but code_patches.c is the same as without them)
+        reserved = {a: "the port's frame-time fixes" for a in expected}
+        reserved.update({a: "the port's built-in FPS++" for a in botw_fps_patches.SITES})
+        reserved.update({a: "a cheat of Settings > Cheats" for a in botw_cheat_patches.SITES})
+        # the Cemu Durability pack's site: Settings > Cheats has it without the pack's lost call target
+        reserved[0x024ACBF0] = "the durability cheat of Settings > Cheats (without the pack's bug)"
+        self.code_mods = botw_code_mods.CodeMods(self, reserved=reserved,
+                                                 reserved_functions={f: "the port's fix of " + w for f, w in rewritten.items()})
+        self.plain_funcs |= self.code_mods.plain_functions()
 
     def emit_function(self, start):
         source, count = super().emit_function(start)
@@ -86,7 +99,12 @@ class BotwRecompiler(recomp.Recompiler):
                 if source.count(old) != 1:
                     raise ValueError('Missing menu countdown emission')
                 source = source.replace(old, new)
+        source = self.code_mods.apply(source, start)
         return source, count
+
+    def run(self, outdir, per_file):
+        super().run(outdir, per_file)
+        self.code_mods.write(outdir)
 
 
 def fix_guest_jumps(source, start):

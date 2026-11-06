@@ -1,7 +1,8 @@
 // Content mods (Settings > Mods): the Mods folder holds one folder per mod, a Cemu graphic pack
-// (rules.txt with content/ and aoc/), an SDCafiine folder or just content/ and aoc/, made for the Wii U
-// game, or a BCML mod: a .bnp file (unpacked at startup with the system's tar into the caches) or an
-// unpacked one, whose merge data in logs/ is applied with its files (and with its chosen options'). At
+// (rules.txt with content/ and aoc/; its code patches are code mods, code_patches.h), an SDCafiine folder or
+// just content/ and aoc/, made for the Wii U game, or a BCML mod: a .bnp file (unpacked at startup with the
+// system's tar into the caches) or an unpacked one, whose merge data in logs/ is applied with its files (and
+// with its chosen options'). At
 // startup the enabled ones are merged in the list's order (content_merge.h; cached per set of mods and
 // options) and the game's reads of content and DLC files go to the result (hle/fs.cpp). Changes apply at
 // the next start.
@@ -37,6 +38,7 @@ struct Layout {  // what a mod folder holds
     };
     std::vector<Group> groups;  // only groups with options
     std::vector<Option> options;
+    bool code = false;    // a Cemu graphic pack with code patches (patch_*.asm, patches.txt): a code mod too
     std::string problem;  // why it can't be used ("": it can)
     std::string warning;  // parts of it that are not used
 };
@@ -62,6 +64,8 @@ struct ModView {
     bool enabled = false;  // the saved choice (next start)
     bool active = false;   // part of this run
     std::string problem, warning;
+    bool code = false;           // it has code patches too (mods::patches)
+    bool content = false;        // it has content/, aoc/ or BCML merge data (merged at startup)
     size_t files = 0, used = 0;  // this run: files it has, files the game reads from it
     std::vector<std::string> notes;
     std::vector<Layout::Group> groups;  // a BCML mod's options (none for a mod that can't be used)
