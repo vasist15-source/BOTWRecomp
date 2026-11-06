@@ -44,6 +44,7 @@
 #include "game_release.h"
 #include "input.h"
 #include "mods/manager.h"
+#include "mods/mod_loader.h"
 #include "mods/packages.h"
 #include "runtime.h"
 #ifdef __ANDROID__
@@ -495,6 +496,7 @@ int main(int argc, char** argv) {
     mods::content::set_game_root(config::game_dir);  // loose imports (fan translations) find their game path
     mods::packages::set_code_mod_support(guestmods::hooks_built() && mods::code::enabled());
     mods::packages::initialize();
+    mods::loader::startup();  // Settings > Mods: merge the enabled content mods before the game reads files
     mem::init();
     auto valid_mod_memory = [](uint32_t address, size_t size) {
         if (size > 1024 * 1024) return false;

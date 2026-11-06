@@ -46,6 +46,13 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   choice, Master Cycle Zero fuel and summoning anywhere, amiibo more than once a day).
 - Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`; `101c9500` for the European
   release).
+- Content mods made for the Wii U version: put each one (a BCML `.bnp`, a Cemu graphic pack with
+  `content`/`aoc` folders, an SDCafiine folder, or just `content`/`aoc`) in
+  `~/Library/Application Support/BotW/Mods` and switch it on in Settings > Mods. Packs that several
+  mods change are merged file by file, BCML's parameter, animation list and size changes are applied,
+  and the resource size table is updated; saves are backed up when the set of mods changes. Not yet:
+  `.bnp` options other than BCML's defaults, BCML's text, flag, ActorInfo and map merges, and Cemu code
+  patches (`patch_*.asm`) and shaders in a mod.
 
 ## What you need
 

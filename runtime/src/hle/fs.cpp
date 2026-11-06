@@ -18,6 +18,7 @@
 #include "../runtime.h"
 #include "../write_watch.h"
 #include "../mods/content.h"
+#include "../mods/mod_loader.h"
 #include "../game_languages.h"
 #include "../rtl_text.h"
 
@@ -130,11 +131,18 @@ std::string host_path(const std::string& guest) {
 #endif
 }
 
+// a content mod's file for a guest path (content and DLC; read-only access only), or ""
+std::string mod_file(const std::string& guest,const std::string& mode="rb") {
+    if(mode!="r"&&mode!="rb")return {};
+    auto file=mods::loader::replacement(guest);  // Settings > Mods (merged at startup)
+    return file.empty()?mods::content::replacement(guest,mode):file;
+}
+
 // Optional content mods affect read-only content access only. A content mod's file comes first, then
 // the pack of the active language source (game_languages.h: the European or Japanese pack the player
 // chose, read under the name the game asks for), then the installed game.
 std::string read_path(const std::string& guest,const std::string& mode="rb") {
-    auto override=mods::content::replacement(guest,mode);
+    auto override=mod_file(guest,mode);
     if(!override.empty())if(const char* trace=std::getenv("WWHD_TEST_CONTENT_TRACE");trace&&std::string(trace)=="1")LOG("[content-mod] read %s -> %s",guest.c_str(),override.c_str());
     if(override.empty()&&(mode=="r"||mode=="rb"))override=game_lang::redirect(guest);
     return override.empty()?host_path(guest):override;
@@ -288,7 +296,7 @@ HLE(coreinit, FSReadDir) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         struct stat st;
         auto path=it->second.path + "/" + de->d_name;
-        auto replacement=mods::content::replacement(it->second.gpath + "/" + de->d_name);
+        auto replacement=mod_file(it->second.gpath + "/" + de->d_name);
         if(!replacement.empty())path=std::move(replacement);
         if (stat(path.c_str(), &st) != 0) continue;
         fill_stat(out, st);

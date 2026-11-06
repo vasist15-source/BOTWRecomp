@@ -225,6 +225,59 @@ Settings > Cheats gains an Enemies card and a Weather choice (`cheatNoBloodMoon`
   029FFB3C reports an actor whose name (*(r1 + 0x40)) starts with Enemy_ as placed already.
 Regenerating changed code_087 and code_192 only (3 functions). **Not play-tested yet.**
 
+### 2026-11-06: content mods and BCML .bnp mods (Settings > Mods), first part of the mod loader
+Mods made for the Wii U version go in `~/Library/Application Support/BotW/Mods`, one folder each: a Cemu
+graphic pack (`rules.txt` with `content/` and `aoc/`; its code patches and shaders are not used), an
+SDCafiine folder (`<title id>/<mod>/content`), or just `content/` and `aoc/`, also inside a wrapper folder
+as unzipped. Switch mods, `.bnp`, `.zip` and code-only packs are listed with the reason they can't be used.
+Settings > Mods: on/off, order (higher wins), what each mod changed; changes apply at the next start.
+At startup (`mods/mod_loader.cpp`, before guest code) the enabled mods are merged (`mods/content_merge.cpp`,
+formats in `mods/botw_formats.cpp`) into `~/Library/Caches/BotW/Mods/<fingerprint of the mods' files>`, and
+`hle/fs.cpp` reads `/vol/content` and `/vol/aoc…` files from the result (one map lookup per open):
+- a file several mods have: the higher one's. Archives several mods change (packs, actor packs, nested
+  ones) are merged file by file, each mod's changes taken against the game's archive (same data
+  compressed differently counts as unchanged). Rebuilt archives keep each file's alignment class and the
+  Yaz0 header's alignment word, and are compressed again (own LZ encoder, about Nintendo's ratio).
+- a loose file the game only has inside packs (all but 7 files of TitleBG.pack and Bootup.pack, which
+  the game reads from the packs, and DLC shrine packs) is also put into those packs.
+- one mod's archive is used as it is only if it has all of the game's files (also in nested archives it
+  changes); a partial one, as BCML's .bnp packs keep only the files they change, goes into the game's copy.
+  Checked on the dump: a 2-file TitleBG.pack (one with a 1-file actor pack) merged in 89 ms, all 820 files there.
+- the resource size table (`System/Resource/ResourceSizeTable.product.srsizetable`, 67,992 entries; packs
+  have none): the mods' own entries (the larger one wins), entries of files that grew grow (fixed overhead:
+  rounded size plus the game's overhead; large overhead such as params and models: the growth at the
+  entry's ratio to the size, plus a quarter), an entry a mod's own table drops for its file is dropped, and
+  the table's own entry follows its size. DLC entries are `Aoc/0010/...` where the game has one.
+- saves are copied to `Save backups/<date>` (newest 10) when a start's set of mods differs from the last.
+  `BOTW_MODS=0` starts without mods; `BOTW_MODS_DIR` uses another folder (headless runs use none).
+- BCML mods: a `.bnp` in the Mods folder is unpacked at startup with `/usr/bin/tar` (bsdtar reads 7z) into
+  `~/Library/Caches/BotW/Mods unpacked/<name-size-time>`; an unpacked one (`content/` with `logs/` or
+  `info.json`) works the same. Its merge data is applied in the mod's turn (`mods/aamp.cpp` reads and writes
+  AAMP v2): `deepmerge.aamp` (values set, new objects and lists added, by name hash, into the file its
+  FileTable names, `content/X.sbactorpack//Actor/Y.bphysics`, inside the merged archives), `aslist.aamp`
+  (AddReses by Anim, new ones `AddRes_N` after the game's; ASDefines by Name; CFDefines by CFPre Name) and
+  `rstb.json` (sizes; 0 drops the entry). Options from `info.json` use BCML's defaults (no switches yet).
+  Mods with other logs (texts, gamedata, ActorInfo, maps, ...) are refused with their names.
+  Why: The Linkle Mod 3.0.1 unpacked without its merge data crashed at the title screen (null pointer in
+  039742E0+0xA6C, both runs) though its 130 partial actor packs merged complete. With it (checked on the dump,
+  `content_merge_test --dump`): 195 parameter files changed (Link's cloth physics count 4 -> 5 plus the
+  `Bust_Havok` entry for the new `Link.hkcl`, `Linkle_Extra_Animation` as AddRes_2, 622 of 622 support-bone
+  values of Armor_012_Upper), 135 archives merged, all 331 sizes exact and 59 entries dropped, 674 ms at the
+  first start; all 440 parameter files of the merged TitleBG.pack read, write and read back the same.
+  Then it loaded forever (the game asked for a loose `Actor/ActorLink/GameROMPlayer.bxml`): rstb.json's
+  3,071,360 for GameROMPlayer.bactorpack is BCML's own rebuild, ours was 3,080,168 bytes. Now files made
+  here (rebuilt archives, changed parameters) get at least their grown entry whatever a mod's sizes say
+  (a 0 still drops the entry), and AAMP files are written with equal values and strings stored once, as
+  the game's are (Player.baslist 32,484 bytes, the game's 32,444; GameROMPlayer 3,071,976, entry 3,072,408).
+  `content_merge_test --dump` now fails on any changed file larger than its entry: 0 of them, 133 grown,
+  1,539 parameter files round-trip.
+Not done: merges inside files of other mods (ActorInfo, gamedata flags, texts: the higher mod's whole file),
+Cemu code patches through the translator, mod-only files in directory listings. Measured with sample
+mods made from the dump (scratchpad only, synthetic edits): TitleBG.pack merged from 3 mods plus a DLC
+shrine pack in 221 ms, 347 MB peak at startup (freed before the game starts); the next start takes the
+cache in 1 ms. `content_merge_test` (ctest `content_merge`) passes. Play-tested by the user with The Linkle
+Mod 3.0.1 (2026-11-06): it works.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

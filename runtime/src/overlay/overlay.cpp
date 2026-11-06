@@ -46,6 +46,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../mods/mods.h"
 #include "../mods/cheats.h"
 #include "../mods/manager.h"
+#include "../mods/mod_loader.h"
 #include "../mods/packages.h"
 #include "../mods/graphic_packs.h"
 #include "../mods/catalogue_client.h"
@@ -144,10 +145,11 @@ ImGuiKey imgui_key(int code) {
 }
 
 // ---------------------------------------------------------------- UI state (render thread)
-// no Mods: Wind Waker code mods; no Saves: save states have no menu or shortcut (removed 2026-11-06)
-enum Tab { kGraphics, kDisplay, kAudio, kControls, kKeyboard, kCheats, kAbout, kTabs };
-const char* const kTabNames[kTabs] = {"Graphics", "Display", "Audio", "Controls", "Keyboard & Mouse", "Cheats", "Language & About"};
-const char* const kTabIds[kTabs] = {"graphics", "display", "audio", "controls", "keyboard", "cheats", "about"};
+// Mods: BotW content mods (mods/mod_loader.h), not Wind Waker's code mods; no Saves: save states have no
+// menu or shortcut (removed 2026-11-06)
+enum Tab { kGraphics, kDisplay, kAudio, kControls, kKeyboard, kCheats, kMods, kAbout, kTabs };
+const char* const kTabNames[kTabs] = {"Graphics", "Display", "Audio", "Controls", "Keyboard & Mouse", "Cheats", "Mods", "Language & About"};
+const char* const kTabIds[kTabs] = {"graphics", "display", "audio", "controls", "keyboard", "cheats", "mods", "about"};
 
 struct Ui {
     bool init = false;
@@ -1703,6 +1705,63 @@ void tab_cheats() {
               "switch one off and the game plays as normal again.");
 }
 
+// Mods (mods/mod_loader.cpp): content mods in the Mods folder, merged when the game starts
+void tab_mods() {
+    const std::vector<mods::loader::ModView> list = mods::loader::list();
+    heading("Content mods");
+    if (list.empty())
+        note("No mods yet. Put each mod in its own folder in the Mods folder (Show in Finder below): a Cemu "
+             "graphic pack (rules.txt with content and aoc folders), an SDCafiine folder, or a folder with "
+             "content and aoc folders, made for the Wii U version.");
+    for (size_t i = 0; i < list.size(); i++) {
+        const mods::loader::ModView& m = list[i];
+        ImGui::PushID(m.id.c_str());
+        if (i) ImGui::Spacing();
+        bool on = m.enabled && m.problem.empty();
+        const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;  // the card's right edge
+        ImGui::BeginDisabled(!m.problem.empty());
+        if (toggle(m.name.c_str(), &on)) mods::loader::set_enabled(m.id, on);
+        ImGui::EndDisabled();
+        if (!m.description.empty()) help(m.description.c_str());
+        // order: higher in the list wins
+        const float bw = ImGui::GetFrameHeight(), sp = ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX(), right - 2 * bw - sp));
+        ImGui::BeginDisabled(i == 0);
+        if (ImGui::ArrowButton("up", ImGuiDir_Up)) mods::loader::move(m.id, -1);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(i + 1 == list.size());
+        if (ImGui::ArrowButton("down", ImGuiDir_Down)) mods::loader::move(m.id, +1);
+        ImGui::EndDisabled();
+        if (!m.problem.empty()) {
+            warn("%s", m.problem.c_str());
+        } else {
+            std::string line = m.kind + (m.id != m.name ? ", folder " + m.id : std::string());
+            if (m.active) line += ": in use, " + std::to_string(m.used) + " of its " + std::to_string(m.files) + " files read by the game";
+            note("%s", line.c_str());
+            if (!m.warning.empty()) warn("%s", m.warning.c_str());
+            for (const auto& n : m.notes) note("%s", n.c_str());
+        }
+        ImGui::PopID();
+    }
+    close_card();
+    if (hostui::can_open_folder()) {
+        if (ImGui::Button("Show in Finder")) {
+            std::string d = mods::loader::directory();
+            hostui::post([d] { hostui::open_folder(d); });
+        }
+        ImGui::SameLine();
+    }
+    if (ImGui::Button("Look for new mods")) mods::loader::rescan();
+    if (mods::loader::restart_needed()) warn("Restart the game to apply these changes.");
+    const std::string summary = mods::loader::summary();
+    if (!summary.empty()) note("This start: %s", summary.c_str());
+    note("Mods higher in the list win where two change the same file. Archives that several mods change are "
+         "merged file by file, and the resource size table is updated for you. Changes apply when the game "
+         "starts again. Mods for the Switch version don't work here. When you start with a different set of "
+         "mods, your saves are backed up first (Save backups, next to the Mods folder).");
+}
+
 // sidebar icons: a coloured rounded tile with a white glyph, as System Settings draws them
 void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
     static const ImVec4 tiles[kTabs] = {
@@ -1712,6 +1771,7 @@ void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
         ImVec4(0.19f, 0.78f, 0.35f, 1),  // Controls: green
         ImVec4(0.56f, 0.56f, 0.58f, 1),  // Keyboard & Mouse: gray
         ImVec4(1.00f, 0.58f, 0.00f, 1),  // Cheats: orange
+        ImVec4(0.00f, 0.66f, 0.68f, 1),  // Mods: teal
         ImVec4(0.37f, 0.36f, 0.90f, 1),  // Language & About: indigo
     };
     const ImVec4 tile = tiles[tab];
@@ -1760,6 +1820,15 @@ void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
             for (int c = 0; c < 5; c++) dl->AddRectFilled(P(5.2f + c * 2.5f, 8.4f + r * 2.3f), P(6.6f + c * 2.5f, 9.6f + r * 2.3f), white, 0.3f * k);
         dl->AddRectFilled(P(7.5f, 13), P(14.5f, 14), white, 0.4f * k);
         break;
+    case kMods: {  // stacked layers
+        const ImVec2 top[4] = {P(11, 4.5f), P(18, 8.5f), P(11, 12.5f), P(4, 8.5f)};
+        dl->AddConvexPolyFilled(top, 4, white);
+        for (float y : {12.0f, 15.5f}) {
+            const ImVec2 v[3] = {P(4, y), P(11, y + 4), P(18, y)};
+            dl->AddPolyline(v, 3, white, 1.6f * k);
+        }
+        break;
+    }
     case kCheats: {  // heart
         dl->AddCircleFilled(P(8.1f, 8.9f), 3.5f * k, white, 20);
         dl->AddCircleFilled(P(13.9f, 8.9f), 3.5f * k, white, 20);
@@ -1903,6 +1972,7 @@ void settings_window() {
         case kControls: tab_controls(); break;
         case kKeyboard: tab_keyboard(); break;
         case kCheats: tab_cheats(); break;
+        case kMods: tab_mods(); break;
         default: tab_about(); break;
         }
         close_card();
