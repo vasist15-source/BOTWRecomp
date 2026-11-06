@@ -28,7 +28,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kCacheFormat = 4;     // bump when merged output changes for the same inputs (3: compact AAMP, sizes of rebuilt files; 4: BCML events, flags, save data, texts)
+constexpr int kCacheFormat = 5;     // bump when merged output changes for the same inputs (3: compact AAMP, sizes of rebuilt files; 4: BCML events, flags, save data, texts; 5: the other BCML tables)
 constexpr size_t kSaveBackups = 10;  // newest kept in "Save backups"
 
 std::string lower(std::string s) {
@@ -100,11 +100,15 @@ void read_rules(const fs::path& rules, Layout& l) {
 }
 // A BCML mod (.bnp) keeps some changes only as merge data in logs/. The merge applies deepmerge.aamp and
 // aslist.aamp (actor parameters, animation lists), rstb.json (sizes), eventinfo.yml, gamedata.yml, savedata.yml
-// and texts.json (events, game data and save data flags, texts: bcml_merge.h); packs.json only lists its packs.
-// Anything else (ActorInfo, maps, shops, drops, quests, ...) is not applied yet, and without it the game can crash
-// (The Linkle Mod unpacked before this support: support bones and physics of its new models, 2026-11-06).
-const char* const kBcmlLogs[] = {"packs.json", "rstb.json", "deepmerge.aamp", "aslist.aamp",
-                                 "eventinfo.yml", "gamedata.yml", "savedata.yml", "texts.json"};
+// and texts.json (events, game data and save data flags, texts), actorinfo.yml, map.yml, shop.aamp, drops.json,
+// quests.yml, residents.yml, areadata.yml, effects.yml, mainstatic.yml and dstatic.yml (actors, map units, shops,
+// drop tables, quests, resident actors, area data, status effects, the main field's and the shrines' static data:
+// bcml_merge.h); packs.json only lists its packs. A log of any other name is not applied, and without it the game
+// can crash (The Linkle Mod unpacked before its logs were applied: support bones and physics of its new models,
+// 2026-11-06), so such a mod is refused.
+const char* const kBcmlLogs[] = {"packs.json", "rstb.json", "deepmerge.aamp", "aslist.aamp", "eventinfo.yml", "gamedata.yml",
+                                 "savedata.yml", "texts.json", "actorinfo.yml", "map.yml", "shop.aamp", "drops.json",
+                                 "quests.yml", "residents.yml", "areadata.yml", "effects.yml", "mainstatic.yml", "dstatic.yml"};
 bool bcml_logs(const fs::path& dir, std::string& unsupported) {  // whether dir/logs has any; which can't be applied
     std::error_code ec;
     std::vector<std::string> other;
@@ -617,12 +621,17 @@ Layout detect(const fs::path& folder, const std::string& title) {
             l.aoc = aoc;
             return l;
         }
-        if (!content.empty() || !aoc.empty()) {
+        std::string unsupported;
+        const bool logs = bcml_logs(cur, unsupported);
+        // a BCML mod may have only merge data: BCML leaves out the files its logs have (map units, ActorInfo, ...)
+        const bool only_logs = logs && std::any_of(std::begin(kBcmlLogs), std::end(kBcmlLogs), [&](const char* k) {
+            std::error_code e;
+            return std::string(k) != "packs.json" && fs::is_regular_file(cur / "logs" / k, e);
+        });
+        if (!content.empty() || !aoc.empty() || only_logs) {
             l.kind = in_title ? "SDCafiine folder" : "Content folder";
             l.content = content;
             l.aoc = aoc;
-            std::string unsupported;
-            const bool logs = bcml_logs(cur, unsupported);
             std::error_code ec;
             if (logs || fs::exists(cur / "info.json", ec)) {
                 l.kind = "BCML mod";

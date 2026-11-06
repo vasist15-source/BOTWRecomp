@@ -38,19 +38,6 @@ bool write_doc(const byml::Document& doc, Bytes& out, std::string& why, const st
     if (!byml::write(doc, out, &bad)) return fail(why, what + ": " + bad);
     return true;
 }
-// BCML's util.dict_merge: hashes merge key by key, lists are replaced (overwrite_lists) or extended
-void dict_merge(Value& dst, const Value& src, bool overwrite_lists) {
-    for (const auto& [key, v] : src.hash) {
-        Value* d = dst.find(key);
-        if (d && d->type == Type::Hash && v.type == Type::Hash) dict_merge(*d, v, overwrite_lists);
-        else if (d && d->type == Type::Array && v.type == Type::Array) {
-            if (overwrite_lists) *d = v;
-            else d->array.insert(d->array.end(), v.array.begin(), v.array.end());
-        } else {
-            dst.set(key, v);
-        }
-    }
-}
 // "/revival_bool_data_4.bgdata" -> "/revival_bool_data", 4
 bool split_name(const std::string& name, std::string& prefix, int& index) {
     const size_t dot = name.rfind('.');
@@ -126,6 +113,19 @@ bool open_msbt(const std::string& name, const Bytes& data, msbt::File& f, std::s
 }
 
 }  // namespace
+
+void dict_merge(Value& dst, const Value& src, bool overwrite_lists) {
+    for (const auto& [key, v] : src.hash) {
+        Value* d = dst.find(key);
+        if (d && d->type == Type::Hash && v.type == Type::Hash) dict_merge(*d, v, overwrite_lists);
+        else if (d && d->type == Type::Array && v.type == Type::Array) {
+            if (overwrite_lists) *d = v;
+            else d->array.insert(d->array.end(), v.array.begin(), v.array.end());
+        } else {
+            dst.set(key, v);
+        }
+    }
+}
 
 // ---------------------------------------------------------------- EventInfo
 bool read_events(const std::string& yaml, Value& diff, std::string& why) {

@@ -16,6 +16,7 @@ struct Value {
     enum Type { Null, Bool, Number, String, Array, Object } type=Null;
     bool boolean=false; double number=0; std::string text;
     std::vector<Value> array; std::map<std::string,Value> object;
+    std::vector<std::string> keys;  // Object, as read: its keys in the order of the text
     Value()=default;
     Value(bool b):type(Bool),boolean(b){}
     Value(double n):type(Number),number(n){}
@@ -71,7 +72,7 @@ class Reader {
     Value value(unsigned depth){
         if(depth>32)fail("JSON nesting limit");ws();if(p==s.size())fail("Unexpected end");Value v;
         if(s[p]=='"')return Value(str());
-        if(take('{')){v.type=Value::Object;if(take('}'))return v;do{auto key=str();if(!take(':'))fail("Expected colon");if(v.object.contains(key))fail("Duplicate key");v.object.emplace(key,value(depth+1));if(take('}'))return v;}while(take(','));fail("Expected object separator");}
+        if(take('{')){v.type=Value::Object;if(take('}'))return v;do{auto key=str();if(!take(':'))fail("Expected colon");if(v.object.contains(key))fail("Duplicate key");v.keys.push_back(key);v.object.emplace(key,value(depth+1));if(take('}'))return v;}while(take(','));fail("Expected object separator");}
         if(take('[')){v.type=Value::Array;if(take(']'))return v;do{if(v.array.size()>=65536)fail("Array limit");v.array.push_back(value(depth+1));if(take(']'))return v;}while(take(','));fail("Expected array separator");}
         for(auto [literal,type,b]:{std::tuple{"null",Value::Null,false},std::tuple{"true",Value::Bool,true},std::tuple{"false",Value::Bool,false}}){std::string l=literal;if(s.compare(p,l.size(),l)==0){p+=l.size();v.type=type;v.boolean=b;return v;}}
         size_t start=p;if(s[p]=='-')++p;

@@ -6,23 +6,29 @@
 //   savedata.yml   GameData/savedataformat.ssarc: game_data.sav's flags (name and hash) added or deleted
 //   texts.json     Message/Msg_<language>.product.ssarc in Pack/Bootup_<language>.pack: texts added or
 //                  replaced by label, per MSBT file, in msyt's JSON form
-// A mod's diff is merged over the game's file in load order (later mods win). A mod that ships its own copy of
-// such a file and no log for it has its changes against the game's copy taken as its diff, as BCML does when
-// it installs a mod. Files the merge leaves alone stay as the game has them; new flags go where the game keeps
-// flags of their kind (MainField_... and the other stage flags with the revival ones).
+// and the tables of one file each below (bcml_tables.cpp). A mod's diff is merged over the game's file in load order
+// (later mods win). A mod that ships its own copy of such a file and no log for it has its changes against the game's
+// copy taken as its diff, as BCML does when it installs a mod. Files the merge leaves alone stay as the game has them;
+// new flags go where the game keeps flags of their kind (MainField_... and the other stage flags with the revival ones).
 #pragma once
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "aamp.h"
 #include "byml.h"
 
 namespace mods::bcml {
 
 using Bytes = std::vector<uint8_t>;
 using Files = std::map<std::string, Bytes>;  // an archive's files by name, as stored
+
+// BCML's util.dict_merge: hashes merge key by key, lists are replaced (overwrite_lists) or extended
+void dict_merge(byml::Value& dst, const byml::Value& src, bool overwrite_lists);
 
 // ---- EventInfo: a Hash of event entries ("Npc_oasis001<Talk>": {...})
 bool read_events(const std::string& yaml, byml::Value& diff, std::string& why);
@@ -62,5 +68,45 @@ bool texts_of_copy(const Files& game, const Files& copy, TextFiles& diff, std::s
 // of the same language in another region, else English, else any (null: the mod has none)
 const TextFiles* texts_for(const std::map<std::string, TextFiles>& diff, const std::string& language);
 bool merge_texts(const Files& game, const std::vector<const TextFiles*>& diffs, Files& changed, size_t& texts, std::string& why);
+
+// ---------------------------------------------------------------- tables of one file each (bcml_tables.cpp)
+//   actorinfo.yml   Actor/ActorInfo.product.sbyml: actors by the CRC-32 of their name, fields merged
+//   map.yml         Map/MainField/<A-1>/<A-1>_Static.smubin and _Dynamic: objects and rails by HashId
+//   shop.aamp       Actor/ShopData/*.bshop in actor packs: items added to or removed from a shop's tables
+//   drops.json      Actor/DropTable/*.bdrop in actor packs: drop tables replaced whole
+//   quests.yml      Quest/QuestProduct.sbquestpack in Pack/TitleBG.pack: quests by Name
+//   residents.yml   Actor/ResidentActors.byml in Pack/Bootup.pack: resident actors by name
+//   areadata.yml    Ecosystem/AreaData.sbyml in Pack/Bootup.pack: areas by AreaNumber, fields merged
+//   effects.yml     Ecosystem/StatusEffectList.sbyml in Pack/Bootup.pack: status effects by name
+//   mainstatic.yml  Map/MainField/Static.smubin: markers, start positions, ... by position and name
+//   dstatic.yml     Map/CDungeon/Static.smubin: shrine entrances by map and position name
+enum class Kind { ActorInfo, Map, Shop, Drop, Quests, Residents, AreaData, Effects, MainStatic, DungeonStatic };
+struct DropTable {
+    int32_t repeat_min = 0, repeat_max = 0, approach = 0, speed = 0;  // RepeatNumMin/Max, ApproachType, OccurrenceSpeedType
+    std::vector<std::pair<std::string, std::optional<float>>> items;  // in order; no value: BCML's UNDERRIDE (the game's)
+    bool operator==(const DropTable& o) const {
+        return repeat_min == o.repeat_min && repeat_max == o.repeat_max && approach == o.approach && speed == o.speed && items == o.items;
+    }
+};
+using Drops = std::vector<std::pair<std::string, DropTable>>;  // tables in order
+// a mod's changes to one file: as its log has them (a BYML value; shops an AAMP list, drops their tables)
+struct Diff {
+    byml::Value value;
+    aamp::List shop;
+    Drops drops;
+};
+// logs (one file each, or a file for each map unit / shop / drop table: "A-1_Static",
+// "content/Actor/Pack/X.sbactorpack//Actor/ShopData/X.bshop")
+bool read_log(Kind k, const std::string& text, Diff& diff, std::string& why);  // a log of a single file
+bool read_maps(const std::string& yaml, std::map<std::string, Diff>& units, std::string& why);
+bool read_shops(const Bytes& aamp, std::map<std::string, Diff>& files, std::string& why);
+bool read_drops(const std::string& json, std::map<std::string, Diff>& files, std::string& why);
+// the entries a diff changes (actors, objects, items, ...), for the Mods page
+size_t entries(Kind k, const Diff& d);
+// a mod's own copy of the file (unpacked) as its diff against the game's (unpacked), as BCML logs a mod it installs
+bool diff_of_copy(Kind k, const Bytes& game, const Bytes& copy, Diff& diff, std::string& why);
+// the game's file (unpacked) with the diffs, in load order; `out` (unpacked) and the entries that differ from the
+// game's. False with an empty `why` when nothing changes.
+bool merge_file(Kind k, const Bytes& game, const std::vector<const Diff*>& diffs, Bytes& out, size_t& changed, std::string& why);
 
 }  // namespace mods::bcml

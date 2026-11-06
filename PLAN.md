@@ -392,6 +392,50 @@ from the mod's own texts.json (BCML misses them too). Switching Linkle off worke
 outfit). Still refused by name: actorinfo.yml, areadata.yml, drops.json, dstatic.yml, effects.yml, mainstatic.yml,
 map.yml, quests.yml, residents.yml, shop.aamp. No per-frame work; frame time and CPU % not measured.
 
+### 2026-11-07: the rest of BCML's merge data: actors, map units, shops, drop tables, quests, ... (layer 2, part 2)
+A `.bnp`'s other ten logs are applied too, so every log BCML's mergers write is: `actorinfo.yml`, `map.yml`, `shop.aamp`,
+`drops.json`, `quests.yml`, `residents.yml`, `areadata.yml`, `effects.yml`, `mainstatic.yml`, `dstatic.yml`. BCML 2.x logs
+(`packs.log`, `rstb.log`, `deepmerge.yml`, ...) stay refused, as BCML refuses them. A BCML mod with only `logs/` (BCML leaves
+out the files its logs have: map units, ActorInfo) now loads; before, it had "no content/ folder". The mergers are
+`mods/bcml_tables.cpp` (BCML's actors.py and actorinfo.rs, mubin.py and maps.rs, shop.py, drop.py, quests.py, residents.py,
+areadata.py, effects.py, mainstatic.py; UKMM's uk-manager and uk-content as a second reference; our own code). Each file is
+rebuilt from the game's copy with every mod's log, or a plain mod's own copy's changes against the game's, in load order,
+where the game reads it, and replaces the mods' copies:
+- ActorInfo (`Actor/ActorInfo.product.sbyml`, loose): actors by the CRC-32 of their name, fields merged (lists replaced), new
+  ones added, the list kept in hash order with its Hashes; an actor's instSize is the largest any mod gives.
+- map units (`A-1_Static`, `A-1_Dynamic`): objects and rails by HashId: changes (the highest mod's), deletions (any mod's),
+  new ones (the highest mod's first), sorted by HashId; BCML's first logs (objects only) too. With the DLC the DLC's units:
+  static ones in `aoc/0010/Pack/AocMainField.pack` (which the game reads before the loose copies) and loose, dynamic ones
+  loose; BCML empties AocMainField.pack and writes loose copies instead. Without the DLC: `Pack/TitleBG.pack`, loose.
+- shops (`Actor/ShopData/*.bshop`) and drop tables (`Actor/DropTable/*.bdrop`) in their actor pack wherever the game has it
+  (title actors in Pack/TitleBG.pack, whatever path the log gives). Shops: BCML's additions and removals per table and
+  item; drop tables: a later mod's table replaces an earlier one's whole, the game's tables and items no log has go (as
+  BCML: its logs hold whole files), UNDERRIDE takes the game's probability.
+- quests (`Quest/QuestProduct.sbquestpack` in TitleBG.pack): by Name, a new one after its `prev_quest`; resident actors,
+  area data (by AreaNumber, fields merged) and status effects in Bootup.pack; the main field's static data (entries by
+  BCML's id: position rounded up and the first "name" key's value) and the shrines' entrances: the DLC's loose copies, else
+  Bootup.pack's.
+Where BCML's code loses data or can't mean what it does, this differs: drop tables number each table (BCML's writer puts
+the first one's name under Table00, which the game doesn't read, and the last one's twice); a changed quest is the highest
+mod's (BCML takes the lowest one's) and loses BCML's `prev_quest`; static entries that share an id (12 in the DLC's file)
+are all kept (BCML keeps one per id in a category a mod changes); resident actors keep the game's order (BCML sorts them);
+a shop table left with no items is left out and an UNDERRIDE item the game lacks is dropped (BCML stops with an error).
+With the DLC, plain mods' base-game copies of map units are not merged into the DLC's (BCML diffs them against the base
+game). `kCacheFormat` 5 (one re-merge). The written quest file is about half the game's size (466,780 bytes against
+883,444): the game's file doesn't share equal nodes, ours (as BCML's oead) does; it reads back to the same values. On the
+dump, ActorInfo with one price changed writes back at exactly the game's 1,963,744 bytes.
+Tested on synthetic data only (the user has no mods with these logs): `content_merge_test` (ctest `content_merge`, passes)
+merges all ten kinds from two .bnp-style mods and a plain mod's copies, with and without the DLC, and each merger alone
+(a mod's copy as its diff gives its file back). `content_merge_test --dump` with the user's Mods folder (The Linkle Mod 3.0.1
+with Royal Guards Armoury and the Umbrella Glider, Gerudo Hero) and three synthetic mods made from the dump (scratchpad
+only: a log of each kind, a second one on the same files, a plain mod with its own ActorInfo, A-1 dynamic unit and
+Bokoblin actor pack): 1174-1193 ms at the first start, 440 MB peak, 4-6 ms from the cache (the user's mods alone:
+1019-1124 ms, 400 MB); without the DLC 1247 ms. Every rebuilt file reads back (ActorInfo, AocMainField.pack, the A-1 units,
+both static files, TitleBG.pack, Bootup.pack, two actor packs), no size entry is smaller than its file, and every logged
+change is in the merged files (3 actors, 5 map entries, 2 shop items, 11 drop tables, 2 quests, 1 resident actor, 1 area,
+1 status effect, 2 static entries, 1 shrine entrance). No per-frame work; frame time and CPU % not measured. Not
+play-tested yet.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

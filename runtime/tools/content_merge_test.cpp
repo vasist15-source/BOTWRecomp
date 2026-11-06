@@ -7,7 +7,10 @@
 //   content_merge_test WORK --options TABLE  (run by the test itself) a start with other BCML options
 //   content_merge_test --dump GAME BASE AOC MODS   by hand: the loader on a real dump and Mods folder; every
 //                      merged archive is read back (BOTW_MODS_DIR=MODS; its cache is MODS/../Mods cache)
+#include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cmath>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -236,10 +239,10 @@ const aamp::Param& value(const aamp::List& l, const char* object, const char* pa
     assert(p);
     return *p;
 }
-// a BCML log: FileTable names the files, each file's changes are the list named by the CRC-32 of its name
-Bytes bcml_log(const std::vector<std::pair<std::string, aamp::List>>& files) {
+// a BCML log: FileTable (shop.aamp: Filenames) names the files, each file's changes are the list named by the CRC-32 of its name
+Bytes bcml_log(const std::vector<std::pair<std::string, aamp::List>>& files, const char* table_name = "FileTable") {
     aamp::List root{aamp::hash("param_root"), {}, {}};
-    aamp::Object table{aamp::hash("FileTable"), {}};
+    aamp::Object table{aamp::hash(table_name), {}};
     for (size_t i = 0; i < files.size(); i++) {
         table.params.push_back({aamp::hash("File" + std::to_string(i)), aamp::kStringRef, bytes(files[i].first)});
         aamp::List diff = files[i].second;
@@ -875,6 +878,386 @@ void test_bcml_tables(const fs::path& root) {
     assert(bcml::texts_for(langs, "USfr") == &langs["USen"] && bcml::texts_for({}, "USen") == nullptr);
 }
 
+// ---------------------------------------------------------------- BCML merge data for tables of one file each
+std::vector<std::string> split_parts(const std::string& path) {  // "A//B" -> A, B
+    std::vector<std::string> out;
+    for (size_t at = 0;;) {
+        const size_t sep = path.find("//", at);
+        out.push_back(path.substr(at, sep == std::string::npos ? std::string::npos : sep - at));
+        if (sep == std::string::npos) return out;
+        at = sep + 2;
+    }
+}
+std::string actor_key(const std::string& path) {  // a shop's or drop table's path by its actor pack: "content/Actor/Pack/X.sbactorpack//..."
+    const auto parts = split_parts(path);
+    size_t k = 0;
+    while (k + 1 < parts.size() && parts[k].find(".sbactorpack") == std::string::npos) k++;
+    std::string key = "content/" + (parts[k].rfind("content/", 0) == 0 ? parts[k].substr(8) : parts[k]);
+    for (size_t j = k + 1; j < parts.size(); j++) key += "//" + parts[j];
+    return key;
+}
+std::string num(const char* key, int n, int digits) {
+    char b[48];
+    snprintf(b, sizeof b, "%s%0*d", key, digits, n);
+    return b;
+}
+using ShopTables = std::vector<std::pair<std::string, std::vector<std::pair<std::string, int>>>>;  // table -> (item, ItemAdjustPrice)
+Bytes shop_file(const ShopTables& tables) {  // a .bshop as the game's
+    aamp::Object header = O("Header", {I("TableNum", int(tables.size()))});
+    std::vector<aamp::Object> objects;
+    for (size_t t = 0; t < tables.size(); t++) {
+        header.params.push_back(S(num("Table", int(t + 1), 2).c_str(), tables[t].first));
+        aamp::Object o = O(tables[t].first.c_str(), {I("ColumnNum", int(tables[t].second.size()))});
+        for (size_t i = 0; i < tables[t].second.size(); i++) {
+            const int n = int(i + 1);
+            o.params.push_back(I(num("ItemSort", n, 3).c_str(), n - 1));
+            o.params.push_back(S(num("ItemName", n, 3).c_str(), tables[t].second[i].first));
+            o.params.push_back(I(num("ItemNum", n, 3).c_str(), 1));
+            o.params.push_back(I(num("ItemAdjustPrice", n, 3).c_str(), tables[t].second[i].second));
+            o.params.push_back({aamp::hash(num("ItemLookGetFlg", n, 3)), aamp::kBool, le(0)});
+            o.params.push_back(I(num("ItemAmount", n, 3).c_str(), 1));
+        }
+        objects.push_back(std::move(o));
+    }
+    objects.insert(objects.begin(), header);
+    return aamp_bytes(L("param_root", {}, objects));
+}
+ShopTables shop_of(const Bytes& b) {
+    const aamp::List root = aamp_of(b);
+    ShopTables out;
+    for (const auto& p : aamp::object(root, aamp::hash("Header"))->params) {
+        if (!aamp::is_string(p.type)) continue;
+        const aamp::Object* o = aamp::object(root, aamp::hash(aamp::text(p)));
+        assert(o);
+        auto& items = out.emplace_back(aamp::text(p), std::vector<std::pair<std::string, int>>{}).second;
+        int32_t columns;
+        memcpy(&columns, aamp::param(*o, aamp::hash("ColumnNum"))->data.data(), 4);
+        for (int n = 1; n <= columns; n++) {
+            int32_t price, sort;
+            memcpy(&price, aamp::param(*o, aamp::hash(num("ItemAdjustPrice", n, 3)))->data.data(), 4);
+            memcpy(&sort, aamp::param(*o, aamp::hash(num("ItemSort", n, 3)))->data.data(), 4);
+            assert(sort == n - 1);
+            items.push_back({aamp::text(*aamp::param(*o, aamp::hash(num("ItemName", n, 3)))), price});
+        }
+    }
+    return out;
+}
+aamp::Object shop_item(const std::string& item, int price) {  // as BCML's shop data has an item
+    return {aamp::hash(item), {S("ItemName", item), I("ItemNum", 1), I("ItemAdjustPrice", price), {aamp::hash("ItemLookGetFlg"), aamp::kBool, le(0)},
+                               I("ItemAmount", 1)}};
+}
+using DropTables = std::vector<std::pair<std::string, std::vector<std::pair<std::string, float>>>>;  // table -> (item, probability)
+Bytes drop_file(const DropTables& tables) {  // a .bdrop as the game's
+    aamp::Object header = O("Header", {I("TableNum", int(tables.size()))});
+    std::vector<aamp::Object> objects;
+    for (size_t t = 0; t < tables.size(); t++) {
+        header.params.push_back(S(num("Table", int(t + 1), 2).c_str(), tables[t].first));
+        aamp::Object o = O(tables[t].first.c_str(), {I("RepeatNumMin", 1), I("RepeatNumMax", 1), I("ApproachType", 0), I("OccurrenceSpeedType", 0),
+                                                     I("ColumnNum", int(tables[t].second.size()))});
+        for (size_t i = 0; i < tables[t].second.size(); i++) {
+            o.params.push_back(S(num("ItemName", int(i + 1), 2).c_str(), tables[t].second[i].first));
+            o.params.push_back(F(num("ItemProbability", int(i + 1), 2).c_str(), tables[t].second[i].second));
+        }
+        objects.push_back(std::move(o));
+    }
+    objects.insert(objects.begin(), header);
+    return aamp_bytes(L("param_root", {}, objects));
+}
+DropTables drops_of(const Bytes& b) {
+    const aamp::List root = aamp_of(b);
+    DropTables out;
+    const aamp::Object* header = aamp::object(root, aamp::hash("Header"));
+    int32_t count;
+    memcpy(&count, aamp::param(*header, aamp::hash("TableNum"))->data.data(), 4);
+    for (int t = 1; t <= count; t++) {  // as the game reads it: Table01 to TableNum
+        const std::string name = aamp::text(*aamp::param(*header, aamp::hash(num("Table", t, 2))));
+        const aamp::Object* o = aamp::object(root, aamp::hash(name));
+        assert(o);
+        auto& items = out.emplace_back(name, std::vector<std::pair<std::string, float>>{}).second;
+        int32_t columns;
+        memcpy(&columns, aamp::param(*o, aamp::hash("ColumnNum"))->data.data(), 4);
+        for (int n = 1; n <= columns; n++) {
+            float p;
+            memcpy(&p, aamp::param(*o, aamp::hash(num("ItemProbability", n, 2)))->data.data(), 4);
+            items.push_back({aamp::text(*aamp::param(*o, aamp::hash(num("ItemName", n, 2)))), p});
+        }
+    }
+    return out;
+}
+byml::Value actor_entry(const std::string& name, int price) {
+    return Ha({{"name", S(name)}, {"itemBuyingPrice", N(price)}, {"instSize", N(1000)}, {"profile", S("Item")}});
+}
+Bytes actor_info(std::vector<byml::Value> actors) {  // ActorInfo: actors sorted by the CRC-32 of their name, with the hashes
+    std::sort(actors.begin(), actors.end(), [](const byml::Value& a, const byml::Value& b) { return aamp::hash(a.str("name")) < aamp::hash(b.str("name")); });
+    std::vector<byml::Value> hashes;
+    for (const auto& a : actors) {
+        const uint32_t h = aamp::hash(a.str("name"));
+        hashes.push_back(h > 0x7FFFFFFF ? byml::Value::u32(h) : N(int32_t(h)));
+    }
+    return byml_bytes(Ha({{"Actors", Ar(actors)}, {"Hashes", Ar(hashes)}}));
+}
+byml::Value map_obj(uint32_t hash, const std::string& name) {
+    return Ha({{"HashId", byml::Value::u32(hash)}, {"SRTHash", N(0)}, {"Translate", Ar({Fl(1), Fl(2), Fl(3)})}, {"UnitConfigName", S(name)}});
+}
+Bytes map_unit(std::vector<byml::Value> objs, std::vector<byml::Value> rails = {}) { return byml_bytes(Ha({{"Objs", Ar(objs)}, {"Rails", Ar(rails)}})); }
+std::vector<std::string> unit_names(const Bytes& b) {  // "HashId:UnitConfigName" in order
+    std::vector<std::string> out;
+    const byml::Value unit = byml_of(b);
+    for (const auto& o : unit.find("Objs")->array) out.push_back(std::to_string(o.find("HashId")->as_u32()) + ":" + o.str("UnitConfigName"));
+    return out;
+}
+byml::Value xyz(float x, float y, float z) { return Ha({{"X", Fl(x)}, {"Y", Fl(y)}, {"Z", Fl(z)}}); }
+Bytes main_static() {
+    return byml_bytes(Ha({{"StartPos", Ar({Ha({{"Map", S("A-1")}, {"PlayerState", S("Wait")}, {"PosName", S("Start1")}, {"Rotate", xyz(0, 0, 0)},
+                                                {"Translate", xyz(1.5f, 2.5f, -3.5f)}}),
+                                            Ha({{"Map", S("A-1")}, {"PlayerState", S("Wait")}, {"PosName", S("Start2")}, {"Rotate", xyz(0, 0, 0)},
+                                                {"Translate", xyz(10, 0, 0)}})})},
+                          {"TargetPosMarker", Ar({Ha({{"Rotate", xyz(0, 0, 0)}, {"Translate", xyz(10.5f, -2.5f, 3)}, {"UniqueName", S("M1")}})})},
+                          {"StaticGrudgeLocation", Ar({Ha({{"Translate", xyz(5, 5, 5)}}), Ha({{"Translate", xyz(5, 5, 5)}})})}}));
+}
+Bytes shrine_static() {
+    return byml_bytes(Ha({{"StartPos", Ar({Ha({{"Map", S("Dungeon000")}, {"PosName", S("Entrance_1")}, {"Rotate", xyz(0, 90, 0)}, {"Translate", xyz(-26, 18, -6)}}),
+                                            Ha({{"Map", S("Dungeon001")}, {"PosName", S("Entrance_1")}, {"Rotate", xyz(0, 0, 0)}, {"Translate", xyz(4, 4, 4)}})})}}));
+}
+// the game: ActorInfo, map units, a title actor's shop, a loose enemy's drop table and shop, quests, resident actors, area
+// data, status effects, static data; with the DLC (dlc) its map units and static data too
+World make_tables_world(const fs::path& root, bool dlc) {
+    World w = make_world(root);
+    put(w.update / "content/Actor/ActorInfo.product.sbyml", yaz(actor_info({actor_entry("Npc_A", 10), actor_entry("Weapon_B", 20)})));
+    const Bytes stat = map_unit({map_obj(10, "Obj_One"), map_obj(20, "Obj_Two"), map_obj(30, "Obj_Three")}, {Ha({{"HashId", byml::Value::u32(100)}})});
+    const Bytes dyn = map_unit({map_obj(5, "Dyn_One"), map_obj(6, "Dyn_Two")});
+    const Bytes quests = byml_bytes(Ar({Ha({{"Name", S("Q1")}, {"Type", S("Main")}}), Ha({{"Name", S("Q2")}, {"Type", S("Main")}}), Ha({{"Name", S("Q3")}})}));
+    const Bytes title_actor = yaz(sarc({{"Actor/ShopData/Npc_Title.bshop", shop_file({{"Normal", {{"Item_Old", 0}, {"Item_Keep", 5}}}})},
+                                        {"Actor/ActorLink/Npc_Title.bxml", bytes("link")}}));
+    put(w.update / "content/Pack/TitleBG.pack", sarc({{"Quest/QuestProduct.sbquestpack", yaz(quests)}, {"Map/MainField/A-1/A-1_Static.smubin", yaz(stat)},
+                                                      {"Actor/Pack/Npc_Title.sbactorpack", title_actor}, {"Other/Title.txt", bytes("title")}}));
+    put(w.update / "content/Map/MainField/A-1/A-1_Dynamic.smubin", yaz(dyn));
+    put(w.update / "content/Actor/Pack/Enemy_X.sbactorpack",
+        yaz(sarc({{"Actor/DropTable/X.bdrop", drop_file({{"Normal", {{"Item_A", 10}, {"Item_B", 20}, {"Item_C", 30}}}, {"Hard", {{"Item_H", 1}}}, {"Extra", {{"Item_E", 2}}}})},
+                  {"Actor/ShopData/Enemy_X.bshop", shop_file({{"Normal", {{"Item_Sell", 3}}}})}})));
+    const Bytes residents = byml_bytes(Ar({Ha({{"name", S("R1")}, {"only_res", Bo(false)}}), Ha({{"name", S("R2")}, {"only_res", Bo(true)}})}));
+    const Bytes areas = byml_bytes(Ar({Ha({{"AreaNumber", N(0)}, {"Climate", S("C0")}}),
+                                       Ha({{"AreaNumber", N(1)}, {"Climate", S("C1")}, {"Enemy", Ar({Ha({{"name", S("E")}, {"num", Fl(1)}})})}})}));
+    const Bytes effects = byml_bytes(Ar({Ha({{"AttackUp", Ar({Ha({{"special", Bo(false)}}), Ha({{"special", Bo(false)}})})}, {"LifeMaxUp", Ar({Ha({{"special", Bo(true)}})})}})}));
+    put(w.update / "content/Pack/Bootup.pack", sarc({{"Actor/ResidentActors.byml", residents}, {"Ecosystem/AreaData.sbyml", yaz(areas)},
+                                                     {"Ecosystem/StatusEffectList.sbyml", yaz(effects)}, {"Map/MainField/Static.smubin", yaz(main_static())},
+                                                     {"Map/CDungeon/Static.smubin", yaz(shrine_static())}, {"Other/Boot.txt", bytes("boot")}}));
+    if (dlc) {  // the DLC's map units have a DLC object more; its static data is the game's
+        const Bytes dlc_stat = map_unit({map_obj(10, "Obj_One"), map_obj(20, "Obj_Two"), map_obj(25, "DLC_Thing"), map_obj(30, "Obj_Three")},
+                                        {Ha({{"HashId", byml::Value::u32(100)}})});
+        put(w.aoc / "content/0010/Pack/AocMainField.pack", sarc({{"Map/MainField/A-1/A-1_Static.smubin", yaz(dlc_stat)}, {"Map/MainField/LazyTraverseList.smubin", yaz(bytes("x"))}}));
+        put(w.aoc / "content/0010/Map/MainField/A-1/A-1_Static.smubin", yaz(dlc_stat));
+        put(w.aoc / "content/0010/Map/MainField/A-1/A-1_Dynamic.smubin", yaz(map_unit({map_obj(5, "Dyn_One"), map_obj(6, "Dyn_Two"), map_obj(7, "DLC_Dyn")})));
+        put(w.aoc / "content/0010/Map/MainField/Static.smubin", yaz(main_static()));
+        put(w.aoc / "content/0010/Map/CDungeon/Static.smubin", yaz(shrine_static()));
+    }
+    Rstb t = game_table();
+    rstb_set(t, "Actor/ActorInfo.product.byml", uint32_t(unyaz(get(w.update / "content/Actor/ActorInfo.product.sbyml")).size() + 100));
+    rstb_set(t, "Quest/QuestProduct.bquestpack", uint32_t(quests.size() + 100));
+    rstb_set(t, "Actor/Pack/Enemy_X.bactorpack", 10);  // smaller than the file: grows with it
+    put(w.update / "content/System/Resource/ResourceSizeTable.product.srsizetable", yaz(rstb_write(t)));
+    return w;
+}
+// the mods, lowest first: a plain mod with its own copies, two .bnp mods with logs
+std::vector<merge::Mod> make_tables_mods(const World& w, bool dlc) {
+    const fs::path m = w.root / "mods";
+    // plain: its ActorInfo (Weapon_B's price), the DLC's dynamic unit (an object changed), the enemy's actor pack (its
+    // Hard table), its Bootup.pack with only the resident actors (one more)
+    put(m / "plain/content/Actor/ActorInfo.product.sbyml", yaz(actor_info({actor_entry("Npc_A", 10), actor_entry("Weapon_B", 25)})));
+    if (dlc)
+        put(m / "plain/aoc/0010/Map/MainField/A-1/A-1_Dynamic.smubin",
+            yaz(map_unit({map_obj(5, "Dyn_One"), map_obj(6, "Dyn_Two_Plain"), map_obj(7, "DLC_Dyn")})));
+    put(m / "plain/content/Actor/Pack/Enemy_X.sbactorpack",
+        yaz(sarc({{"Actor/DropTable/X.bdrop", drop_file({{"Normal", {{"Item_A", 10}, {"Item_B", 20}, {"Item_C", 30}}}, {"Hard", {{"Item_Plain", 9}}}, {"Extra", {{"Item_E", 2}}}})},
+                  {"Actor/ShopData/Enemy_X.bshop", shop_file({{"Normal", {{"Item_Sell", 3}}}})}})));
+    put(m / "plain/content/Pack/Bootup.pack",
+        sarc({{"Actor/ResidentActors.byml", byml_bytes(Ar({Ha({{"name", S("R1")}, {"only_res", Bo(false)}}), Ha({{"name", S("R2")}, {"only_res", Bo(true)}}),
+                                                          Ha({{"name", S("R_Plain")}, {"only_res", Bo(false)}})}))}}));
+    // one: a log of each kind
+    const uint32_t npc = aamp::hash("Npc_A"), fresh = aamp::hash("Weapon_New");
+    put(m / "one/logs/actorinfo.yml", std::to_string(npc) + ":\n  itemBuyingPrice: 11\n'" + std::to_string(fresh) +
+                                          "':\n  name: Weapon_New\n  profile: WeaponSmallSword\n  instSize: 100\n");
+    put(m / "one/logs/map.yml", "A-1_Static:\n  Objs:\n    add:\n    - {HashId: !u 0x28, SRTHash: 0, Translate: [1.0, 2.0, 3.0], UnitConfigName: Obj_Four_One}\n"
+                                "    mod:\n      '20': {HashId: !u 0x14, SRTHash: 0, Translate: [1.0, 2.0, 3.0], UnitConfigName: Obj_Two_One}\n"
+                                "    del: [!u 0x1e]\n  Rails: {add: [], mod: {}, del: []}\n"
+                                "A-1_Dynamic:\n  Objs:\n    add: [{HashId: !u 0x8, SRTHash: 0, Translate: [1.0, 2.0, 3.0], UnitConfigName: Dyn_Three}]\n"
+                                "    mod: {}\n    del: []\n  Rails: {add: [], mod: {}, del: []}\n");
+    aamp::List adds = L("Additions", {L("Normal", {}, {shop_item("Item_New", 7)})}, {O("TableNames", {S("Normal", "Normal")})});
+    aamp::List rems = L("Removals", {L("Normal", {}, {shop_item("Item_Old", 0)})}, {});
+    aamp::List enemy_adds = L("Additions", {L("Normal", {}, {O("Item_Sell", {I("ItemAdjustPrice", 4)})})}, {});
+    put(m / "one/logs/shop.aamp", bcml_log({{"content/Actor/Pack/Npc_Title.sbactorpack//Actor/ShopData/Npc_Title.bshop", L("", {adds, rems}, {})},
+                                            {"content/Actor/Pack/Enemy_X.sbactorpack//Actor/ShopData/Enemy_X.bshop", L("", {enemy_adds}, {})},
+                                            {"content/Actor/Pack/Npc_Missing.sbactorpack//Actor/ShopData/Npc_Missing.bshop", L("", {adds}, {})}},
+                                           "Filenames"));
+    put(m / "one/logs/drops.json", R"({"content/Actor/Pack/Enemy_X.sbactorpack//Actor/DropTable/X.bdrop": {
+        "Normal": {"repeat_num_min": 2, "repeat_num_max": 3, "approach_type": 0, "occurrence_speed_type": 0,
+                   "items": {"Item_C": 31.5, "Item_A": "UNDERRIDE_CONST", "Item_Z": 5.0}}}})");
+    put(m / "one/logs/quests.yml", "add:\n- {Name: Q_New, Type: Sub, prev_quest: Q1}\nmod:\n  Q2: {Name: Q2, Type: Sub1, prev_quest: Q1}\ndel: [Q3]\n");
+    put(m / "one/logs/residents.yml", "R1: {name: R1, only_res: false, remove: true}\nR_New: {name: R_New, only_res: true}\n");
+    put(m / "one/logs/areadata.yml", "'1':\n  Climate: ModClimate\n");
+    put(m / "one/logs/effects.yml", "AttackUp:\n- {special: true}\n");
+    // the main field's static data: Start1 changed in place, Start2 removed, M1 moved (BCML: the old one removed, a new one)
+    put(m / "one/logs/mainstatic.yml", "StartPos:\n  23-3Start1: {Map: A-1, PlayerState: Run, PosName: Start1, Rotate: {X: 0.0, Y: 0.0, Z: 0.0}, "
+                                       "Translate: {X: 1.5, Y: 2.5, Z: -3.5}}\n  1000Start2: {remove: true}\nTargetPosMarker:\n  11-23M1: {remove: true}\n"
+                                       "  21-23M1: {Rotate: {X: 0.0, Y: 0.0, Z: 0.0}, Translate: {X: 20.5, Y: -2.5, Z: 3.0}, UniqueName: M1}\n");
+    put(m / "one/logs/dstatic.yml", "Dungeon000___Entrance_1:\n  Translate: {X: 1.0, Y: 2.0, Z: 3.0}\n"
+                                    "Dungeon999: {Map: Dungeon999, PosName: Entrance_1, Rotate: {X: 0.0, Y: 0.0, Z: 0.0}, Translate: {X: 9.0, Y: 9.0, Z: 9.0}}\n");
+    put(m / "one/logs/rstb.json", "{\"Actor/ActorInfo.product.byml\": 10}");  // BCML's size for its own merge: too small for this one
+    // two (higher): the same actors, objects and quest again
+    put(m / "two/logs/actorinfo.yml", std::to_string(npc) + ":\n  bfres: Mod_A\n" + std::to_string(fresh) + ":\n  instSize: 50\n  profile: WeaponLargeSword\n");
+    put(m / "two/logs/map.yml", "A-1_Static:\n  Objs:\n    add:\n    - {HashId: !u 0x28, SRTHash: 0, Translate: [1.0, 2.0, 3.0], UnitConfigName: Obj_Four_Two}\n"
+                                "    mod:\n      '20': {HashId: !u 0x14, SRTHash: 0, Translate: [1.0, 2.0, 3.0], UnitConfigName: Obj_Two_Two}\n"
+                                "    del: []\n  Rails: {add: [], mod: {}, del: []}\n");
+    put(m / "two/logs/quests.yml", "add: []\nmod:\n  Q2: {Name: Q2, Type: Sub2, prev_quest: Q_New}\ndel: []\n");
+    // the title actor's shop again, named where the game has it
+    put(m / "two/logs/shop.aamp", bcml_log({{"content/Pack/TitleBG.pack//Actor/Pack/Npc_Title.sbactorpack//Actor/ShopData/Npc_Title.bshop",
+                                             L("", {L("Additions", {L("Normal", {}, {O("Item_Keep", {I("ItemAdjustPrice", 6)})})}, {})}, {})}},
+                                           "Filenames"));
+    std::vector<merge::Mod> mods = {{"plain", "Plain", m / "plain/content", {}, {}}, {"one", "One", {}, {}, m / "one/logs"}, {"two", "Two", {}, {}, m / "two/logs"}};
+    if (dlc) mods[0].aoc = m / "plain/aoc";
+    return mods;
+}
+void test_bcml_files(const fs::path& root) {
+    for (bool dlc : {true, false}) {
+        const World w = make_tables_world(root / (dlc ? "dlc" : "base"), dlc);
+        const std::vector<merge::Mod> mods = make_tables_mods(w, dlc);
+        const auto t0 = std::chrono::steady_clock::now();
+        const merge::Result r = merge::build(w.vanilla(), mods, w.out);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        auto file = [&](const char* tree) {
+            auto it = r.files.find(merge::tree_key(tree));
+            if (it == r.files.end()) fprintf(stderr, "not mapped: %s\n", tree);
+            assert(it != r.files.end());
+            return get(it->second);
+        };
+        // ActorInfo: the plain mod's price, one's price, two's model; a new actor with the larger instSize; sorted by hash
+        const byml::Value info = byml_of(file("content/Actor/ActorInfo.product.sbyml"));
+        const auto& actors = info.find("Actors")->array;
+        const auto& hashes = info.find("Hashes")->array;
+        assert(actors.size() == 3 && hashes.size() == 3);
+        std::map<std::string, const byml::Value*> by_name;
+        for (size_t i = 0; i < actors.size(); i++) {
+            by_name[actors[i].str("name")] = &actors[i];
+            assert(uint32_t(hashes[i].bits) == aamp::hash(actors[i].str("name")) && (!i || uint32_t(hashes[i - 1].bits) < uint32_t(hashes[i].bits)));
+        }
+        assert(*by_name["Npc_A"]->find("itemBuyingPrice") == N(11) && by_name["Npc_A"]->str("bfres") == "Mod_A");
+        assert(*by_name["Weapon_B"]->find("itemBuyingPrice") == N(25));
+        assert(by_name["Weapon_New"]->str("profile") == "WeaponLargeSword" && *by_name["Weapon_New"]->find("instSize") == N(100));
+        // map units: the static one's object changed by two (the higher), one's deletion, two's new object first; the DLC's
+        // in Pack/AocMainField.pack and loose, else in Pack/TitleBG.pack; the dynamic one with the plain mod's change (DLC)
+        const std::vector<std::string> want_static = dlc ? std::vector<std::string>{"10:Obj_One", "20:Obj_Two_Two", "25:DLC_Thing", "40:Obj_Four_Two"}
+                                                         : std::vector<std::string>{"10:Obj_One", "20:Obj_Two_Two", "40:Obj_Four_Two"};
+        const auto title = unsarc(file("content/Pack/TitleBG.pack"));
+        if (dlc) {
+            const auto aoc_pack = unsarc(file("aoc/0010/Pack/AocMainField.pack"));
+            assert(unit_names(unyaz(aoc_pack.at("Map/MainField/A-1/A-1_Static.smubin"))) == want_static);
+            assert(unit_names(unyaz(file("aoc/0010/Map/MainField/A-1/A-1_Static.smubin"))) == want_static);
+            assert(aoc_pack.at("Map/MainField/A-1/A-1_Static.smubin") == file("aoc/0010/Map/MainField/A-1/A-1_Static.smubin"));
+            assert(unit_names(unyaz(file("aoc/0010/Map/MainField/A-1/A-1_Dynamic.smubin"))) ==
+                   (std::vector<std::string>{"5:Dyn_One", "6:Dyn_Two_Plain", "7:DLC_Dyn", "8:Dyn_Three"}));
+            assert(byml_of(unyaz(title.at("Map/MainField/A-1/A-1_Static.smubin"))).find("Objs")->array.size() == 3);  // the base game's: untouched
+            assert(!r.files.count(merge::tree_key("content/Map/MainField/A-1/A-1_Dynamic.smubin")));
+        } else {
+            assert(unit_names(unyaz(title.at("Map/MainField/A-1/A-1_Static.smubin"))) == want_static);
+            assert(unit_names(unyaz(file("content/Map/MainField/A-1/A-1_Dynamic.smubin"))) == (std::vector<std::string>{"5:Dyn_One", "6:Dyn_Two", "8:Dyn_Three"}));
+        }
+        assert(byml_of(unyaz(dlc ? file("aoc/0010/Map/MainField/A-1/A-1_Static.smubin") : title.at("Map/MainField/A-1/A-1_Static.smubin")))
+                   .find("Rails")->array.size() == 1);
+        // the title actor's shop (in Pack/TitleBG.pack, though the log names it loose): an item out, one in; the enemy's
+        // price changed; a shop the game doesn't have: skipped
+        const auto title_actor = unsarc(unyaz(title.at("Actor/Pack/Npc_Title.sbactorpack")));
+        assert(shop_of(title_actor.at("Actor/ShopData/Npc_Title.bshop")) == (ShopTables{{"Normal", {{"Item_Keep", 6}, {"Item_New", 7}}}}));
+        assert(text(title_actor.at("Actor/ActorLink/Npc_Title.bxml")) == "link");
+        assert(!r.files.count(merge::tree_key("content/Actor/Pack/Npc_Title.sbactorpack")));
+        const auto enemy = unsarc(unyaz(file("content/Actor/Pack/Enemy_X.sbactorpack")));
+        assert(shop_of(enemy.at("Actor/ShopData/Enemy_X.bshop")) == (ShopTables{{"Normal", {{"Item_Sell", 4}}}}));
+        // the drop table: one's Normal (the game's Item_B goes, Item_A the game's probability, Item_Z new), the plain mod's
+        // Hard and Extra (its whole file, as BCML logs it)
+        assert(drops_of(enemy.at("Actor/DropTable/X.bdrop")) ==
+               (DropTables{{"Normal", {{"Item_A", 10}, {"Item_C", 31.5f}, {"Item_Z", 5}}}, {"Hard", {{"Item_Plain", 9}}}, {"Extra", {{"Item_E", 2}}}}));
+        const aamp::List normal_table = aamp_of(enemy.at("Actor/DropTable/X.bdrop"));
+        assert(value(normal_table, "Normal", "RepeatNumMin") == I("RepeatNumMin", 2) && value(normal_table, "Normal", "RepeatNumMax") == I("RepeatNumMax", 3));
+        // quests: Q_New after Q1, Q2 as two has it (without BCML's prev_quest), Q3 gone
+        const byml::Value quests = byml_of(title.at("Quest/QuestProduct.sbquestpack"));
+        assert(quests.array.size() == 3 && quests.array[0].str("Name") == "Q1" && quests.array[1].str("Name") == "Q_New" && quests.array[2].str("Name") == "Q2");
+        assert(quests.array[2].str("Type") == "Sub2" && !quests.array[2].find("prev_quest") && !quests.array[1].find("prev_quest"));
+        // Bootup.pack: resident actors (R1 removed, the plain mod's and one's added), area 1's climate, AttackUp
+        const auto boot = unsarc(file("content/Pack/Bootup.pack"));
+        std::vector<std::string> residents;
+        for (const auto& a : byml_of(boot.at("Actor/ResidentActors.byml")).array) residents.push_back(a.str("name"));
+        assert((residents == std::vector<std::string>{"R2", "R_New", "R_Plain"}));
+        assert(!is_yaz0(boot.at("Actor/ResidentActors.byml").data(), boot.at("Actor/ResidentActors.byml").size()));
+        const byml::Value areas = byml_of(boot.at("Ecosystem/AreaData.sbyml"));
+        assert(areas.array[1].str("Climate") == "ModClimate" && areas.array[1].find("Enemy")->array.size() == 1 && areas.array[0].str("Climate") == "C0");
+        const byml::Value effects = byml_of(boot.at("Ecosystem/StatusEffectList.sbyml"));
+        assert(effects.array[0].find("AttackUp")->array.size() == 1 && *effects.array[0].find("AttackUp")->array[0].find("special") == Bo(true));
+        assert(text(boot.at("Other/Boot.txt")) == "boot");
+        // static data: the DLC's loose copies, else Bootup.pack's
+        const byml::Value stat = byml_of(dlc ? file("aoc/0010/Map/MainField/Static.smubin") : boot.at("Map/MainField/Static.smubin"));
+        const auto& starts = stat.find("StartPos")->array;
+        assert(starts.size() == 1 && starts[0].str("PlayerState") == "Run");
+        const auto& markers = stat.find("TargetPosMarker")->array;
+        assert(markers.size() == 1 && markers[0].find("Translate")->find("X")->as_f32() == 20.5f);
+        assert(stat.find("StaticGrudgeLocation")->array.size() == 2);  // two entries with the same id, untouched (BCML would keep one)
+        const byml::Value shrines = byml_of(dlc ? file("aoc/0010/Map/CDungeon/Static.smubin") : boot.at("Map/CDungeon/Static.smubin"));
+        const auto& entrances = shrines.find("StartPos")->array;
+        assert(entrances.size() == 3 && entrances[0].find("Translate")->find("X")->as_f32() == 1.0f && entrances[0].find("Rotate")->find("Y")->as_f32() == 90.0f);
+        assert(entrances[2].str("Map") == "Dungeon999");
+        if (dlc) assert(byml_of(boot.at("Map/MainField/Static.smubin")) == byml_of(main_static()));  // with the DLC the game reads the DLC's
+        // sizes: the rebuilt files' entries hold them (one's ActorInfo size is BCML's, too small for this merge)
+        const Rstb table = table_of(w.out / merge::kSizeTable);
+        assert(entry(table, "Actor/ActorInfo.product.byml") >= unyaz(file("content/Actor/ActorInfo.product.sbyml")).size());
+        assert(entry(table, "Actor/Pack/Enemy_X.bactorpack") >= unyaz(file("content/Actor/Pack/Enemy_X.sbactorpack")).size());
+        // what the Mods page says
+        assert(has_note(r.mods[1], "BCML merge data: 2 actors, 3 quests, 2 resident actors, 1 area, 1 status effect, 4 main field static entries, "
+                                   "2 shrine entrances, 4 map objects in 2 map units, 4 shop items in 3 shops, 1 drop table in 1 file"));
+        assert(has_note(r.mods[1], "Npc_Missing.sbactorpack//Actor/ShopData/Npc_Missing.bshop is not in the game's files"));
+        assert(has_note(r.mods[0], "Actor/ActorInfo.product.sbyml: its changes (1 entry) are merged"));
+        assert(has_note(r.mods[0], "Actor/DropTable/X.bdrop: its changes (3 entries) are merged"));
+        assert(has_note(r.mods[0], "Actor/ResidentActors.byml: its changes (1 entry) are merged"));
+        assert(r.mods[0].merged >= 3);
+        const std::string summary = r.log.size() > 1 ? r.log[1] : "";
+        assert(summary.find("Rebuilt from BCML merge data: actors, 2 map units, 2 shops, 1 drop table, quests, resident actors, area data, status effects, "
+                            "main field static data, shrine entrances") == 0);
+        printf("content merge: tables of one file each merged in %.0f ms (%s)\n", ms, dlc ? "with the DLC" : "without the DLC");
+    }
+
+    // the merges on their own: a mod's copy as its diff gives its file back; nothing to change: the game's file
+    const Bytes game_info = actor_info({actor_entry("Npc_A", 10), actor_entry("Weapon_B", 20)});
+    const Bytes mod_info = actor_info({actor_entry("Npc_A", 12), actor_entry("Weapon_B", 20), actor_entry("Armor_New", 3)});
+    bcml::Diff d;
+    std::string why;
+    Bytes out;
+    size_t changed = 0;
+    assert(bcml::diff_of_copy(bcml::Kind::ActorInfo, game_info, mod_info, d, why) && bcml::entries(bcml::Kind::ActorInfo, d) == 2);
+    assert(bcml::merge_file(bcml::Kind::ActorInfo, game_info, {&d}, out, changed, why) && changed == 2 && byml_of(out) == byml_of(mod_info));
+    assert(bcml::diff_of_copy(bcml::Kind::ActorInfo, game_info, game_info, d, why) && bcml::entries(bcml::Kind::ActorInfo, d) == 0);
+    assert(!bcml::merge_file(bcml::Kind::ActorInfo, game_info, {&d}, out, changed, why) && why.empty());
+    const Bytes game_unit = map_unit({map_obj(10, "A"), map_obj(20, "B")}), mod_unit = map_unit({map_obj(10, "A2"), map_obj(15, "New")});
+    assert(bcml::diff_of_copy(bcml::Kind::Map, game_unit, mod_unit, d, why) && bcml::entries(bcml::Kind::Map, d) == 3);
+    assert(bcml::merge_file(bcml::Kind::Map, game_unit, {&d}, out, changed, why) && byml_of(out) == byml_of(mod_unit));
+    const Bytes game_shop = shop_file({{"Normal", {{"I1", 1}, {"I2", 2}}}, {"Other", {{"O1", 1}}}});
+    const Bytes mod_shop = shop_file({{"Normal", {{"I1", 9}, {"I3", 3}}}, {"Other", {{"O1", 1}}}});
+    assert(bcml::diff_of_copy(bcml::Kind::Shop, game_shop, mod_shop, d, why));
+    assert(bcml::merge_file(bcml::Kind::Shop, game_shop, {&d}, out, changed, why) && shop_of(out) == shop_of(mod_shop) && changed == 3);
+    const Bytes game_quests = byml_bytes(Ar({Ha({{"Name", S("Q1")}}), Ha({{"Name", S("Q2")}})}));
+    const Bytes mod_quests = byml_bytes(Ar({Ha({{"Name", S("Q0")}}), Ha({{"Name", S("Q1")}, {"Type", S("X")}}), Ha({{"Name", S("Q2")}})}));
+    assert(bcml::diff_of_copy(bcml::Kind::Quests, game_quests, mod_quests, d, why) && bcml::entries(bcml::Kind::Quests, d) == 2);
+    assert(bcml::merge_file(bcml::Kind::Quests, game_quests, {&d}, out, changed, why) && byml_of(out) == byml_of(mod_quests));
+    const Bytes game_areas = byml_bytes(Ar({Ha({{"AreaNumber", N(0)}, {"A", N(1)}}), Ha({{"AreaNumber", N(2)}, {"A", N(1)}})}));
+    const Bytes mod_areas = byml_bytes(Ar({Ha({{"AreaNumber", N(0)}, {"A", N(1)}}), Ha({{"AreaNumber", N(1)}, {"A", N(5)}}), Ha({{"AreaNumber", N(2)}, {"A", N(3)}})}));
+    assert(bcml::diff_of_copy(bcml::Kind::AreaData, game_areas, mod_areas, d, why) && bcml::entries(bcml::Kind::AreaData, d) == 2);
+    assert(bcml::merge_file(bcml::Kind::AreaData, game_areas, {&d}, out, changed, why) && byml_of(out) == byml_of(mod_areas));
+    // logs that can't be read are refused with a reason
+    assert(!bcml::read_log(bcml::Kind::ActorInfo, "not-a-hash: {name: X}\n", d, why) && why.find("hash") != std::string::npos);
+    std::map<std::string, bcml::Diff> units;
+    assert(!bcml::read_maps("A-1_Static:\n  Objs: {add: {}, mod: {}, del: []}\n  Rails: {}\n", units, why));
+    units.clear();
+    assert(bcml::read_maps("A-1_Static: {add: [], mod: {}, del: [1]}\n", units, why) && units.at("A-1_Static").value.find("Objs"));  // BCML's first logs
+    std::map<std::string, bcml::Diff> drops;
+    assert(!bcml::read_drops(R"({"f": {"Normal": {"items": {}}}})", drops, why));
+}
+
 // ---------------------------------------------------------------- folder layouts
 void test_layouts(const fs::path& root) {
     const std::string usa = "00050000101C9400";
@@ -930,7 +1313,9 @@ void test_layouts(const fs::path& root) {
     l = loader::detect(root / "unpacked-bnp", usa);
     assert(l.kind == "BCML mod" && l.problem.empty() && l.logs == root / "unpacked-bnp/logs");
     assert(l.name == "Some BCML Mod 1.0" && l.description == "About it");
-    for (const char* log : {"eventinfo.yml", "gamedata.yml", "savedata.yml", "texts.json"}) put(root / "unpacked-bnp/logs" / log, "{}");
+    for (const char* log : {"eventinfo.yml", "gamedata.yml", "savedata.yml", "texts.json", "actorinfo.yml", "map.yml", "shop.aamp", "drops.json",
+                            "quests.yml", "residents.yml", "areadata.yml", "effects.yml", "mainstatic.yml", "dstatic.yml"})
+        put(root / "unpacked-bnp/logs" / log, "{}");
     assert(loader::detect(root / "unpacked-bnp", usa).problem.empty());  // merge data the loader applies
     put(root / "unpacked-bnp/logs/future.yml", "x");  // merge data the loader can't apply
     l = loader::detect(root / "unpacked-bnp", usa);
@@ -980,6 +1365,11 @@ void test_layouts(const fs::path& root) {
     put(root / "packs-only/content/Actor/Pack/A.sbactorpack", "x");  // only the list of its packs: usable
     put(root / "packs-only/logs/packs.json", "{}");
     assert(loader::detect(root / "packs-only", usa).problem.empty());
+    put(root / "logs-only/logs/map.yml", "{}");  // only merge data (BCML leaves out the map units its log has)
+    l = loader::detect(root / "logs-only", usa);
+    assert(l.kind == "BCML mod" && l.problem.empty() && l.logs == root / "logs-only/logs" && l.content.empty());
+    put(root / "list-only/logs/packs.json", "{}");  // a list of packs it doesn't have: nothing
+    assert(!loader::detect(root / "list-only", usa).problem.empty());
     fs::create_directories(root / "empty");
     assert(!loader::detect(root / "empty", usa).problem.empty());
 }
@@ -1351,6 +1741,323 @@ void check_tables(const fs::path& cache, const fs::path& mods, const merge::Vani
     printf("BCML merge data in the merged files: %zu events, %zu flags, %zu save data flags, %zu texts in %zu languages\n", n_events, n_flags,
            n_saves, n_texts, n_languages);
 }
+// BCML merge data for tables of one file each (actors, map units, shops, drop tables, quests, resident actors, area
+// data, status effects, static data): every logged change is in the merged files where the game reads them; one that
+// only one mod logs is as logged
+Bytes inside(Bytes data, const std::string& path) {  // a file in an archive ("A//B"), unpacked
+    for (const auto& part : split_parts(path)) {
+        data = is_yaz0(data.data(), data.size()) ? unyaz(data) : data;
+        const auto files = unsarc(data);
+        auto it = files.find(part);
+        if (it == files.end()) fprintf(stderr, "not in the merged archive: %s\n", path.c_str());
+        assert(it != files.end());
+        data = it->second;
+    }
+    return is_yaz0(data.data(), data.size()) ? unyaz(data) : data;
+}
+std::map<std::string, std::map<std::string, std::map<uint32_t, aamp::Param>>> shop_items(const Bytes& b) {  // table -> item -> key -> value
+    const aamp::List root = aamp_of(b);
+    std::map<std::string, std::map<std::string, std::map<uint32_t, aamp::Param>>> out;
+    for (const auto& p : aamp::object(root, aamp::hash("Header"))->params) {
+        if (!aamp::is_string(p.type)) continue;
+        const aamp::Object* o = aamp::object(root, aamp::hash(aamp::text(p)));
+        assert(o);
+        int32_t columns;
+        memcpy(&columns, aamp::param(*o, aamp::hash("ColumnNum"))->data.data(), 4);
+        for (int n = 1; n <= columns; n++) {
+            auto& item = out[aamp::text(p)][aamp::text(*aamp::param(*o, aamp::hash(num("ItemName", n, 3))))];
+            for (const char* key : {"ItemName", "ItemNum", "ItemAdjustPrice", "ItemLookGetFlg", "ItemAmount"}) {
+                aamp::Param v = *aamp::param(*o, aamp::hash(num(key, n, 3)));
+                v.name = aamp::hash(key);
+                item[v.name] = v;
+            }
+        }
+    }
+    return out;
+}
+std::string static_key(const byml::Value& e) {  // BCML's id of a static data entry (mainstatic.py get_id)
+    const byml::Value* t = e.find("Translate");
+    if (!t) return {};
+    std::string id;
+    for (const char* axis : {"X", "Y", "Z"}) id += std::to_string((long long)std::ceil(t->find(axis)->as_f32()));
+    for (const auto& [k, v] : e.hash) {
+        std::string lower = k;
+        for (char& c : lower) c = char(tolower((unsigned char)c));
+        if (lower.find("name") != std::string::npos) return id + v.text;
+    }
+    return id;
+}
+void check_files(const fs::path& cache, const fs::path& mods, const merge::Vanilla& game) {
+    std::vector<fs::path> logs;
+    for (const fs::path& root : {mods, mods.parent_path() / "Mods unpacked"}) {
+        if (!fs::exists(root)) continue;
+        for (auto it = fs::recursive_directory_iterator(root); it != fs::recursive_directory_iterator(); ++it) {
+            const std::string n = it->path().filename().string();
+            if (!it->is_directory()) continue;
+            if (it.depth() > 3 || n == "options" || n == "content" || n == "aoc") {
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (n == "logs") {
+                logs.push_back(it->path());
+                it.disable_recursion_pending();
+            }
+        }
+    }
+    fs::path merged;
+    for (const auto& e : fs::directory_iterator(cache))
+        if (fs::exists(e.path() / "merged")) merged = e.path() / "merged";
+    auto file = [&](const std::string& tree) {
+        const fs::path m = merged / tree;
+        return fs::exists(m) ? get(m) : get(game.find(tree));
+    };
+    auto read = [](const fs::path& p) {
+        const Bytes b = get(p);
+        return std::string(b.begin(), b.end());
+    };
+    // the logs, by kind and file: (log, diff); a file several mods log is only checked to be there
+    using Logged = std::map<std::pair<bcml::Kind, std::string>, std::vector<bcml::Diff>>;
+    Logged all;
+    for (const auto& l : logs) {
+        std::string why;
+        for (const auto& [name, kind] : {std::pair<const char*, bcml::Kind>{"actorinfo.yml", bcml::Kind::ActorInfo}, {"quests.yml", bcml::Kind::Quests},
+                                         {"residents.yml", bcml::Kind::Residents}, {"areadata.yml", bcml::Kind::AreaData},
+                                         {"effects.yml", bcml::Kind::Effects}, {"mainstatic.yml", bcml::Kind::MainStatic},
+                                         {"dstatic.yml", bcml::Kind::DungeonStatic}}) {
+            if (!fs::exists(l / name)) continue;
+            bcml::Diff d;
+            assert(bcml::read_log(kind, read(l / name), d, why));
+            all[{kind, ""}].push_back(std::move(d));
+        }
+        std::map<std::string, bcml::Diff> files;
+        if (fs::exists(l / "map.yml")) {
+            assert(bcml::read_maps(read(l / "map.yml"), files, why));
+            for (auto& [unit, d] : files) all[{bcml::Kind::Map, unit}].push_back(std::move(d));
+        }
+        files.clear();
+        if (fs::exists(l / "shop.aamp")) {
+            assert(bcml::read_shops(get(l / "shop.aamp"), files, why));
+            for (auto& [path, d] : files) all[{bcml::Kind::Shop, actor_key(path)}].push_back(std::move(d));
+        }
+        files.clear();
+        if (fs::exists(l / "drops.json")) {
+            assert(bcml::read_drops(read(l / "drops.json"), files, why));
+            for (auto& [path, d] : files) all[{bcml::Kind::Drop, actor_key(path)}].push_back(std::move(d));
+        }
+    }
+    if (all.empty()) return;
+    const bool dlc = !game.find("aoc/0010/Pack/AocMainField.pack").empty();
+    std::map<bcml::Kind, size_t> checked;
+    // where the game reads a shop or drop table: its actor pack, loose or in Pack/TitleBG.pack
+    auto actor_file = [&](const std::string& path) {
+        const auto parts = split_parts(path);
+        size_t k = 0;
+        while (k + 1 < parts.size() && parts[k].find(".sbactorpack") == std::string::npos) k++;
+        std::string actor = parts[k].rfind("content/", 0) == 0 ? parts[k].substr(8) : parts[k], rest;
+        for (size_t j = k + 1; j < parts.size(); j++) rest += (rest.empty() ? "" : "//") + parts[j];
+        if (!game.find("content/" + actor).empty()) return inside(file("content/" + actor), rest);
+        return inside(file("content/Pack/TitleBG.pack"), actor + "//" + rest);
+    };
+    for (const auto& [id, diffs] : all) {
+        const auto& [kind, key] = id;
+        const bool once = diffs.size() == 1;
+        if (kind == bcml::Kind::ActorInfo) {
+            const byml::Value info = byml_of(file("content/Actor/ActorInfo.product.sbyml"));
+            std::map<uint32_t, const byml::Value*> actors;
+            const auto& list = info.find("Actors")->array;
+            const auto& hashes = info.find("Hashes")->array;
+            for (size_t i = 0; i < list.size(); i++) {
+                actors[aamp::hash(list[i].str("name"))] = &list[i];
+                assert(uint32_t(hashes[i].bits) == aamp::hash(list[i].str("name")) && (!i || uint32_t(hashes[i - 1].bits) < uint32_t(hashes[i].bits)));
+            }
+            std::map<std::string, int> count;
+            for (const auto& d : diffs)
+                for (const auto& [h, a] : d.value.hash) count[h]++;
+            for (const auto& d : diffs)
+                for (const auto& [h, a] : d.value.hash) {
+                    const auto it = actors.find(uint32_t(std::stoul(h)));
+                    assert(it != actors.end());
+                    if (count[h] == 1)
+                        for (const auto& [k, v] : a.hash) {
+                            const byml::Value* m = it->second->find(k);
+                            assert(m && (k == "instSize" ? m->as_s32() >= v.as_s32() : v.type == byml::Type::Hash || *m == v));
+                        }
+                    checked[kind]++;
+                }
+        } else if (kind == bcml::Kind::Map) {
+            const std::string rel = "Map/MainField/" + key.substr(0, key.find('_')) + "/" + key + ".smubin";
+            const bool is_static = key.substr(key.find('_') + 1) == "Static";
+            const Bytes unit = is_static ? inside(file(dlc ? "aoc/0010/Pack/AocMainField.pack" : "content/Pack/TitleBG.pack"), rel)
+                                         : unyaz(file((dlc ? "aoc/0010/" : "content/") + rel));
+            if (is_static && dlc) assert(unit == unyaz(file("aoc/0010/" + rel)));  // the loose copy is the same
+            const byml::Value u = byml_of(unit);
+            for (const char* section : {"Objs", "Rails"}) {
+                std::map<uint32_t, const byml::Value*> by_hash;
+                for (const auto& e : u.find(section)->array) by_hash[e.find("HashId")->as_u32()] = &e;
+                std::set<uint32_t> kept;  // added or changed by some mod
+                for (const auto& d : diffs)
+                    if (const byml::Value* s = d.value.find(section)) {
+                        if (const byml::Value* add = s->find("add"))
+                            for (const auto& e : add->array) kept.insert(e.find("HashId")->as_u32());
+                        if (const byml::Value* mod = s->find("mod"))
+                            for (const auto& [h, e] : mod->hash) kept.insert(uint32_t(std::stoul(h)));
+                    }
+                for (const auto& d : diffs) {
+                    const byml::Value* s = d.value.find(section);
+                    if (!s) continue;
+                    if (const byml::Value* add = s->find("add"))
+                        for (const auto& e : add->array) {
+                            const auto it = by_hash.find(e.find("HashId")->as_u32());
+                            assert(it != by_hash.end() && (!once || *it->second == e));
+                            checked[kind]++;
+                        }
+                    if (const byml::Value* mod = s->find("mod"))
+                        for (const auto& [h, e] : mod->hash) {
+                            const auto it = by_hash.find(uint32_t(std::stoul(h)));
+                            assert(it != by_hash.end() && (!once || *it->second == e));
+                            checked[kind]++;
+                        }
+                    if (const byml::Value* del = s->find("del"))
+                        for (const auto& h : del->array) {
+                            assert(kept.count(h.as_u32()) || !by_hash.count(h.as_u32()));
+                            checked[kind]++;
+                        }
+                }
+            }
+        } else if (kind == bcml::Kind::Shop) {
+            const auto items = shop_items(actor_file(key));
+            for (const auto& d : diffs) {
+                std::map<uint32_t, std::string> tables;  // the tables' names by hash
+                for (const auto& [name, x] : items) tables[aamp::hash(name)] = name;
+                if (const aamp::List* adds = aamp::list(d.shop, aamp::hash("Additions"))) {
+                    if (const aamp::Object* names = aamp::object(*adds, aamp::hash("TableNames")))
+                        for (const auto& p : names->params) tables[p.name] = aamp::text(p);
+                    for (const auto& table : adds->lists) {
+                        assert(tables.count(table.name));
+                        const auto& in = items.at(tables[table.name]);
+                        for (const auto& o : table.objects) {
+                            const auto it = std::find_if(in.begin(), in.end(), [&](const auto& x) { return aamp::hash(x.first) == o.name; });
+                            assert(it != in.end());
+                            if (once)
+                                for (const auto& p : o.params) assert(it->second.at(p.name) == p);
+                            checked[kind]++;
+                        }
+                    }
+                }
+                if (const aamp::List* rems = aamp::list(d.shop, aamp::hash("Removals")); rems && once)
+                    for (const auto& table : rems->lists) {
+                        if (!tables.count(table.name)) continue;  // the table went
+                        const auto& in = items.at(tables[table.name]);
+                        const aamp::List* adds = aamp::list(d.shop, aamp::hash("Additions"));
+                        const aamp::List* added = adds ? aamp::list(*adds, table.name) : nullptr;
+                        for (const auto& o : table.objects) {
+                            const bool back = added && aamp::object(*added, o.name);
+                            assert(back || std::none_of(in.begin(), in.end(), [&](const auto& x) { return aamp::hash(x.first) == o.name; }));
+                            checked[kind]++;
+                        }
+                    }
+            }
+        } else if (kind == bcml::Kind::Drop) {
+            const DropTables merged_drops = drops_of(actor_file(key));
+            for (const auto& d : diffs)
+                for (const auto& [name, t] : d.drops) {
+                    const auto it = std::find_if(merged_drops.begin(), merged_drops.end(), [&](const auto& x) { return x.first == name; });
+                    assert(it != merged_drops.end());
+                    if (once) {
+                        assert(it->second.size() <= t.items.size());  // an UNDERRIDE item the game lacks is left out
+                        for (const auto& [item, prob] : t.items) {
+                            const auto m = std::find_if(it->second.begin(), it->second.end(), [&](const auto& x) { return x.first == item; });
+                            assert(m != it->second.end() || !prob);
+                            if (prob) assert(m->second == *prob);
+                        }
+                    }
+                    checked[kind]++;
+                }
+        } else if (kind == bcml::Kind::Quests) {
+            const byml::Value quests = byml_of(inside(file("content/Pack/TitleBG.pack"), "Quest/QuestProduct.sbquestpack"));
+            std::map<std::string, const byml::Value*> by_name;
+            for (const auto& q : quests.array) {
+                assert(!by_name.count(q.str("Name")) && !q.find("prev_quest"));
+                by_name[q.str("Name")] = &q;
+            }
+            std::set<std::string> kept;
+            for (const auto& d : diffs) {
+                for (const auto& q : d.value.find("add") ? d.value.find("add")->array : std::vector<byml::Value>{}) kept.insert(q.str("Name"));
+                if (const byml::Value* mod = d.value.find("mod"))
+                    for (const auto& [name, q] : mod->hash) kept.insert(name);
+            }
+            for (const auto& d : diffs) {
+                for (const char* part : {"add", "mod"})
+                    if (const byml::Value* p = d.value.find(part))
+                        for (const auto& q : p->type == byml::Type::Hash ? std::vector<byml::Value>{} : p->array) {
+                            assert(by_name.count(q.str("Name")));
+                            checked[kind]++;
+                        }
+                if (const byml::Value* mod = d.value.find("mod"))
+                    for (const auto& [name, q] : mod->hash) {
+                        byml::Value x = q;
+                        x.erase("prev_quest");
+                        assert(by_name.count(name) && (!once || *by_name[name] == x));
+                        checked[kind]++;
+                    }
+                if (const byml::Value* del = d.value.find("del"))
+                    for (const auto& name : del->array) {
+                        assert(kept.count(name.text) || !by_name.count(name.text));
+                        checked[kind]++;
+                    }
+            }
+        } else if (kind == bcml::Kind::Residents || kind == bcml::Kind::AreaData || kind == bcml::Kind::Effects) {
+            const char* inner = kind == bcml::Kind::Residents ? "Actor/ResidentActors.byml" : kind == bcml::Kind::AreaData ? "Ecosystem/AreaData.sbyml"
+                                                                                                                             : "Ecosystem/StatusEffectList.sbyml";
+            const byml::Value list = byml_of(inside(file("content/Pack/Bootup.pack"), inner));
+            std::map<std::string, const byml::Value*> by_key;
+            if (kind == bcml::Kind::Effects)
+                for (const auto& [name, e] : list.array[0].hash) by_key[name] = &e;
+            else
+                for (const auto& e : list.array)
+                    by_key[kind == bcml::Kind::Residents ? e.str("name") : std::to_string(e.find("AreaNumber")->as_s32())] = &e;
+            for (const auto& d : diffs)
+                for (const auto& [k, v] : d.value.hash) {
+                    const bool removed = kind == bcml::Kind::Residents && v.find("remove");
+                    assert(removed ? !once || !by_key.count(k) : by_key.count(k) > 0);
+                    if (once && !removed) {
+                        if (kind == bcml::Kind::Effects) assert(*by_key[k] == v);
+                        else
+                            for (const auto& [field, x] : v.hash) assert(x.type == byml::Type::Hash || *by_key[k]->find(field) == x);
+                    }
+                    checked[kind]++;
+                }
+        } else if (kind == bcml::Kind::MainStatic) {
+            const byml::Value stat = byml_of(dlc ? unyaz(file("aoc/0010/Map/MainField/Static.smubin")) : inside(file("content/Pack/Bootup.pack"), "Map/MainField/Static.smubin"));
+            for (const auto& d : diffs)
+                for (const auto& [cat, entries] : d.value.hash) {
+                    std::map<std::string, const byml::Value*> by_id;
+                    for (const auto& e : stat.find(cat)->array) by_id[static_key(e)] = &e;
+                    for (const auto& [k, e] : entries.hash) {
+                        assert(e.find("remove") ? !once || !by_id.count(k) : by_id.count(k) > 0);
+                        checked[kind]++;
+                    }
+                }
+        } else if (kind == bcml::Kind::DungeonStatic) {
+            const byml::Value stat = byml_of(dlc ? unyaz(file("aoc/0010/Map/CDungeon/Static.smubin")) : inside(file("content/Pack/Bootup.pack"), "Map/CDungeon/Static.smubin"));
+            std::map<std::string, const byml::Value*> by_id;
+            for (const auto& e : stat.find("StartPos")->array) by_id[e.str("Map") + "___" + e.str("PosName")] = &e;
+            for (const auto& d : diffs)
+                for (const auto& [k, e] : d.value.hash) {
+                    const std::string id = k.find("___") == std::string::npos ? k + "___Entrance_1" : k;
+                    assert(by_id.count(id));
+                    if (once)
+                        for (const auto& [field, v] : e.hash) assert(*by_id[id]->find(field) == v);
+                    checked[kind]++;
+                }
+        }
+    }
+    printf("BCML merge data in the merged files: %zu actors, %zu map entries, %zu shop items, %zu drop tables, %zu quests, %zu resident actors, "
+           "%zu areas, %zu status effects, %zu static entries, %zu shrine entrances\n",
+           checked[bcml::Kind::ActorInfo], checked[bcml::Kind::Map], checked[bcml::Kind::Shop], checked[bcml::Kind::Drop], checked[bcml::Kind::Quests],
+           checked[bcml::Kind::Residents], checked[bcml::Kind::AreaData], checked[bcml::Kind::Effects], checked[bcml::Kind::MainStatic],
+           checked[bcml::Kind::DungeonStatic]);
+}
 int dump_check(char** argv) {
     config::game_dir = argv[2];
     config::base_dir = argv[3];
@@ -1405,7 +2112,14 @@ int dump_check(char** argv) {
         c.table = have_table ? &merged_table : nullptr;
         if (tree.rfind("aoc/", 0) == 0) c.aoc = "Aoc/" + tree.substr(4, tree.find('/', 4) - 4) + "/";
         c.sized(tree.substr(tree.find('/', tree.rfind("aoc/", 0) == 0 ? 4 : 0) + 1), unpacked.size());
-        check_archive(unpacked, vanilla.empty() ? nullptr : &vunpacked, 1, c);
+        if (is_sarc(unpacked.data(), unpacked.size())) {
+            check_archive(unpacked, vanilla.empty() ? nullptr : &vunpacked, 1, c);
+        } else {  // a loose file made here: parameters (BCML's deep merge), a data table (ActorInfo, a map unit, static data)
+            c.files++;
+            if (vunpacked != unpacked) c.changed++;
+            if (unpacked.size() >= 4 && !memcmp(unpacked.data(), "AAMP", 4)) check_params(unpacked, c);
+            else if (byml::is_byml(unpacked.data(), unpacked.size())) check_table(unpacked, c);
+        }
         small += c.small;
         printf("%s: %zu bytes (game %zu): %zu archives, %zu files read back (%zu parameter files, %zu data tables, %zu text files), %zu changed, "
                "%zu of the game's missing\n",
@@ -1415,6 +2129,7 @@ int dump_check(char** argv) {
     printf("size entries smaller than their files: %zu\n", small);
     assert(small == 0);
     check_tables(cache, fs::path(argv[5]), game);
+    check_files(cache, fs::path(argv[5]), game);
     return 0;
 }
 
@@ -1437,6 +2152,7 @@ int main(int argc, char** argv) {
     test_merge(work / "merge");
     test_bcml(work / "bcml");
     test_bcml_tables(work / "tables");
+    test_bcml_files(work / "files");
     test_layouts(work / "layouts");
     test_loader(work / "loader", argv[0]);
     printf("content merge: all tests passed\n");
