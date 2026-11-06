@@ -42,8 +42,8 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   buttons by position), keyboard and mouse.
 - Settings overlay: graphics, audio (master volume), controls, and cheats you can switch on and off
   while playing (infinite arrows, unbreakable weapons and shields, champion abilities without
-  recharge, infinite hearts and stamina, Master Cycle Zero fuel and summoning anywhere, amiibo more
-  than once a day).
+  recharge, infinite hearts and stamina, no Blood Moon, no random enemy spawns, a weather of your
+  choice, Master Cycle Zero fuel and summoning anywhere, amiibo more than once a day).
 - Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`; `101c9500` for the European
   release).
 

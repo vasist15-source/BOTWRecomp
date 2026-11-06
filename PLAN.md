@@ -208,6 +208,23 @@ saves are also looked for under `101c9500` (the same save files). `tools/run.sh`
 European folders when there are no USA ones. `game_release_test` covers the decision. **Not run with a
 European dump yet**: check the `[config] release:` log line, the text language, the DLC and a Cemu save.
 
+### 2026-11-06: more cheats: weather, no Blood Moon, no random enemy spawns
+Settings > Cheats gains an Enemies card and a Weather choice (`cheatNoBloodMoon`, `cheatNoRandomEnemies`,
+`cheatWeather` = 0 for the game's own, 1-9 for weather type 0-8; `WWHD_CHEATS=weather=3` takes values).
+- Weather (sites of Cemu's Weather mod, 03668FC8/03668FEC in the WeatherMgr update): the current weather
+  (+0x18) is compared with the forced one and the forced one stored, so it takes over when the game's
+  own transition allows (+0x14 >= 0.99); the game's wanted weather (r26) is left alone. Places with a
+  weather of their own keep it.
+- No Blood Moon (ours; Cemu's Day Time pack only moves its threshold): TimeMgr's bloody-day check
+  0365ECBC (FirstTouchdown and the timer at +0xA8 over 2520.0 = 7 * 360, the only reader of 10301850)
+  answers no. handleNewDay (0365F214) then never marks a day WM_BloodyDay, so the midnight Blood Moon
+  (Demo011_0 and the BloodyMoon/Schedule event) never comes; the timer keeps counting, so a Blood Moon
+  follows within two days of the switch going off. Untouched: the relief Blood Moon the game forces
+  to free memory (BloodyMoonRelief, another path) and a day already marked when the switch goes on.
+- No random enemy spawns (Cemu's Prevent Random Spawns, "all enemies"): the auto-placement check at
+  029FFB3C reports an actor whose name (*(r1 + 0x40)) starts with Enemy_ as placed already.
+Regenerating changed code_087 and code_192 only (3 functions). **Not play-tested yet.**
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

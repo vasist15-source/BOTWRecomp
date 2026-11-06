@@ -63,17 +63,20 @@ else:
         cheats = module('botw_cheat_patches', ROOT / 'tools/botw_cheat_patches.py')
         fake = {0x100: (0x7C180050, 'BOTW_CHEAT_ARROWS', cheats.NOP),
                 0x104: (0x38600000, 'BOTW_CHEAT_AMIIBO', 0x38600001),
-                0x108: (0xFC20F890, 'botw_cheat_unbreakable(1)', 'c->f[1].ps0 = 0.0;')}
+                0x108: (0xFC20F890, 'botw_cheat_unbreakable(1)', ('after', 'c->f[1].ps0 = 0.0;')),
+                0x10C: (0x2C030000, 'BOTW_CHEAT_WEATHER', ('instead', 'c->r[3] = 0;'))}
         source = '\n'.join(['void f_00000100(Cpu* __restrict c) {',
                             '    c->r[0] = c->r[0] - c->r[24]; /* 00000100: 7C180050 */',
                             '    c->r[3] = 0u + 0x00000000u; /* 00000104: 38600000 */',
-                            '    c->f[1].ps0 = c->f[31].ps0; /* 00000108: FC20F890 */', '}'])
+                            '    c->f[1].ps0 = c->f[31].ps0; /* 00000108: FC20F890 */',
+                            '    cr_set_s(c, 0, (int32_t)c->r[3], 0); /* 0000010C: 2C030000 */', '}'])
         with mock.patch.dict(cheats.SITES, fake, clear=True):
             out = cheats.apply(source, list(fake), lambda address, word: f'NEW_{word:08X};')
             self.assertTrue(out.startswith('#include "botw_cheats.h"\n'))
             self.assertIn('if (!botw_cheat(BOTW_CHEAT_ARROWS)) { c->r[0] = c->r[0] - c->r[24]; }', out)
             self.assertIn('if (botw_cheat(BOTW_CHEAT_AMIIBO)) { NEW_38600001; } else { c->r[3] = 0u + 0x00000000u; }', out)
             self.assertIn('c->f[1].ps0 = c->f[31].ps0; if (botw_cheat_unbreakable(1)) { c->f[1].ps0 = 0.0; }', out)
+            self.assertIn('if (botw_cheat(BOTW_CHEAT_WEATHER)) { c->r[3] = 0; } else { cr_set_s(c, 0, (int32_t)c->r[3], 0); }', out)
             for address, (word, _, _) in fake.items():
                 self.assertEqual(out.count(f'/* {address:08X}: {word:08X} */'), 1)
             with self.assertRaises(ValueError):

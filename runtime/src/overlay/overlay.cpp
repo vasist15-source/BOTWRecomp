@@ -1681,6 +1681,17 @@ void tab_cheats() {
     heading("Link");
     cheat_switch(BOTW_CHEAT_HEARTS);
     cheat_switch(BOTW_CHEAT_STAMINA);
+    heading("Enemies");
+    cheat_switch(BOTW_CHEAT_NO_BLOOD_MOON);
+    cheat_switch(BOTW_CHEAT_NO_RANDOM_ENEMIES);
+    heading("Weather");
+    {
+        int w = mods::cheats::value(BOTW_CHEAT_WEATHER);
+        ImGui::SetNextItemWidth(260);
+        if (ImGui::Combo("Weather", &w, mods::cheats::kWeatherNames, IM_ARRAYSIZE(mods::cheats::kWeatherNames)))
+            mods::cheats::set_value(BOTW_CHEAT_WEATHER, (uint8_t)w);
+        help(mods::cheats::info(BOTW_CHEAT_WEATHER).help);
+    }
     heading("Master Cycle Zero");
     cheat_switch(BOTW_CHEAT_CYCLE_FUEL);
     cheat_switch(BOTW_CHEAT_CYCLE_ANYWHERE);

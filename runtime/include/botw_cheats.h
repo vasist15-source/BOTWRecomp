@@ -19,10 +19,14 @@ enum {
     BOTW_CHEAT_CYCLE_FUEL,      // Master Cycle Zero fuel is not used up
     BOTW_CHEAT_CYCLE_ANYWHERE,  // Master Cycle Zero can be summoned everywhere
     BOTW_CHEAT_AMIIBO,          // each amiibo can be read again the same day
+    BOTW_CHEAT_NO_BLOOD_MOON,   // no scheduled Blood Moon (the one that frees memory still can come)
+    BOTW_CHEAT_NO_RANDOM_ENEMIES,  // auto-placed enemies (Stal enemies at night, Keese, ...) don't appear
+    BOTW_CHEAT_WEATHER,         // 0: the game's weather; 1-9: weather type 0-8 forced
     BOTW_CHEAT_COUNT
 };
-extern uint8_t botw_cheats[BOTW_CHEAT_COUNT];  // 1 = on; any thread may switch them
+extern uint8_t botw_cheats[BOTW_CHEAT_COUNT];  // 0 = off, else on (or a value); any thread may switch them
 static inline int botw_cheat(int id) { return __atomic_load_n(&botw_cheats[id], __ATOMIC_RELAXED); }
+int botw_cheat_enemy_name(uint32_t name);  // the guest C string at name starts with "Enemy_"
 // a weapon actor's durability loss: its type (+0x938) 4 is a shield; 0-3 are swords, spears and bows
 static inline int botw_cheat_unbreakable(uint32_t weapon_type) {
     return botw_cheat(weapon_type == 4 ? BOTW_CHEAT_SHIELDS : BOTW_CHEAT_WEAPONS);
