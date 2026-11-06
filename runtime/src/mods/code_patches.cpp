@@ -455,8 +455,12 @@ bool make_plan(Plan& p, std::string& why) {
         return false;
     }
     const fs::path setup = fs::path(cfg.get("source").string()) / "tools" / "installer" / "botw_setup.py";
-    if (!fs::equivalent(fs::path(cfg.get("app").string()), app, ec) || !fs::exists(setup, ec)) {
-        why = "The installer that made this game (" + cfg.get("source").string() + ") isn't there any more.";
+    if (!fs::equivalent(fs::path(cfg.get("app").string()), app, ec)) {
+        why = "The installer put the game in " + cfg.get("app").string() + ", not here: open the installer again to rebuild it.";
+        return false;
+    }
+    if (!fs::exists(setup, ec)) {  // 0.2.0 and later keep it in ~/Library/Application Support/BotW/installer
+        why = "The installer that made this game (" + cfg.get("source").string() + ") isn't there any more: open it again.";
         return false;
     }
     std::vector<std::string> cmd = {"/usr/bin/python3", "-u", setup.string(), "--json", "install", "--base", cfg.get("base").string(),

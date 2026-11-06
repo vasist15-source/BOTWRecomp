@@ -64,6 +64,8 @@ Prefer Terminal? From a source checkout, `tools/installer/install-macos.command 
 | settings, controls, screenshots | `~/Library/Application Support/BotW` |
 | shader cache | `~/Library/Caches/BotW` |
 | build files (if kept) | `~/Library/Caches/BotW/installer` (`gen`: translated code, `obj` or `rt`: the build) |
+| the installer's files, for rebuilding the game code from Settings > Mods (code mods) | `~/Library/Application Support/BotW/installer` |
+| mods | `~/Library/Application Support/BotW/Mods` (Settings > Mods > Show in Finder) |
 | game log, crash reports, installer log | `~/Library/Logs/BotW` (`wwhd.log`, `captures/`, `installer.log`) |
 
 Moved your dump? Open the installer again and choose the new place; it builds again (faster with

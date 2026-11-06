@@ -45,6 +45,10 @@ CONFIG = os.path.join(SUPPORT, "install.plist")
 # botw_dmg.py): only the game code is compiled here, with the Command Line Tools' clang, and linked to
 # it. A source checkout has no kit/ and builds everything with CMake.
 KIT = os.path.join(ROOT, "kit")
+# A release's files (this script, the translator, the kit) are kept here, and install.plist names this folder
+# as the source: the installer app runs from its DMG (or a copy Gatekeeper translocated), which is gone later,
+# and the game's Rebuild for code mods (runtime/src/mods/code_patches.cpp) runs this script again from there.
+INSTALLER_COPY = os.path.join(SUPPORT, "installer")
 SAVE = os.path.join(SUPPORT, "save")
 GAME_COPY = os.path.join(SUPPORT, "game")
 APP_NAME = "Breath of the Wild.app"
@@ -375,6 +379,22 @@ def import_save(src_user, log):
         shutil.rmtree(os.path.join(SAVE, "common"), ignore_errors=True)
         shutil.copytree(common, os.path.join(SAVE, "common"))
     log("Imported the save from %s" % src_user)
+
+
+def keep_release(log):
+    """Copies a release's files to INSTALLER_COPY (replacing an older release's) and returns that folder."""
+    if os.path.realpath(ROOT) == os.path.realpath(INSTALLER_COPY):  # the game's Rebuild runs the kept copy
+        return INSTALLER_COPY
+    tmp, old = INSTALLER_COPY + ".tmp", INSTALLER_COPY + ".old"
+    for d in (tmp, old):
+        shutil.rmtree(d, ignore_errors=True)
+    shutil.copytree(ROOT, tmp, ignore=shutil.ignore_patterns("__pycache__"))
+    if os.path.exists(INSTALLER_COPY):
+        os.rename(INSTALLER_COPY, old)
+    os.rename(tmp, INSTALLER_COPY)
+    shutil.rmtree(old, ignore_errors=True)
+    log("Kept the installer's files in %s, for rebuilding the game code from Settings > Mods" % INSTALLER_COPY)
+    return INSTALLER_COPY
 
 
 # ---------------------------------------------------------------- tools
@@ -809,7 +829,14 @@ class Installer:
         gen, obj = os.path.join(CACHE, "gen"), os.path.join(CACHE, "obj")
         os.makedirs(obj, exist_ok=True)
         flags = self.kit["cflags"] + ["-I", os.path.join(KIT, "include"), "-I", gen]
-        flag_stamp = hashlib.sha256(json.dumps(flags).encode()).hexdigest()
+        # the objects depend on the flags and the kit's headers, not on where the kit is: the installer runs
+        # from a DMG or a translocated copy, the game's Rebuild from INSTALLER_COPY, and a kept build must stay
+        stamp = hashlib.sha256(json.dumps(self.kit["cflags"]).encode())
+        for d, _, names in sorted(os.walk(os.path.join(KIT, "include"))):
+            for n in sorted(names):
+                with open(os.path.join(d, n), "rb") as f:
+                    stamp.update(os.path.relpath(os.path.join(d, n), KIT).encode() + b"\0" + f.read())
+        flag_stamp = stamp.hexdigest()
         stamp_file = os.path.join(obj, ".flags")
         if not os.path.isfile(stamp_file) or open(stamp_file).read() != flag_stamp:
             shutil.rmtree(obj)
@@ -917,9 +944,10 @@ class Installer:
         # where the app finds everything (per user, independent of this source folder)
         os.makedirs(SUPPORT, exist_ok=True)
         os.makedirs(os.path.join(SAVE, "user"), exist_ok=True)
+        source = keep_release(self.log) if self.kit else ROOT  # a source checkout stays where it is
         cfg = {"base": os.path.abspath(paths["base"]), "update": os.path.abspath(paths["update"]),
                "dlc": os.path.abspath(paths["dlc"]) if paths["dlc"] else "", "save": SAVE,
-               "app": app, "source": ROOT, "installed": time.strftime("%Y-%m-%d %H:%M:%S")}
+               "app": app, "source": source, "installed": time.strftime("%Y-%m-%d %H:%M:%S")}
         with open(CONFIG + ".tmp", "wb") as f:
             plistlib.dump(cfg, f)
         os.replace(CONFIG + ".tmp", CONFIG)
