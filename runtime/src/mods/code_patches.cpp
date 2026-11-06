@@ -2,6 +2,7 @@
 // (botw_patches.h); the manifest and the caves' functions come from build/gen/code_patches.c.
 #include "code_patches.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -58,6 +59,7 @@ struct Mod {  // a pack the game code holds (the manifest)
 };
 struct Plan {  // how this game rebuilds its code
     std::vector<std::vector<std::string>> steps;
+    std::vector<std::vector<std::string>> envs;  // per step: more environment (NAME=value)
     std::vector<double> weights;  // of each step in the progress
     bool installer = false;       // the steps print the installer's JSON events
     std::string exe, how;
@@ -408,26 +410,39 @@ bool make_plan(Plan& p, std::string& why) {
     std::error_code ec;
     const fs::path exe_dir = host::exe_dir();
     const fs::path python = fs::exists("/usr/bin/python3", ec) ? "/usr/bin/python3" : "python3";
-    if (fs::exists(exe_dir / "CMakeCache.txt", ec)) {  // a build folder of a source checkout
-        const fs::path cache = exe_dir / "CMakeCache.txt";
+    const fs::path app = exe_dir.parent_path().parent_path();
+    const bool bundle = exe_dir.filename() == "MacOS" && app.extension() == ".app";
+    // an app tools/make_app.sh made from a source checkout: it starts in that checkout (BotWLaunch's dir)
+    const fs::path checkout = fs::current_path(ec);
+    const bool made_app = bundle && fs::exists(checkout / "tools" / "make_app.sh", ec) &&
+                          fs::exists(checkout / "build" / "rt" / "CMakeCache.txt", ec);
+    if (fs::exists(exe_dir / "CMakeCache.txt", ec) || made_app) {  // a build folder of a source checkout
+        const fs::path build = made_app ? checkout / "build" / "rt" : exe_dir;
+        const fs::path cache = build / "CMakeCache.txt";
         const fs::path src = cache_var(cache, "CMAKE_HOME_DIRECTORY"), gen = cache_var(cache, "GEN_DIR");
         const std::string cmake = cache_var(cache, "CMAKE_COMMAND");
         const fs::path setup = src / "tools" / "installer" / "botw_setup.py";
         const fs::path rpx = fs::path(config::game_dir) / "code" / "U-King.rpx";
         if (!fs::exists(setup, ec) || gen.empty() || cmake.empty() || !fs::exists(rpx, ec)) {
-            why = "The build folder " + exe_dir.string() + " doesn't say where its source and generated code are.";
+            why = "The build folder " + build.string() + " doesn't say where its source and generated code are.";
             return false;
         }
         p.steps = {{python.string(), "-u", setup.string(), "recomp", rpx.string(), gen.string()},
-                   {cmake, "--build", exe_dir.string(), "--target", "wwhd"}};
+                   {cmake, "--build", build.string(), "--target", "wwhd"}};
+        p.envs = {{}, {}};
         p.weights = {0.75, 0.25};
         p.exe = (exe_dir / fs::path(g.args.empty() ? "wwhd" : g.args[0]).filename()).string();
-        p.how = "Translates the game code into " + gen.string() + " and builds " + p.exe + ".";
+        p.how = "Translates the game code into " + gen.string() + " and builds " + (build / "wwhd").string() + ".";
+        if (made_app) {  // then bundles it again where this app is, with the same game folders
+            p.steps.push_back({"/bin/sh", (src / "tools" / "make_app.sh").string(), app.parent_path().string()});
+            p.envs.push_back({"BOTW_DUMP=" + fs::path(config::game_dir).parent_path().string()});
+            p.weights = {0.7, 0.25, 0.05};
+            p.how += " Then tools/make_app.sh makes " + app.string() + " again.";
+        }
         return true;
     }
-    const fs::path app = exe_dir.parent_path().parent_path();
     const fs::path plist = fs::path(host::config_dir()) / "install.plist";
-    if (exe_dir.filename() != "MacOS" || app.extension() != ".app" || !fs::exists(plist, ec)) {
+    if (!bundle || !fs::exists(plist, ec)) {
         why = "This copy of the game wasn't made by the installer or built from source here, so it can't rebuild itself.";
         return false;
     }
@@ -477,8 +492,8 @@ void update(const std::function<void(RebuildState&)>& f) {
 
 #ifndef _WIN32
 // runs one step, handing each line of its output (stdout and stderr) to on_line; the exit code, or -1
-int run_step(const std::vector<std::string>& args, const std::string& mods_dir, const std::function<void(const std::string&)>& on_line,
-             std::string& error) {
+int run_step(const std::vector<std::string>& args, const std::vector<std::string>& more_env, const std::string& mods_dir,
+             const std::function<void(const std::string&)>& on_line, std::string& error) {
     int pipefd[2];
     if (pipe(pipefd)) {
         error = "can't create a pipe";
@@ -496,9 +511,14 @@ int run_step(const std::vector<std::string>& args, const std::string& mods_dir, 
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);  // its own group: a cancel stops all of it
     posix_spawnattr_setpgroup(&attr, 0);
     std::vector<std::string> env;
-    for (char** e = environ; *e; e++)
-        if (std::strncmp(*e, "BOTW_MODS_DIR=", 14) != 0) env.push_back(*e);
-    env.push_back("BOTW_MODS_DIR=" + mods_dir);
+    std::vector<std::string> set = more_env;
+    set.push_back("BOTW_MODS_DIR=" + mods_dir);
+    for (char** e = environ; *e; e++) {
+        const char* eq = std::strchr(*e, '=');
+        const std::string name(*e, eq ? size_t(eq - *e) + 1 : std::strlen(*e));
+        if (std::none_of(set.begin(), set.end(), [&](const std::string& s) { return s.rfind(name, 0) == 0; })) env.push_back(*e);
+    }
+    env.insert(env.end(), set.begin(), set.end());
     std::vector<char*> envp, argv;
     for (auto& e : env) envp.push_back(e.data());
     envp.push_back(nullptr);
@@ -591,7 +611,7 @@ void rebuild_worker(Plan p, std::string mods_dir) {
                 });
         };
         std::string error;
-        const int code = run_step(p.steps[k], mods_dir, on_line, error);
+        const int code = run_step(p.steps[k], k < p.envs.size() ? p.envs[k] : std::vector<std::string>{}, mods_dir, on_line, error);
         bool cancelled;
         {
             std::lock_guard<std::mutex> lk(g_mutex);
