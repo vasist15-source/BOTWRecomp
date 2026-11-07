@@ -1,5 +1,13 @@
 # BOTWRecomp: Breath of the Wild, native for Apple Silicon Macs
 
+<img width="1710" height="1107" alt="Screenshot 2026-11-07 at 11 25 25 PM" src="https://github.com/user-attachments/assets/dcb1f071-a5ff-491c-8be3-dc1f2ad10eb1" />
+
+
+<img width="1710" height="1107" alt="Screenshot 2026-11-07 at 1 48 57 AM" src="https://github.com/user-attachments/assets/19bf78e1-5d8c-4e92-a318-5f4170b9dd80" />
+
+<img width="1710" height="1107" alt="Screenshot 2026-11-07 at 1 49 10 AM" src="https://github.com/user-attachments/assets/e5abc30d-aa0f-4aa9-8b8a-469d374c2d5b" />
+
+
 A native macOS build of *The Legend of Zelda: Breath of the Wild* (Wii U, update v208 / game
 version 1.5.0), made by static recompilation: the game's own PowerPC code is translated to C ahead of
 time and compiled for Apple Silicon, Cafe OS is reimplemented natively, and GX2 graphics go straight
@@ -29,6 +37,8 @@ rough edges: stutter the first time new effects are drawn (shaders are compiled 
 
 The installer holds no game files: it builds the game on your Mac from your copy. Details and
 troubleshooting: [tools/installer/README.md](tools/installer/README.md).
+
+
 
 ## What works
 
