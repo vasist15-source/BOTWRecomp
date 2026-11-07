@@ -39,8 +39,6 @@ The installer holds no game files: it builds the game on your Mac from your copy
 troubleshooting: [tools/installer/README.md](tools/installer/README.md).
 
 
-<img width="1710" height="1107" alt="Screenshot 2026-11-07 at 1 48 57 AM" src="https://github.com/user-attachments/assets/19bf78e1-5d8c-4e92-a318-5f4170b9dd80" />
-
 
 ## What works
 
