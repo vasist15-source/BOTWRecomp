@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "obj_table.h"
 #include "savestate.h"
 #include "scheduler_tick.h"
 #include "render_prof.h"
@@ -929,23 +930,71 @@ HLE(coreinit, OSMemoryBarrier) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 
 // ---------------------------------------------------------------- host objects
+// Found by guest address without a lock (obj_table.h); objects are never replaced or deleted (waiters may
+// hold them). WWHD_LOCKED_LOOKUP=1: the old lookup (one lock per kind of object, then a hash map), which
+// every game thread contended on; WWHD_LOOKUP_AB=1 alternates the two every 10 s and counts lookups and
+// waits ([lookup-ab] lines, metal_main.mm ab_frame).
+static bool env_is_1(const char* name) {
+    const char* e = getenv(name);
+    return e && !strcmp(e, "1");
+}
+static const bool g_lookup_ab = env_is_1("WWHD_LOOKUP_AB");
+static std::atomic<bool> g_lookup_locked{env_is_1("WWHD_LOCKED_LOOKUP")};
+
+namespace {
+// the A/B's counts: a set per thread (no cache line shared between threads), summed when a window ends
+struct LookupCounts {
+    std::atomic<uint64_t> lookups[objtable::kKinds] = {};
+    std::atomic<uint64_t> locked{0}, lockWaits{0}, mutexWaits{0}, mutexBlocks{0};
+};
+std::mutex g_counts_m;
+std::vector<LookupCounts*> g_counts;  // never freed: a thread's counts outlive it
+thread_local LookupCounts* t_counts = nullptr;
+LookupCounts& lookup_counts() {
+    if (__builtin_expect(!t_counts, 0)) {
+        t_counts = new LookupCounts();
+        std::lock_guard<std::mutex> lk(g_counts_m);
+        g_counts.push_back(t_counts);
+    }
+    return *t_counts;
+}
+inline void bump(std::atomic<uint64_t>& n) { n.store(n.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }  // its thread only
+}  // namespace
+
 template <typename T>
 struct ObjTable {
-    std::mutex m;
-    std::unordered_map<uint32_t, T*> map;  // objects are never deleted (waiters may hold them)
+    objtable::Table<T> t;
+    const objtable::Kind kind;
+    explicit ObjTable(objtable::Kind k) : kind(k) {}
     T* get(uint32_t addr) {
-        std::lock_guard<std::mutex> lk(m);
-        T*& p = map[addr];
-        if (!p) p = new T();
+        if (__builtin_expect(g_lookup_ab, 0)) return get_counted(addr);
+        return __builtin_expect(g_lookup_locked.load(std::memory_order_relaxed), 0) ? t.get_locked(addr) : t.get(addr);
+    }
+    T* get_counted(uint32_t addr) {
+        LookupCounts& n = lookup_counts();
+        bump(n.lookups[kind]);
+        typename objtable::Table<T>::Took took;
+        T* p = g_lookup_locked.load(std::memory_order_relaxed) ? t.get_locked(addr, &took) : t.get(addr, &took);
+        if (took.lock) bump(n.locked);
+        if (took.waited) bump(n.lockWaits);
         return p;
     }
-    void reset(uint32_t addr) {
-        std::lock_guard<std::mutex> lk(m);
-        T*& p = map[addr];
-        delete p;
-        p = new T();
-    }
+    template <class F>
+    void for_each(F&& f) { t.for_each(f); }  // under the table's lock: no object is added meanwhile
 };
+// never destroyed: std::exit runs static destructors while game threads may still be in a wait
+template <typename T>
+static ObjTable<T>& make_table(objtable::Kind k) { return *new ObjTable<T>(k); }
+
+// the A/B counts OSMutex calls whose host object's lock was held
+static inline void lock_object(std::unique_lock<std::mutex>& lk) {
+    if (__builtin_expect(g_lookup_ab, 0) && !lk.try_lock()) {
+        bump(lookup_counts().mutexWaits);
+        lk.lock();
+    } else if (!lk.owns_lock()) {
+        lk.lock();
+    }
+}
 
 // OSMutex: recursive, owned by a thread
 struct HMutex {
@@ -954,13 +1003,15 @@ struct HMutex {
     const void* owner = nullptr;
     int count = 0;
 };
-static ObjTable<HMutex> g_mutexes;
+static ObjTable<HMutex>& g_mutexes = make_table<HMutex>(objtable::kMutex);
 
 static void mutex_lock(uint32_t addr) {
     HMutex* mx = g_mutexes.get(addr);
     const void* self = t_self ? (const void*)t_self : (const void*)&t_cpu;
-    std::unique_lock<std::mutex> lk(mx->m);
+    std::unique_lock<std::mutex> lk(mx->m, std::defer_lock);
+    lock_object(lk);
     if (mx->owner == self) { mx->count++; return; }
+    if (__builtin_expect(g_lookup_ab, 0) && mx->owner) bump(lookup_counts().mutexBlocks);
     park_wait(lk, mx->cv, [&] { return mx->owner == nullptr; }, W_MUTEX, addr);
     mx->owner = self;
     mx->count = 1;
@@ -978,7 +1029,8 @@ static bool mutex_trylock(uint32_t addr) {
 static void mutex_unlock(uint32_t addr) {
     HMutex* mx = g_mutexes.get(addr);
     {
-        std::lock_guard<std::mutex> lk(mx->m);
+        std::unique_lock<std::mutex> lk(mx->m, std::defer_lock);
+        lock_object(lk);
         if (--mx->count > 0) return;
         mx->owner = nullptr;
         mx->count = 0;
@@ -1025,7 +1077,7 @@ struct HSemaphore {
     std::condition_variable cv;
     int32_t count = 0;
 };
-static ObjTable<HSemaphore> g_semaphores;
+static ObjTable<HSemaphore>& g_semaphores = make_table<HSemaphore>(objtable::kSemaphore);
 HLE(coreinit, OSInitSemaphore) {
     HSemaphore* s = g_semaphores.get(arg(c, 0));
     {
@@ -1092,13 +1144,12 @@ struct HEvent {
     bool auto_reset = false;
     std::deque<HostThread*> waiters;
 };
-static ObjTable<HEvent> g_events;
+static ObjTable<HEvent>& g_events = make_table<HEvent>(objtable::kEvent);
 static void wake_timed_events() {
-    std::lock_guard<std::mutex> table(g_events.m);
-    for (auto& [address, event] : g_events.map) {
+    g_events.for_each([](uint32_t, HEvent* event) {
         std::lock_guard<std::mutex> lock(event->m);
         event->cv.notify_all();
-    }
+    });
 }
 
 static bool event_wait(uint32_t addr, const std::chrono::steady_clock::time_point* deadline, const uint64_t* simulation_deadline = nullptr) {
@@ -1173,7 +1224,7 @@ struct HQueue {
     std::deque<std::array<uint32_t, 4>> msgs;
     uint32_t capacity = 0;
 };
-static ObjTable<HQueue> g_queues;
+static ObjTable<HQueue>& g_queues = make_table<HQueue>(objtable::kMessageQueue);
 
 HLE(coreinit, OSInitMessageQueue) {
     uint32_t q = arg(c, 0);
@@ -1270,7 +1321,7 @@ struct HSleep {
     std::vector<HostThread*> waiters;
     uint64_t gen = 0;  // for sleepers that are not guest threads
 };
-static ObjTable<HSleep> g_sleepq;
+static ObjTable<HSleep>& g_sleepq = make_table<HSleep>(objtable::kThreadQueue);
 HLE(coreinit, OSInitThreadQueue) { g_sleepq.get(arg(c, 0)); }  // sleepers (if any) keep waiting for a wakeup
 HLE(coreinit, OSSleepThread) {
     HSleep* q = g_sleepq.get(arg(c, 0));
@@ -1302,7 +1353,7 @@ struct HRendezvous {
     std::condition_variable cv;
     uint32_t arrived = 0;  // bit per core that has reached it
 };
-static ObjTable<HRendezvous> g_rdv;
+static ObjTable<HRendezvous>& g_rdv = make_table<HRendezvous>(objtable::kRendezvous);
 HLE(coreinit, OSInitRendezvous) {
     HRendezvous* r = g_rdv.get(arg(c, 0));
     std::lock_guard<std::mutex> lk(r->m);
@@ -1320,6 +1371,45 @@ HLE(coreinit, OSWaitRendezvous) {
     r->cv.notify_all();
     park_wait(lk, r->cv, [&] { return (r->arrived & mask) == mask; }, W_RDV, arg(c, 0));
     ret(c, 1);
+}
+
+// the lookup's in-run A/B (obj_table.h)
+bool objtable::ab() { return g_lookup_ab; }
+bool objtable::locked() { return g_lookup_locked.load(); }
+void objtable::set_locked(bool on) { g_lookup_locked.store(on); }
+objtable::Counts objtable::counts() {
+    Counts c;
+    std::lock_guard<std::mutex> lk(g_counts_m);
+    for (const LookupCounts* n : g_counts) {
+        for (int k = 0; k < kKinds; k++) c.lookups[k] += n->lookups[k].load(std::memory_order_relaxed);
+        c.locked += n->locked.load(std::memory_order_relaxed);
+        c.lockWaits += n->lockWaits.load(std::memory_order_relaxed);
+        c.mutexWaits += n->mutexWaits.load(std::memory_order_relaxed);
+        c.mutexBlocks += n->mutexBlocks.load(std::memory_order_relaxed);
+    }
+    return c;
+}
+uint64_t objtable::guest_cpu_ns() {
+#ifdef __APPLE__
+    static std::mutex m;
+    static std::unordered_map<const HostThread*, uint64_t> seen;  // each thread's CPU time at its last sample
+    static uint64_t total = 0;
+    std::lock_guard<std::mutex> l(m);
+    std::lock_guard<std::mutex> lk(g_threads_mutex);
+    for (auto& [g, t] : g_threads) {
+        if (!t->mach || t->exited) continue;
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(t->mach, THREAD_BASIC_INFO, (thread_info_t)&info, &cnt) != KERN_SUCCESS) continue;
+        const uint64_t ns = (uint64_t)(info.user_time.seconds + info.system_time.seconds) * 1000000000ull +
+                            (uint64_t)(info.user_time.microseconds + info.system_time.microseconds) * 1000ull;
+        uint64_t& s = seen[t];
+        if (ns > s) total += ns - s, s = ns;
+    }
+    return total;
+#else
+    return 0;
+#endif
 }
 
 // ---------------------------------------------------------------- alarms
@@ -1568,9 +1658,7 @@ HostThread* owner_host(uint32_t g) {
 template <class T>
 std::vector<std::pair<uint32_t, T*>> sorted(ObjTable<T>& t) {
     std::vector<std::pair<uint32_t, T*>> v;
-    std::lock_guard<std::mutex> lk(t.m);
-    for (auto& [a, p] : t.map)
-        if (p) v.push_back({a, p});
+    t.for_each([&](uint32_t a, T* p) { v.push_back({a, p}); });
     std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.first < y.first; });
     return v;
 }
@@ -1883,12 +1971,10 @@ void threads_ss_load(ss::Reader& r) {
     g_tick.notify();
     // parked threads re-check their conditions against the restored objects
     auto wake = [](auto& table) {
-        std::lock_guard<std::mutex> lk(table.m);
-        for (auto& [a, o] : table.map)
-            if (o) {
-                { std::lock_guard<std::mutex> l(o->m); }
-                o->cv.notify_all();
-            }
+        table.for_each([](uint32_t, auto* o) {
+            { std::lock_guard<std::mutex> l(o->m); }
+            o->cv.notify_all();
+        });
     };
     wake(g_mutexes);
     wake(g_events);

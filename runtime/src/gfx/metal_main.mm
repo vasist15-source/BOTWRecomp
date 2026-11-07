@@ -3,6 +3,7 @@
 #include <thread>
 #include <pthread.h>
 #include <mach/mach_time.h>
+#include <libproc.h>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -26,6 +27,7 @@
 #include "dynres.h"
 extern "C" uint64_t wwhd_query_counts(uint64_t* conditional);  // gx2_core.cpp
 #include "runtime.h"
+#include "obj_table.h"
 #include "input.h"
 
 // gameplay mods (runtime/src/mods): HUD drawn into the TV image
@@ -1251,7 +1253,11 @@ void pass_timing_arm(double lastFrameMs);
 //   WWHD_PARTIAL_AB=1 ([partial-ab]): partial texture updates (texture_pieces.h: a check after writes to a
 //     texture's armed pages hashes the chunks on the pages written and uploads the slices or levels that
 //     changed) or full ones (the whole texture hashed, and uploaded if it changed), each window followed by
-//     a [texchurn] report of its 8 costliest surfaces.
+//     a [texchurn] report of its 8 costliest surfaces;
+//   WWHD_LOOKUP_AB=1 ([lookup-ab]): the guest sync objects' lookup (obj_table.h), without a lock or the old
+//     one (one lock per kind of object, then a hash map), with the game threads' CPU time, cycles and
+//     instructions, lookups of each kind, those that took the table's lock and found it held, and OSMutex
+//     calls that found their object's lock held or waited for another thread.
 // Each line: process CPU, frame time, render thread CPU time, the encoding thread's busy time (executing
 // records) and CPU time (its waits included), GPU busy and the span from a frame's first GPU start to its
 // last end, command buffers and draws, how often the encoding thread was woken and slept, and the render
@@ -1272,13 +1278,14 @@ extern uint64_t g_tex_checks_all, g_tex_gpu_checks_all, g_tex_unarmed_all, g_tex
     g_tex_hash_ns_all, g_tex_uploads_all;
 extern uint64_t g_tex_write_checks_all, g_tex_partial_all, g_tex_pieces_all, g_tex_upload_bytes_all, g_tex_decode_ns_all;
 static void ab_frame() {
-    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES, AB_PARTIAL };
+    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES, AB_PARTIAL, AB_LOOKUP };
     static const int ab = [] {
         auto on = [](const char* name) { const char* e = getenv(name); return e && !strcmp(e, "1"); };
         return on("WWHD_ENCODE_AB")    ? AB_ENCODE
                : on("WWHD_BUFFER_AB")  ? AB_BUFFERS
                : on("WWHD_TEXTURE_AB") ? AB_TEXTURES
                : on("WWHD_PARTIAL_AB") ? AB_PARTIAL
+               : on("WWHD_LOOKUP_AB")  ? AB_LOOKUP
                                        : AB_NONE;
     }();
     if (ab == AB_NONE || (ab == AB_ENCODE && !g_eq)) return;
@@ -1300,6 +1307,8 @@ static void ab_frame() {
         uint64_t frame, gpuNs, spanNs, gpuFrames, encTicks, encCpuNs, cmds, draws, wakes, encSleeps, syncs, syncNs, rtSleeps;
         uint64_t faults, protectedPages, texChecks, gpuChecks, unarmed, became, hashed, hashNs, uploads;
         uint64_t writeChecks, partial, pieces, upBytes, decodeNs;
+        uint64_t guestNs, cycles, instructions;
+        objtable::Counts lookups;
     };
     auto take = [] {
         Mark m;
@@ -1336,6 +1345,12 @@ static void ab_frame() {
         m.pieces = g_tex_pieces_all;
         m.upBytes = g_tex_upload_bytes_all;
         m.decodeNs = g_tex_decode_ns_all;
+        m.guestNs = objtable::guest_cpu_ns();
+        rusage_info_v4 ri{};
+        const bool riOk = proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t*)&ri) == 0;
+        m.cycles = riOk ? ri.ri_cycles : 0;
+        m.instructions = riOk ? ri.ri_instructions : 0;
+        m.lookups = objtable::counts();
         return m;
     };
     static Mark start = take();
@@ -1373,6 +1388,28 @@ static void ab_frame() {
             (now.decodeNs - start.decodeNs) / 1e6 / frames, (now.faults - start.faults) / frames, over25, over45, longest, secs, ++window);
         texture_churn_report(mode, 8);
         texture_partial_set(!texture_partial_on());
+        over25 = over45 = 0;
+        longest = 0;
+        start = now;
+        return;
+    }
+    if (ab == AB_LOOKUP) {
+        const char* mode = objtable::locked() ? "locked" : "lock-free";
+        const objtable::Counts &a = start.lookups, &b = now.lookups;
+        double kinds[objtable::kKinds], all = 0;
+        for (int k = 0; k < objtable::kKinds; k++) all += kinds[k] = (b.lookups[k] - a.lookups[k]) / frames;
+        LOG("[lookup-ab] %s: %.0f%% CPU, %.2f ms/frame, game threads %.2f ms/frame, render thread %.2f ms/frame, GPU busy %.2f "
+            "ms/frame, %.1f M cycles and %.1f M instructions/frame; per frame %.0f lookups (mutex %.0f, semaphore %.0f, event %.0f, "
+            "message queue %.0f, thread queue %.0f, rendezvous %.0f), %.2f took the table's lock (%.2f found it held); mutexes: %.1f "
+            "host locks found held, %.1f waits for another thread; %u frames over 25 ms, %u over 45 ms, longest %.0f ms (%.1f s, "
+            "window %d)",
+            mode, 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames, (now.guestNs - start.guestNs) / 1e6 / frames,
+            1000 * (now.rt - start.rt) / frames, (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames, (now.cycles - start.cycles) / 1e6 / frames,
+            (now.instructions - start.instructions) / 1e6 / frames, all, kinds[objtable::kMutex], kinds[objtable::kSemaphore],
+            kinds[objtable::kEvent], kinds[objtable::kMessageQueue], kinds[objtable::kThreadQueue], kinds[objtable::kRendezvous],
+            (b.locked - a.locked) / frames, (b.lockWaits - a.lockWaits) / frames, (b.mutexWaits - a.mutexWaits) / frames,
+            (b.mutexBlocks - a.mutexBlocks) / frames, over25, over45, longest, secs, ++window);
+        objtable::set_locked(!objtable::locked());
         over25 = over45 = 0;
         longest = 0;
         start = now;

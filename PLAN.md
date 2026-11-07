@@ -575,6 +575,34 @@ the kept installer copy have not been played yet. The release build is installed
   after our own write-back; hashing the bytes we write back would need a write-back that keeps its pages armed, and a
   game write in between would go unseen.
 
+### 2026-11-08: guest sync objects found without a lock (OSMutex and friends)
+- Every OSLockMutex / OSUnlockMutex, OSFastMutex_*, GHS C library lock, OSSemaphore, OSEvent, OSMessageQueue,
+  OSThreadQueue and OSRendezvous call looked its host object up in `ObjTable` (threads.cpp): one `std::mutex` per kind
+  of object, then an `unordered_map`. Standing still in a village at 1.5x that was ~9,400 lookups a frame (8,700 of them
+  mutex calls, 350 events, 250 message queues, 75 semaphores), all game threads on the same lock, and 157 a frame found
+  it held (a kernel wait each: the `__psynch_mutexwait` of the Oct 21 profile).
+- Table (`obj_table.h`, test `obj_table`): open addressing, (guest address, object) slots filled once under that lock
+  (the object, then the address with release order) and read with acquire loads, no lock. Objects are never replaced or
+  deleted, so every thread gets the same object for an address and may keep it. At most half full; it grows by a copy
+  twice as large, the old arrays kept (a lookup may still read one; one that misses there looks again under the lock).
+  Address 0 has a slot of its own. Iteration (save states, `wake_timed_events`) runs under the lock as before.
+  `ObjTable::reset` had no callers and is gone. The tables are never destroyed (`std::exit` runs static destructors
+  while game threads may be waiting).
+- Measured at 1.5x, 60 fps, standing still in a village, in-run A/B (`WWHD_LOOKUP_AB=1`, 32 windows of 10 s after
+  loading, each against its two neighbours): process CPU -5.0 points (se 0.6; 195.7 -> 190.5 %), game threads -0.74
+  ms/frame (se 0.08; 18.0 -> 17.2; ~80 ns per lookup), cycles -2.6 % (121.6 -> 118.4 M a frame, se 0.35; instructions
+  only -0.9 %: the old cost was stalls), frame time at the 60 fps cap in both modes, render thread and GPU busy
+  unchanged. Guest mutex waits for another thread 8.0 -> 6.0 a frame (an unlock no longer queues for the table's lock
+  while its guest mutex is still held); object locks found held 4.0 -> 5.3 a frame. No frame over 45 ms in either mode,
+  no hang. Synthetic bench (`obj_table_test --bench`, lock+unlock pairs on 512 mutexes): 1 thread 23 -> 10 ns, 4
+  threads 366 -> 33 ns.
+- Switches: `WWHD_LOCKED_LOOKUP=1` (the old lookup), `WWHD_LOOKUP_AB=1` (`[lookup-ab]` lines in `ab_frame`: CPU, frame
+  time, the game threads' CPU time, render thread, GPU busy, cycles and instructions, lookups of each kind, those that
+  took the table's lock and found it held, OSMutex calls that found their object's lock held or waited for another
+  thread, frames over 25 and 45 ms). Not measured at 2x or while moving.
+- Not changed: every wake-up from an HLE wait still takes one global mutex in `park_gate` (`g_frz_m`, for save
+  states), and each wait gives up and retakes its core (per-core locks).
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
