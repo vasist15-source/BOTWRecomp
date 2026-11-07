@@ -25,6 +25,7 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "render_prof.h"
 #include "gx2/gx2_cmd.h"
 #include "write_watch.h"
+#include "gfx/upload_pool.h"
 #include "platform/host.h"
 #include "metal.h"
 #include "runtime.h"
@@ -254,39 +255,36 @@ static uint64_t hash_regs(const uint32_t* regs, uint32_t first, uint32_t count, 
 }
 
 // ---------------------------------------------------------------- upload pool
-// Transient per-draw data (indices, large support buffers) comes from shared
-// buffers recycled once the GPU is done with them.
+// Transient per-draw data (indices, large support buffers, texture staging) comes from 8 MiB shared
+// buffers filled front to back (bookkeeping: gfx/upload_pool.h). A chunk serves every command buffer
+// committed while it fills, and goes back to the free list once it is full and the last of those has
+// completed. Before, each commit retired the chunk it had started: with a commit every 16 draws a chunk
+// held a few KiB, and the pool grew to a chunk per command buffer in flight (48 chunks, 495 MiB, in a
+// Hateno run). WWHD_POOL_SHARE=0 (and the old half of WWHD_BUFFER_AB=1): each commit retires its chunk.
 struct Upload {
     id<MTLBuffer> buf;
     uint32_t offset;
 };
-static std::mutex g_pool_mutex;
-static std::vector<id<MTLBuffer>> g_pool_free;
-static std::vector<id<MTLBuffer>> g_pool_used;
-static id<MTLBuffer> g_pool_cur = nil;
-static uint32_t g_pool_pos = 0;
-constexpr uint32_t kPoolChunk = 8 << 20;
+using UploadPool = gfx::upool::Pool<id<MTLBuffer>>;
+static UploadPool g_pool;
+constexpr uint64_t kPoolChunk = 8 << 20;
+// what a commit gives back once its command buffer completes (pool_take_used, pool_attach)
+struct PoolRetire {
+    std::vector<UploadPool::ChunkT*> chunks;
+};
+uint64_t pool_chunks_made() { return g_pool.chunks_made(); }
+uint64_t pool_bytes_made() { return g_pool.bytes_made(); }
+static bool pool_share_on() {
+    static const bool on = !getenv("WWHD_POOL_SHARE") || atoi(getenv("WWHD_POOL_SHARE")) != 0;
+    return on && buffers_share();
+}
 
 static Upload reserve(uint32_t size) {
-    size = (size + 255) & ~255u;
-    if (!g_pool_cur || g_pool_pos + size > g_pool_cur.length) {
-        std::lock_guard<std::mutex> lk(g_pool_mutex);
-        if (g_pool_cur) g_pool_used.push_back(g_pool_cur);
-        uint32_t want = std::max(kPoolChunk, size);
-        g_pool_cur = nil;
-        for (size_t i = 0; i < g_pool_free.size(); i++)
-            if (g_pool_free[i].length >= want) {
-                g_pool_cur = g_pool_free[i];
-                g_pool_free.erase(g_pool_free.begin() + i);
-                break;
-            }
-        if (!g_pool_cur) g_pool_cur = [R.device newBufferWithLength:want options:MTLResourceStorageModeShared];
-        g_pool_pos = 0;
-    }
-    Upload u{g_pool_cur, g_pool_pos};
-    rprof::add_upload(size);
-    g_pool_pos += size;
-    return u;
+    const UploadPool::Slice s = g_pool.reserve(size, kPoolChunk, [](uint64_t n) {
+        return [R.device newBufferWithLength:n options:MTLResourceStorageModeShared];
+    });
+    rprof::add_upload((size + 255) & ~255u);
+    return {s.chunk->buf, (uint32_t)s.offset};
 }
 id<MTLBuffer> g_debug_values = nil;
 static Upload upload(const void* data, uint32_t size) {
@@ -303,35 +301,32 @@ id<MTLBuffer> upload_reserve(uint32_t size, uint32_t* offset, uint8_t** ptr) {
     return u.buf;
 }
 
-// Buffers used so far, taken at a commit in submission order (render thread): they are recycled when
-// the committed command buffer completes (pool_attach, on whichever thread commits it)
-std::vector<id<MTLBuffer>>* pool_take_used() {
-    auto* used = new std::vector<id<MTLBuffer>>();
-    std::lock_guard<std::mutex> lk(g_pool_mutex);
-    if (g_pool_cur) {
-        g_pool_used.push_back(g_pool_cur);
-        g_pool_cur = nil;
-    }
-    used->swap(g_pool_used);
-    return used;
+// Chunks written since the last commit, taken at a commit in submission order (render thread): they are
+// given back when the committed command buffer completes (pool_attach, on whichever thread commits it).
+// nullptr: nothing to give back.
+PoolRetire* pool_take_used() {
+    static std::vector<UploadPool::ChunkT*> chunks;  // render thread
+    chunks.clear();
+    g_pool.take_used(pool_share_on(), chunks);
+    if (chunks.empty()) return nullptr;
+    auto* r = new PoolRetire();
+    r->chunks.swap(chunks);
+    return r;
 }
-// cmd nil: nothing that reads them was encoded, they are free now
-void pool_attach(id<MTLCommandBuffer> cmd, std::vector<id<MTLBuffer>>* used) {
-    if (!used) return;
-    if (used->empty()) { delete used; return; }
+static void pool_give_back(PoolRetire* r) {
+    g_pool.give_back(r->chunks);
+    delete r;
+}
+// cmd nil: nothing that reads them was encoded, they are given back now
+void pool_attach(id<MTLCommandBuffer> cmd, PoolRetire* r) {
+    if (!r) return;
     if (!cmd) {
-        std::lock_guard<std::mutex> lk(g_pool_mutex);
-        for (auto& b : *used) g_pool_free.push_back(b);
-        delete used;
+        pool_give_back(r);
         return;
     }
-    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
-        std::lock_guard<std::mutex> lk(g_pool_mutex);
-        for (auto& b : *used) g_pool_free.push_back(b);
-        delete used;
-    }];
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) { pool_give_back(r); }];
 }
-// called before a command buffer commits: buffers used so far are recycled when it completes
+// called before a command buffer commits: what was used so far is given back when it completes
 void pool_retire(id<MTLCommandBuffer> cmd) { pool_attach(cmd, pool_take_used()); }
 
 // ---------------------------------------------------------------- fetch shaders

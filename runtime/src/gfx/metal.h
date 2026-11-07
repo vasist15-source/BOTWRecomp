@@ -226,6 +226,16 @@ void q_command_buffer(void (^block)(id<MTLCommandBuffer>));  // runs on the enco
 // guest memory -> (buffer, offset); returns nil if the address is not GPU-visible
 id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset);
 
+// Buffer handling (metal_draw.mm, metal_main.mm): upload chunks shared by the command buffers that fill
+// them, and commits batched while the GPU has queued work. Both are on unless a window of the
+// WWHD_BUFFER_AB A/B turns them off (render thread).
+bool buffers_share();
+bool buffers_batch();
+struct PoolRetire;                 // the upload chunks a commit gives back
+PoolRetire* pool_take_used();      // render thread, at a commit (nullptr: nothing to give back)
+void pool_attach(id<MTLCommandBuffer> cmd, PoolRetire* r);  // given back when cmd completes (nil: now)
+void pool_retire(id<MTLCommandBuffer> cmd);                 // both, before cmd commits
+
 // views: what draws sample (SQ_TEX_RESOURCE words) and render to (CB_COLOR* / DB_DEPTH_* registers, or
 // GX2ColorBuffer / GX2DepthBuffer structs; numSlices: the view's slice count for clears)
 TexView* sampled_texture(const uint32_t* texWords, bool isDepthSampler);

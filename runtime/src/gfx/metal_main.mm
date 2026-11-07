@@ -156,11 +156,15 @@ static std::deque<GpuTimed> g_gpu_fifo;
 struct GpuFrameSum { uint64_t frame = UINT64_MAX; double busy = 0, first = 0, end = 0; bool bad = false; };
 static GpuFrameSum g_gpu_sum;
 std::atomic<uint64_t> g_gpu_ns{0}, g_gpu_max_ns{0}, g_gpu_span_ns{0}, g_gpu_frames{0};  // for the periodic report
+static std::atomic<uint64_t> g_gpu_ns_all{0}, g_gpu_span_ns_all{0}, g_gpu_frames_all{0};  // never reset (WWHD_BUFFER_AB windows)
 static void finish_gpu_frame() {
     const GpuFrameSum& f = g_gpu_sum;
     if (f.frame == UINT64_MAX || f.bad) return;
     const uint64_t ns = (uint64_t)(f.busy * 1e9);
     g_gpu_ns += ns;
+    g_gpu_ns_all += ns;
+    g_gpu_span_ns_all += (uint64_t)((f.end - f.first) * 1e9);
+    ++g_gpu_frames_all;
     g_gpu_span_ns += (uint64_t)((f.end - f.first) * 1e9);
     ++g_gpu_frames;
     if (ns > g_gpu_max_ns) g_gpu_max_ns = ns;
@@ -327,24 +331,37 @@ id<MTLCommandBuffer> command_buffer() {
 
 uint32_t g_draws_since_commit = 0;
 static void track_gpu_time(id<MTLCommandBuffer> cb) { g_gpu_fifo.push_back({cb, commandFrame}); }
-void pool_retire(id<MTLCommandBuffer> cmd);
-std::vector<id<MTLBuffer>>* pool_take_used();
-void pool_attach(id<MTLCommandBuffer> cmd, std::vector<id<MTLBuffer>>* used);
 static bool g_pass_open = false;  // render thread: a pass is open (queued or real)
 bool enc_pass_open() { return g_pass_open; }
 
 // submit work in chunks so the GPU starts while the frame is still being built (like the hardware
 // command processor), instead of all at once on swap
 // WWHD_COMMIT_DRAWS (default 16) and WWHD_COMMIT_US (default 500) set how much is held: committing
-// early lets the GPU start on a frame while the rest is still encoded (the GPU idled ~5 ms a frame)
+// early lets the GPU start on a frame while the rest is still encoded (the GPU idled ~5 ms a frame).
+// While the GPU still has an earlier command buffer to run, more is held: WWHD_COMMIT_BATCH_DRAWS (default
+// 256) and WWHD_COMMIT_BATCH_US (default 2000). A command buffer costs 20-40 us of CPU to make and submit,
+// on the encoding thread and Metal's submission thread (measured on an M4, 160 render passes of 20 draws:
+// 4.8 ms of process CPU a frame in 160 command buffers, 2.2 ms in 16, 1.9 ms in one), and with a commit
+// every 16 draws a BotW frame had dozens. WWHD_COMMIT_BATCH=0: the early rule always, as before.
 static bool g_probe_active = false;  // R.cmd is a readback probe's (second queue): never committed as a chunk
+static std::atomic<uint64_t> g_commits_batched{0};  // commits under the batched rule (report)
 static bool chunk_commit_due() {
     if (g_probe_active) return false;
     static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
     static const uint32_t commitDraws = getenv("WWHD_COMMIT_DRAWS") ? (uint32_t)atoi(getenv("WWHD_COMMIT_DRAWS")) : 16;
     static const int64_t commitNs = getenv("WWHD_COMMIT_US") ? atoll(getenv("WWHD_COMMIT_US")) * 1000 : 500000;
-    return chunked && g_cmd_pending && g_draws_since_commit > 0 &&
-           (g_draws_since_commit >= commitDraws || (commitNs && now_ns() - g_cmd_created_ns >= commitNs));
+    static const bool batch = !getenv("WWHD_COMMIT_BATCH") || atoi(getenv("WWHD_COMMIT_BATCH")) != 0;
+    static const uint32_t batchDraws = getenv("WWHD_COMMIT_BATCH_DRAWS") ? (uint32_t)atoi(getenv("WWHD_COMMIT_BATCH_DRAWS")) : 256;
+    static const int64_t batchNs = getenv("WWHD_COMMIT_BATCH_US") ? atoll(getenv("WWHD_COMMIT_BATCH_US")) * 1000 : 2000000;
+    if (!chunked || !g_cmd_pending || !g_draws_since_commit) return false;
+    // command buffers made and not completed, the one being filled included (the encoding thread makes it
+    // when its first pass begins, so a lagging count only means the early rule)
+    const bool gpuHasWork = batch && buffers_batch() && cmd_seq() - g_cmd_seq_done.load(std::memory_order_acquire) >= 2;
+    const uint32_t draws = gpuHasWork ? batchDraws : commitDraws;
+    const int64_t ns = gpuHasWork ? batchNs : commitNs;
+    const bool due = g_draws_since_commit >= draws || (ns && now_ns() - g_cmd_created_ns >= ns);
+    if (due && gpuHasWork) g_commits_batched.fetch_add(1, std::memory_order_relaxed);
+    return due;
 }
 
 void end_encoder() {
@@ -409,7 +426,7 @@ enum : uint16_t { EQ_WRAP = 1, EQ_BEGIN, EQ_END, EQ_PIPE, EQ_DSS, EQ_RASTER, EQ_
                   EQ_DRAWIDX, EQ_BARRIER, EQ_VIS, EQ_BLOCK };
 struct EqHdr { uint16_t type, pad; uint32_t size; };  // size: header + payload, a multiple of 16
 struct EqBegin { void* rp; uint64_t frame; };
-struct EqEnd { uint8_t commit; std::vector<id<MTLBuffer>>* used; };
+struct EqEnd { uint8_t commit; PoolRetire* used; };
 struct EqObj { void* obj; };
 struct EqBind { uint8_t vertex; uint32_t index; void* obj; NSUInteger off; };
 struct EqBytes { uint8_t vertex; uint32_t index, n; };  // followed by n bytes
@@ -424,6 +441,7 @@ std::atomic<uint64_t> g_eq_rpos{0};  // executed by the encoding thread
 uint64_t g_eq_wlocal = 0;            // render thread: written, maybe not yet published
 bool g_eq_direct_draw = false;       // render thread: this draw needs direct mode (capture, pass timing)
 std::atomic<uint64_t> g_eq_syncs{0}, g_eq_records{0}, g_eq_enc_cpu_ns{0}, g_eq_sync_ns{0};
+std::atomic<uint64_t> g_eq_enc_ticks_all{0};  // g_eq_enc_cpu_ns never reset (WWHD_BUFFER_AB windows)
 uint64_t g_eq_frame = 0;             // encoding thread: frame of the latest pass (new command buffers)
 
 // encoding thread: last rasterizer state set on R.enc (sets are skipped when unchanged)
@@ -589,7 +607,9 @@ void eq_thread_main() {
                 g_eq_rpos.notify_one();
             }
         }
-        g_eq_enc_cpu_ns += mach_absolute_time() - c0;  // ticks (enc_report)
+        const uint64_t ticks = mach_absolute_time() - c0;
+        g_eq_enc_cpu_ns += ticks;  // ticks (enc_report)
+        g_eq_enc_ticks_all += ticks;
     }
 }
 
@@ -1161,6 +1181,54 @@ bool wait_frames_completed(uint64_t n, int64_t timeout_ns) {
 void cache_warm_step();
 
 void pass_timing_arm(double lastFrameMs);
+// ---------------------------------------------------------------- buffer handling A/B
+// WWHD_BUFFER_AB=1: every 10 s the buffer handling switches between the new one (upload chunks shared by
+// command buffers, batched commits) and the old one, and the window just ended is logged ([buffers-ab] in
+// the log): process CPU, frame time, render and encoding thread time, GPU busy and the span from a frame's
+// first GPU start to its last end, command buffers and draws. An A/B in one run, like WWHD_LOD_BIAS=ab: a
+// fanless Mac's heat drifts too much between runs.
+static bool g_buffers_new = true;  // render thread
+bool buffers_share() { return g_buffers_new; }
+bool buffers_batch() { return g_buffers_new; }
+static void buffers_ab_frame() {
+    static const bool ab = [] { const char* e = getenv("WWHD_BUFFER_AB"); return e && !strcmp(e, "1"); }();
+    if (!ab) return;
+    struct Mark { double wall, cpu, rt; uint64_t frame, gpuNs, spanNs, gpuFrames, encTicks, cmds, draws; };
+    auto take = [] {
+        Mark m;
+        m.wall = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        rusage ru{};
+        getrusage(RUSAGE_SELF, &ru);
+        m.cpu = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);  // swap runs on the render thread
+        m.rt = ts.tv_sec + ts.tv_nsec / 1e9;
+        m.frame = R.frame;
+        m.gpuNs = g_gpu_ns_all.load();
+        m.spanNs = g_gpu_span_ns_all.load();
+        m.gpuFrames = g_gpu_frames_all.load();
+        m.encTicks = g_eq_enc_ticks_all.load();
+        m.cmds = g_cmd_seq.load();
+        m.draws = R.drawCount;
+        return m;
+    };
+    static Mark start = take();
+    static int window = 0;
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - start.wall < 10) return;
+    const Mark now = take();
+    const double secs = now.wall - start.wall;
+    const double frames = std::max<double>(1, (double)(now.frame - start.frame));
+    const double gpuFrames = std::max<double>(1, (double)(now.gpuFrames - start.gpuFrames));
+    LOG("[buffers-ab] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, encoding thread %.2f ms/frame, GPU busy %.2f ms/frame "
+        "(first start to last end %.2f), %.1f command buffers/frame, %.0f draws/frame (%.1f s, window %d)",
+        g_buffers_new ? "new" : "old", 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames, 1000 * (now.rt - start.rt) / frames,
+        ticks_ns(now.encTicks - start.encTicks) / 1e6 / frames, (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames,
+        (now.spanNs - start.spanNs) / 1e6 / gpuFrames, (now.cmds - start.cmds) / frames, (now.draws - start.draws) / frames, secs,
+        ++window);
+    g_buffers_new = !g_buffers_new;
+    start = now;
+}
+
 void swap() {
     {  // debug: values a patched shader wrote (WWHD_MSL_PATCH, buffer 30)
         extern id<MTLBuffer> g_debug_values;
@@ -1198,6 +1266,7 @@ void swap() {
     pass_timing_end_frame(command_buffer());
     R.frame++;
     latch_res_scale();
+    buffers_ab_frame();
     if (capture_schedule::contains(g_dump_frames, R.frame))
         dump_tv(capture_schedule::stem(R.frame, false));
     const uint64_t loaded = g_dump_load_frames.empty() ? 0 : ss::last_load_frame();
@@ -1336,6 +1405,16 @@ void swap() {
         }
         lastCpu = cpu;
         enc_report();
+        {
+            uint64_t pool_chunks_made(), pool_bytes_made();  // metal_draw.mm
+            static uint64_t lastSeq = 0;
+            const uint64_t seq = g_cmd_seq.load();
+            LOG("[gfx] last 300 frames: %.1f command buffers/frame (%.1f/frame under the batched rule); upload pool: %llu chunks made so "
+                "far (%.0f MiB)",
+                lastSeq ? (seq - lastSeq) / 300.0 : 0.0, g_commits_batched.exchange(0) / 300.0, (unsigned long long)pool_chunks_made(),
+                pool_bytes_made() / 1048576.0);
+            lastSeq = seq;
+        }
         LOG("[inval] texture invalidates %llu, with candidates %llu, surfaces examined %llu",
             (unsigned long long)g_inval_texture, (unsigned long long)g_inval_passed, (unsigned long long)g_pages_marked);
         void report_skips();

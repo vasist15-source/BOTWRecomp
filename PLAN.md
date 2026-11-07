@@ -464,6 +464,28 @@ Released without a play-test of the release build, at the user's word (2026-11-0
 part 1 merges and code mods were play-tested on dev builds (entries above); archives, the part 2 merges and a Rebuild from
 the kept installer copy have not been played yet. The release build is installed in /Applications.
 
+### 2026-11-07: Metal: command buffers batched while the GPU has work, upload chunks shared
+- Commits (`chunk_commit_due`, metal_main.mm): while a committed command buffer is still running (`cmd_seq()` minus the
+  completed ones is 2 or more), a pass end commits only after 256 draws or 2 ms of work (`WWHD_COMMIT_BATCH_DRAWS`,
+  `WWHD_COMMIT_BATCH_US`; `WWHD_COMMIT_BATCH=0` off); with nothing queued on the GPU the early rule (16 draws or 0.5 ms)
+  applies as before. Flips, DrawDone and swap flushes are unchanged. A command buffer costs 20-40 us of CPU to make and
+  submit on an M4 (160 passes of 20 draws: 4.8 ms of process CPU a frame in 160 command buffers, 2.2 ms in 16, 1.9 ms in one).
+- Upload pool (`gfx/upload_pool.h`, test `upload_pool`): a chunk is shared by every commit while it fills and given back
+  once full and every commit holding it has completed. Before, each commit retired its 8 MiB chunk, so the pool grew to a
+  chunk per command buffer in flight (48 chunks, 495 MiB in a Hateno run). `WWHD_POOL_SHARE=0` retires per commit.
+- Measured at Hateno, 1.5x, 60 fps, standing still, in-run A/B (`WWHD_BUFFER_AB=4`; 7 windows of 10 s per mode against
+  interpolated old windows): command buffers 30 -> 12 a frame, process CPU -28 points (243 -> 237 % while cool, 327 -> 283 %
+  hot), render thread -0.9 ms/frame, encoding thread -0.5 ms/frame, GPU busy +0.8 ms/frame (first start to last end +0.3),
+  frame time at the 60 fps cap (+0.1 ms, within noise). An earlier two-way run (14 pairs, with the index cache below):
+  CPU -29 points, frame time 16.69 ms both while cool, 17.82 against 17.48 ms once hot.
+- Tried and taken out: an index cache (persistent copies validated by page write tracking, the Vulkan buffer cache's
+  `bufcache::Cache`): 99 % hits, index copies 8.6 -> 0.01 MiB/frame, no extra write faults, but no measurable CPU gain (-4
+  points, render thread -0.24 ms, both within noise) and GPU busy +0.4 ms in all 7 windows. The per-draw copy probably leaves
+  the indices in the system-level cache just before the GPU reads them; cached copies come from DRAM.
+- `WWHD_BUFFER_AB=1` alternates new and old every 10 s (`[buffers-ab]` lines: CPU, frame time, thread times, GPU busy and
+  span, command buffers, draws). Not measured: 2x (GPU-bound), where the GPU busy increase could cost frame time; there,
+  try `WWHD_COMMIT_BATCH=0` or smaller batch limits.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
