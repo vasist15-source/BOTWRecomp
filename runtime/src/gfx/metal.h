@@ -194,7 +194,8 @@ id<MTLCommandBuffer> probe_commit();
 // work is queued: render-thread code that touches them (command_buffer(), end_encoder(), flush(),
 // wait_idle()) waits for the queue to drain first (enc_sync), so blits, uploads, readbacks and
 // presentation run as before. Direct mode (WWHD_ENCODE_THREAD=0, F12 captures, pass timing) makes
-// every q_* call at once on the render thread.
+// every q_* call at once on the render thread. Caught up, the encoding thread sleeps until the render
+// thread wakes it (every 32 draws, at commits, when it waits for it: encode_handoff.h).
 void enc_sync();
 void enc_set_direct(bool direct);  // per draw: captures and pass timing need direct mode
 bool enc_pass_open();              // the render thread's view: a render pass is open (queued or real)

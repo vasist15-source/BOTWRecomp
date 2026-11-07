@@ -486,6 +486,26 @@ the kept installer copy have not been played yet. The release build is installed
   span, command buffers, draws). Not measured: 2x (GPU-bound), where the GPU busy increase could cost frame time; there,
   try `WWHD_COMMIT_BATCH=0` or smaller batch limits.
 
+### 2026-11-07: Metal: the encoding thread sleeps once caught up, woken in batches
+- Hand-off (`gfx/encode_handoff.h`, test `encode_handoff`): caught up, the encoding thread sleeps on a semaphore at once.
+  The render thread wakes it after every 32 draws (`WWHD_ENCODE_WAKE_DRAWS`), at a pass end that commits, at the first pass
+  of a command buffer (the batched commit rule counts it) and when it waits for it (syncs, a full ring), and only if it is
+  asleep: a wake-up is a kernel call. The render thread sleeps the same way while it waits; the encoding thread wakes it
+  once the records it waits for are done. Before, the encoding thread spun up to 2,000 yields on the write position and any
+  record ended the spin, so while the render thread drew (a record every ~0.5 us) it never slept; it fell asleep only in the
+  render thread's pauses, ~1,700 times a frame, each woken by a kernel call at the next draw.
+- Measured at Hateno, 1.5x, 60 fps, standing still, in-run A/B (`WWHD_ENCODE_AB=1`, 38 windows of 10 s after loading, each
+  against its neighbours): process CPU -43 points (276 -> 232 %; -50 at the 60 fps cap, 263 -> 215 %), encoding thread CPU
+  10.5 -> 4.4 ms/frame (its work 4.6 -> 4.0), render thread -1.1 ms/frame, frame time at the cap while cool (16.75 -> 16.67
+  ms) and -0.8 ms once the Air throttled (18.81 -> 18.08), GPU busy -0.25 ms, command buffers 12.2 and 12.1 a frame. 150
+  wake-ups a frame; the render thread waited for the encoding thread 13 times a frame, 0.49 ms (spinning: 11, 0.34 ms).
+- `WWHD_ENCODE_SPIN=1`: the old spinning hand-off. `WWHD_ENCODE_AB=1` alternates the two every 10 s (`[encode-ab]` lines);
+  `ab_frame` (was `buffers_ab_frame`, also runs `WWHD_BUFFER_AB`) now logs the encoding thread's CPU time beside its busy
+  time, wake-ups, sleeps and syncs, and so does the 300-frame `[gfx]` encoding thread line. The ring's room check reads the
+  encoding thread's position only when the last one seen says the ring may be full. Synthetic bench:
+  `encode_handoff_test --bench` (Hateno-like frame: 21.9 -> 16.4 ms of process CPU a frame; 64 or 128 draws per wake-up save
+  nothing more and double or quadruple the sync wait). Not measured: 2x.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

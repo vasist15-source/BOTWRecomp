@@ -20,6 +20,7 @@
 
 #include "gx2/gx2.h"
 #include "gx2_texture_regs.h"
+#include "gfx/encode_handoff.h"
 #include "metal.h"
 #include "write_watch.h"
 #include "dynres.h"
@@ -420,10 +421,13 @@ void wait_idle() {
 // queues a commit, so buffers are recycled in submission order.
 // Objects in records are retained when queued and released when executed (nothing is freed under
 // a queued draw, and the bind cache's pointer comparisons stay valid).
+// Caught up, the encoding thread sleeps; the render thread wakes it every 32 draws, at commits and when
+// it waits for it (encode_handoff.h; WWHD_ENCODE_SPIN=1: the old spinning hand-off, WWHD_ENCODE_AB=1:
+// both in turn, see ab_frame).
 // WWHD_ENCODE_THREAD=0: every call is made at once on the render thread, as before.
 namespace {
 enum : uint16_t { EQ_WRAP = 1, EQ_BEGIN, EQ_END, EQ_PIPE, EQ_DSS, EQ_RASTER, EQ_TEX, EQ_SMP, EQ_BUF, EQ_BUFOFF, EQ_BYTES, EQ_DRAW,
-                  EQ_DRAWIDX, EQ_BARRIER, EQ_VIS, EQ_BLOCK };
+                  EQ_DRAWIDX, EQ_BARRIER, EQ_VIS, EQ_BLOCK, EQ_NOP };
 struct EqHdr { uint16_t type, pad; uint32_t size; };  // size: header + payload, a multiple of 16
 struct EqBegin { void* rp; uint64_t frame; };
 struct EqEnd { uint8_t commit; PoolRetire* used; };
@@ -436,12 +440,13 @@ struct EqVis { MTLVisibilityResultMode mode; NSUInteger off; };
 
 constexpr uint64_t kEqRing = 16ull << 20;
 uint8_t* g_eq_ring = nullptr;
-std::atomic<uint64_t> g_eq_wpos{0};  // published by the render thread
-std::atomic<uint64_t> g_eq_rpos{0};  // executed by the encoding thread
+handoff::Handoff* g_eq = nullptr;    // write and read positions, wake-ups (made with the ring)
 uint64_t g_eq_wlocal = 0;            // render thread: written, maybe not yet published
 bool g_eq_direct_draw = false;       // render thread: this draw needs direct mode (capture, pass timing)
 std::atomic<uint64_t> g_eq_syncs{0}, g_eq_records{0}, g_eq_enc_cpu_ns{0}, g_eq_sync_ns{0};
-std::atomic<uint64_t> g_eq_enc_ticks_all{0};  // g_eq_enc_cpu_ns never reset (WWHD_BUFFER_AB windows)
+// never reset (A/B windows): g_eq_enc_cpu_ns, g_eq_syncs, g_eq_sync_ns
+std::atomic<uint64_t> g_eq_enc_ticks_all{0}, g_eq_syncs_all{0}, g_eq_sync_ns_all{0};
+mach_port_t g_eq_thread_port = MACH_PORT_NULL;  // the encoding thread (its CPU time, for reports)
 uint64_t g_eq_frame = 0;             // encoding thread: frame of the latest pass (new command buffers)
 
 // encoding thread: last rasterizer state set on R.enc (sets are skipped when unchanged)
@@ -566,6 +571,7 @@ void eq_exec(uint16_t type, const uint8_t* p) {
         block(raw_command_buffer(g_eq_frame));
         break;
     }
+    case EQ_NOP: break;  // queued by eq_set_sleeping
     }
 }
 
@@ -575,22 +581,24 @@ uint64_t ticks_ns(uint64_t ticks) {
     static const mach_timebase_info_data_t tb = [] { mach_timebase_info_data_t t; mach_timebase_info(&t); return t; }();
     return ticks * tb.numer / tb.denom;
 }
+// a thread's CPU time (user + system), any thread: a kernel call, for reports only
+uint64_t thread_cpu_ns(mach_port_t t) {
+    if (t == MACH_PORT_NULL) return 0;
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS) return 0;
+    return (uint64_t)(info.user_time.seconds + info.system_time.seconds) * 1000000000ull +
+           (uint64_t)(info.user_time.microseconds + info.system_time.microseconds) * 1000ull;
+}
 
 void eq_thread_main() {
     t_encoder_thread = true;
     pthread_setname_np("GX2 encode");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    uint64_t r = g_eq_rpos.load(std::memory_order_relaxed);
+    uint64_t r = g_eq->executed();
     for (;;) {
-        uint64_t w = g_eq_wpos.load(std::memory_order_acquire);
-        if (r == w) {
-            // caught up: spin briefly (the next record usually follows within microseconds), then sleep
-            for (int i = 0; i < 2000 && (w = g_eq_wpos.load(std::memory_order_acquire)) == r; i++) __builtin_arm_yield();
-            if (w == r) {
-                g_eq_wpos.wait(r, std::memory_order_acquire);
-                continue;
-            }
-        }
+        bool sleeping;
+        const uint64_t w = g_eq->next(r, sleeping);  // caught up: sleeps until woken (spinning mode: spins first)
         const uint64_t c0 = mach_absolute_time();
         @autoreleasepool {
             while (r < w) {
@@ -603,53 +611,71 @@ void eq_thread_main() {
                 eq_exec(h->type, (const uint8_t*)(h + 1));
                 r += h->size;
                 // published per record: the render thread's sync and space checks see progress at once
-                g_eq_rpos.store(r, std::memory_order_release);
-                g_eq_rpos.notify_one();
+                g_eq->done(r, sleeping);
             }
         }
+        g_eq->batch_done(r, sleeping);  // wakes a render thread waiting for these records
         const uint64_t ticks = mach_absolute_time() - c0;
         g_eq_enc_cpu_ns += ticks;  // ticks (enc_report)
         g_eq_enc_ticks_all += ticks;
     }
 }
 
+// render thread: waits until the ring has room for records up to `end` (all before end - kEqRing executed).
+// The encoding thread's position is read again only when the last one seen says the ring may be full (about
+// every 16 frames), not for each record: its line changes with every record it executes.
+uint64_t g_eq_seen = 0;
+void eq_wait_room(uint64_t end) {
+    if (end <= kEqRing || g_eq_seen >= end - kEqRing) return;
+    g_eq_seen = g_eq->executed();
+    if (g_eq_seen >= end - kEqRing) return;
+    g_eq->publish(g_eq_wlocal, handoff::Rec::State);  // a skipped ring tail too: let it run to free space
+    g_eq->wait_executed(end - kEqRing, false);
+    g_eq_seen = g_eq->executed();
+}
 // render thread: room for a record of `size` bytes (header included); returns where to write it
 uint8_t* eq_reserve(uint32_t size) {
     static std::once_flag started;
     std::call_once(started, [] {
+        const char* spin = getenv("WWHD_ENCODE_SPIN");
+        const char* draws = getenv("WWHD_ENCODE_WAKE_DRAWS");
+        g_eq = new handoff::Handoff(!(spin && atoi(spin) != 0), draws ? (uint32_t)atoi(draws) : 32);
         g_eq_ring = (uint8_t*)aligned_alloc(64, kEqRing);
-        std::thread(eq_thread_main).detach();
-        LOG("[gfx] encoding thread started");
+        std::thread t(eq_thread_main);
+        g_eq_thread_port = pthread_mach_thread_np(t.native_handle());
+        t.detach();
+        if (g_eq->sleeping()) LOG("[gfx] encoding thread started: sleeps once caught up, woken every %u draws", g_eq->wake_draws());
+        else LOG("[gfx] encoding thread started: spins once caught up (WWHD_ENCODE_SPIN)");
     });
     uint64_t off = g_eq_wlocal % kEqRing;
     if (off + size > kEqRing) {  // records never wrap: skip the rest of the ring
-        auto wait_room = [](uint64_t need) {
-            uint64_t rp;
-            while (need - (rp = g_eq_rpos.load(std::memory_order_acquire)) > kEqRing) g_eq_rpos.wait(rp, std::memory_order_acquire);
-        };
-        wait_room(g_eq_wlocal + sizeof(EqHdr));
+        eq_wait_room(g_eq_wlocal + sizeof(EqHdr));
         ((EqHdr*)(g_eq_ring + off))->type = EQ_WRAP;
         g_eq_wlocal += kEqRing - off;
         off = 0;
     }
-    uint64_t rp;
-    while (g_eq_wlocal + size - (rp = g_eq_rpos.load(std::memory_order_acquire)) > kEqRing) {
-        g_eq_wpos.store(g_eq_wlocal, std::memory_order_release);  // let it run to free space
-        g_eq_wpos.notify_one();
-        g_eq_rpos.wait(rp, std::memory_order_acquire);
-    }
+    eq_wait_room(g_eq_wlocal + size);
     return g_eq_ring + off;
 }
-// wake: the encoding thread sleeps once caught up, and waking it is a kernel call (__ulock_wake). State
-// records are only published (it sees them if it is spinning); the draw, pass end or block that follows
-// wakes it for the batch. Waits for it (enc_sync, a full ring) wake it themselves.
-void eq_publish(bool wake) {
-    g_eq_wpos.store(g_eq_wlocal, std::memory_order_release);
-    if (wake) g_eq_wpos.notify_one();
+// publishes the records written; the hand-off decides whether this one wakes the encoding thread: waking
+// a sleeping thread is a kernel call, so draws wake it in batches, and commits and the first pass of a
+// command buffer at once (encode_handoff.h). Waits for it (enc_sync, a full ring) wake it themselves.
+void eq_publish(handoff::Rec kind) {
+    g_eq->publish(g_eq_wlocal, kind);
     g_eq_records++;
 }
-// queues a record, or makes the call now (direct mode, after the queue drained)
-void eq_submit(uint16_t type, const void* payload, uint32_t n, const void* extra = nullptr, uint32_t extraN = 0) {
+handoff::Rec rec_kind(uint16_t type) {
+    switch (type) {
+    case EQ_DRAW:
+    case EQ_DRAWIDX: return handoff::Rec::Draw;
+    case EQ_END: return handoff::Rec::End;
+    case EQ_BLOCK: return handoff::Rec::Block;
+    default: return handoff::Rec::State;
+    }
+}
+// queues a record, or makes the call now (direct mode, after the queue drained); kind: what it asks of
+// the hand-off (pass ends that commit, passes that open a command buffer)
+void eq_submit_as(handoff::Rec kind, uint16_t type, const void* payload, uint32_t n, const void* extra = nullptr, uint32_t extraN = 0) {
     if (eq_direct()) {
         enc_sync();
         if (!extraN) {
@@ -670,26 +696,47 @@ void eq_submit(uint16_t type, const void* payload, uint32_t n, const void* extra
     memcpy(at + sizeof(EqHdr), payload, n);
     if (extraN) memcpy(at + sizeof(EqHdr) + n, extra, extraN);
     g_eq_wlocal += size;
-    eq_publish(type == EQ_DRAW || type == EQ_DRAWIDX || type == EQ_END || type == EQ_BLOCK);
+    eq_publish(kind);
+}
+void eq_submit(uint16_t type, const void* payload, uint32_t n, const void* extra = nullptr, uint32_t extraN = 0) {
+    eq_submit_as(rec_kind(type), type, payload, n, extra, extraN);
 }
 }  // namespace
 
 void enc_sync() {
     if (t_encoder_thread || !g_eq_ring) return;
     const uint64_t w = g_eq_wlocal;
-    uint64_t r = g_eq_rpos.load(std::memory_order_acquire);
-    if (r >= w) return;
+    if (g_eq->executed() >= w) return;
     const int64_t t0 = now_ns();
-    g_eq_wpos.store(w, std::memory_order_release);
-    g_eq_wpos.notify_one();
-    for (int i = 0; i < 4000 && (r = g_eq_rpos.load(std::memory_order_acquire)) < w; i++) __builtin_arm_yield();
-    while ((r = g_eq_rpos.load(std::memory_order_acquire)) < w) g_eq_rpos.wait(r, std::memory_order_acquire);
+    g_eq->publish(w, handoff::Rec::State);  // published already; the wait wakes it
+    g_eq->wait_executed(w, true);
+    const int64_t dt = now_ns() - t0;
     g_eq_syncs++;
-    g_eq_sync_ns += now_ns() - t0;
+    g_eq_sync_ns += dt;
+    g_eq_syncs_all++;
+    g_eq_sync_ns_all += dt;
 }
 void enc_set_direct(bool direct) {
     if (direct && !g_eq_direct_draw) enc_sync();
     g_eq_direct_draw = direct;
+}
+// render thread: switches the hand-off between sleeping and spinning (WWHD_ENCODE_AB). With nothing
+// queued, the mode is set, a no-op record queued and the encoding thread woken both ways (it may be
+// asleep either way); it runs that record in the new mode, and the wait for it returns in the new mode
+// (encode_handoff.h). The record is written here, not with eq_submit, which in direct mode would run it
+// in place and leave the encoding thread asleep the old way.
+static void eq_set_sleeping(bool sleeping) {
+    if (!g_eq_ring || g_eq->sleeping() == sleeping) return;
+    enc_sync();
+    g_eq->set_sleeping(sleeping);
+    constexpr uint32_t size = (sizeof(EqHdr) + 15) & ~15u;
+    EqHdr* h = (EqHdr*)eq_reserve(size);
+    h->type = EQ_NOP;
+    h->size = size;
+    g_eq_wlocal += size;
+    g_eq->publish(g_eq_wlocal, handoff::Rec::State);
+    g_eq->wake_any();
+    enc_sync();
 }
 
 // ---------------------------------------------------------------- readback probes (second queue)
@@ -773,10 +820,13 @@ void q_begin_pass(MTLRenderPassDescriptor* rp) {
         enc_sync();
         flush_pending_clears();
     }
+    // the first work since a commit: this pass's record makes the next command buffer, which the batched
+    // commit rule counts (chunk_commit_due), so it wakes the encoding thread
+    const bool opens = !g_cmd_pending;
     note_cmd_work();
     g_pass_open = true;
     EqBegin b{(__bridge_retained void*)rp, R.frame};
-    eq_submit(EQ_BEGIN, &b, sizeof b);
+    eq_submit_as(opens ? handoff::Rec::Open : handoff::Rec::State, EQ_BEGIN, &b, sizeof b);
 }
 void q_end_pass() {
     if (eq_direct()) {
@@ -792,7 +842,7 @@ void q_end_pass() {
             g_cmd_pending = false;
             g_draws_since_commit = 0;
         }
-        eq_submit(EQ_END, &e, sizeof e);
+        eq_submit_as(e.commit ? handoff::Rec::Commit : handoff::Rec::End, EQ_END, &e, sizeof e);
     }
     for (auto& c : R.passColor) c = nullptr;
     R.passDepth = nullptr;
@@ -828,13 +878,21 @@ void q_command_buffer(void (^block)(id<MTLCommandBuffer>)) {
     EqObj o{(__bridge_retained void*)[block copy]};
     eq_submit(EQ_BLOCK, &o, sizeof o);
 }
-// periodic report (every 300 frames): the encoding thread's load and the render thread's waits for it
+// periodic report (every 300 frames): the encoding thread's load (busy: executing records; thread CPU:
+// its waits included) and the render thread's waits for it
 void enc_report();
 void enc_report() {
     if (!g_eq_ring) return;
-    LOG("[gfx] last 300 frames: encoding thread busy %.2f ms/frame, %.0f records/frame; render thread waited for it %.1f times/frame, "
-        "%.2f ms/frame", ticks_ns(g_eq_enc_cpu_ns.exchange(0)) / 1e6 / 300.0, g_eq_records.exchange(0) / 300.0, g_eq_syncs.exchange(0) / 300.0,
-        g_eq_sync_ns.exchange(0) / 1e6 / 300.0);
+    static uint64_t lastCpu = 0, lastWakes = 0, lastSleeps = 0;
+    const uint64_t cpu = thread_cpu_ns(g_eq_thread_port), wakes = g_eq->kicks(), sleeps = g_eq->enc_waits();
+    LOG("[gfx] last 300 frames: encoding thread busy %.2f ms/frame (thread CPU %.2f, %s), %.0f records/frame, woken %.1f times/frame, "
+        "slept %.1f; render thread waited for it %.1f times/frame, %.2f ms/frame",
+        ticks_ns(g_eq_enc_cpu_ns.exchange(0)) / 1e6 / 300.0, lastCpu ? (cpu - lastCpu) / 1e6 / 300.0 : 0.0,
+        g_eq->sleeping() ? "sleeping" : "spinning", g_eq_records.exchange(0) / 300.0, (wakes - lastWakes) / 300.0,
+        (sleeps - lastSleeps) / 300.0, g_eq_syncs.exchange(0) / 300.0, g_eq_sync_ns.exchange(0) / 1e6 / 300.0);
+    lastCpu = cpu;
+    lastWakes = wakes;
+    lastSleeps = sleeps;
 }
 
 // ---------------------------------------------------------------- init
@@ -1181,19 +1239,31 @@ bool wait_frames_completed(uint64_t n, int64_t timeout_ns) {
 void cache_warm_step();
 
 void pass_timing_arm(double lastFrameMs);
-// ---------------------------------------------------------------- buffer handling A/B
-// WWHD_BUFFER_AB=1: every 10 s the buffer handling switches between the new one (upload chunks shared by
-// command buffers, batched commits) and the old one, and the window just ended is logged ([buffers-ab] in
-// the log): process CPU, frame time, render and encoding thread time, GPU busy and the span from a frame's
-// first GPU start to its last end, command buffers and draws. An A/B in one run, like WWHD_LOD_BIAS=ab: a
-// fanless Mac's heat drifts too much between runs.
+// ---------------------------------------------------------------- in-run A/B
+// Every 10 s one thing switches between its new and its old behaviour, and the window just ended is logged:
+//   WWHD_BUFFER_AB=1 ([buffers-ab]): buffer handling, new (upload chunks shared by command buffers,
+//     batched commits) or old;
+//   WWHD_ENCODE_AB=1 ([encode-ab]): the encoding thread's hand-off, sleeping with batched wake-ups or the
+//     old spinning one (encode_handoff.h).
+// Each line: process CPU, frame time, render thread CPU time, the encoding thread's busy time (executing
+// records) and CPU time (its waits included), GPU busy and the span from a frame's first GPU start to its
+// last end, command buffers and draws, how often the encoding thread was woken and slept, and the render
+// thread's waits for it. An A/B in one run, like WWHD_LOD_BIAS=ab: a fanless Mac's heat drifts too much
+// between runs.
 static bool g_buffers_new = true;  // render thread
 bool buffers_share() { return g_buffers_new; }
 bool buffers_batch() { return g_buffers_new; }
-static void buffers_ab_frame() {
-    static const bool ab = [] { const char* e = getenv("WWHD_BUFFER_AB"); return e && !strcmp(e, "1"); }();
-    if (!ab) return;
-    struct Mark { double wall, cpu, rt; uint64_t frame, gpuNs, spanNs, gpuFrames, encTicks, cmds, draws; };
+static void ab_frame() {
+    enum { AB_NONE, AB_BUFFERS, AB_ENCODE };
+    static const int ab = [] {
+        auto on = [](const char* name) { const char* e = getenv(name); return e && !strcmp(e, "1"); };
+        return on("WWHD_ENCODE_AB") ? AB_ENCODE : on("WWHD_BUFFER_AB") ? AB_BUFFERS : AB_NONE;
+    }();
+    if (ab == AB_NONE || (ab == AB_ENCODE && !g_eq)) return;
+    struct Mark {
+        double wall, cpu, rt;
+        uint64_t frame, gpuNs, spanNs, gpuFrames, encTicks, encCpuNs, cmds, draws, wakes, encSleeps, syncs, syncNs, rtSleeps;
+    };
     auto take = [] {
         Mark m;
         m.wall = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1208,8 +1278,14 @@ static void buffers_ab_frame() {
         m.spanNs = g_gpu_span_ns_all.load();
         m.gpuFrames = g_gpu_frames_all.load();
         m.encTicks = g_eq_enc_ticks_all.load();
+        m.encCpuNs = thread_cpu_ns(g_eq_thread_port);
         m.cmds = g_cmd_seq.load();
         m.draws = R.drawCount;
+        m.wakes = g_eq ? g_eq->kicks() : 0;
+        m.encSleeps = g_eq ? g_eq->enc_waits() : 0;
+        m.rtSleeps = g_eq ? g_eq->rt_sleeps() : 0;
+        m.syncs = g_eq_syncs_all.load();
+        m.syncNs = g_eq_sync_ns_all.load();
         return m;
     };
     static Mark start = take();
@@ -1219,13 +1295,18 @@ static void buffers_ab_frame() {
     const double secs = now.wall - start.wall;
     const double frames = std::max<double>(1, (double)(now.frame - start.frame));
     const double gpuFrames = std::max<double>(1, (double)(now.gpuFrames - start.gpuFrames));
-    LOG("[buffers-ab] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, encoding thread %.2f ms/frame, GPU busy %.2f ms/frame "
-        "(first start to last end %.2f), %.1f command buffers/frame, %.0f draws/frame (%.1f s, window %d)",
-        g_buffers_new ? "new" : "old", 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames, 1000 * (now.rt - start.rt) / frames,
-        ticks_ns(now.encTicks - start.encTicks) / 1e6 / frames, (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames,
-        (now.spanNs - start.spanNs) / 1e6 / gpuFrames, (now.cmds - start.cmds) / frames, (now.draws - start.draws) / frames, secs,
-        ++window);
-    g_buffers_new = !g_buffers_new;
+    const char* mode = ab == AB_BUFFERS ? (g_buffers_new ? "new" : "old") : g_eq->sleeping() ? "sleeping" : "spinning";
+    LOG("[%s] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, encoding thread busy %.2f ms/frame, CPU %.2f ms/frame, "
+        "GPU busy %.2f ms/frame (first start to last end %.2f), %.1f command buffers/frame, %.0f draws/frame; encoding thread woken "
+        "%.1f times/frame, slept %.1f; render thread waited for it %.1f times/frame (slept %.1f), %.2f ms/frame (%.1f s, window %d)",
+        ab == AB_BUFFERS ? "buffers-ab" : "encode-ab", mode, 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames,
+        1000 * (now.rt - start.rt) / frames, ticks_ns(now.encTicks - start.encTicks) / 1e6 / frames,
+        (now.encCpuNs - start.encCpuNs) / 1e6 / frames, (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames,
+        (now.spanNs - start.spanNs) / 1e6 / gpuFrames, (now.cmds - start.cmds) / frames, (now.draws - start.draws) / frames,
+        (now.wakes - start.wakes) / frames, (now.encSleeps - start.encSleeps) / frames, (now.syncs - start.syncs) / frames,
+        (now.rtSleeps - start.rtSleeps) / frames, (now.syncNs - start.syncNs) / 1e6 / frames, secs, ++window);
+    if (ab == AB_BUFFERS) g_buffers_new = !g_buffers_new;
+    else eq_set_sleeping(!g_eq->sleeping());
     start = now;
 }
 
@@ -1266,7 +1347,7 @@ void swap() {
     pass_timing_end_frame(command_buffer());
     R.frame++;
     latch_res_scale();
-    buffers_ab_frame();
+    ab_frame();
     if (capture_schedule::contains(g_dump_frames, R.frame))
         dump_tv(capture_schedule::stem(R.frame, false));
     const uint64_t loaded = g_dump_load_frames.empty() ? 0 : ss::last_load_frame();
