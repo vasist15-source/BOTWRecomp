@@ -1244,25 +1244,34 @@ void pass_timing_arm(double lastFrameMs);
 //   WWHD_BUFFER_AB=1 ([buffers-ab]): buffer handling, new (upload chunks shared by command buffers,
 //     batched commits) or old;
 //   WWHD_ENCODE_AB=1 ([encode-ab]): the encoding thread's hand-off, sleeping with batched wake-ups or the
-//     old spinning one (encode_handoff.h).
+//     old spinning one (encode_handoff.h);
+//   WWHD_TEXTURE_AB=1 ([textures-ab]): texture change detection with the churn rule (texture_churn.h:
+//     textures rewritten at nearly every check stay unarmed and are hashed at each use) or without it (each
+//     check arms them again), each window followed by its [texchurn] report of the costliest surfaces.
 // Each line: process CPU, frame time, render thread CPU time, the encoding thread's busy time (executing
 // records) and CPU time (its waits included), GPU busy and the span from a frame's first GPU start to its
 // last end, command buffers and draws, how often the encoding thread was woken and slept, and the render
-// thread's waits for it. An A/B in one run, like WWHD_LOD_BIAS=ab: a fanless Mac's heat drifts too much
-// between runs.
+// thread's waits for it; the texture A/B's: write faults, pages protected, checks, bytes hashed and the
+// time it took. An A/B in one run, like WWHD_LOD_BIAS=ab: a fanless Mac's heat drifts too much between runs.
 static bool g_buffers_new = true;  // render thread
 bool buffers_share() { return g_buffers_new; }
 bool buffers_batch() { return g_buffers_new; }
+bool texture_churn_on();
+void texture_churn_set(bool on);
+void texture_churn_report(const char* why);
+extern uint64_t g_tex_checks_all, g_tex_gpu_checks_all, g_tex_unarmed_all, g_tex_became_dynamic_all, g_tex_hashed_all,
+    g_tex_hash_ns_all, g_tex_uploads_all;
 static void ab_frame() {
-    enum { AB_NONE, AB_BUFFERS, AB_ENCODE };
+    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES };
     static const int ab = [] {
         auto on = [](const char* name) { const char* e = getenv(name); return e && !strcmp(e, "1"); };
-        return on("WWHD_ENCODE_AB") ? AB_ENCODE : on("WWHD_BUFFER_AB") ? AB_BUFFERS : AB_NONE;
+        return on("WWHD_ENCODE_AB") ? AB_ENCODE : on("WWHD_BUFFER_AB") ? AB_BUFFERS : on("WWHD_TEXTURE_AB") ? AB_TEXTURES : AB_NONE;
     }();
     if (ab == AB_NONE || (ab == AB_ENCODE && !g_eq)) return;
     struct Mark {
         double wall, cpu, rt;
         uint64_t frame, gpuNs, spanNs, gpuFrames, encTicks, encCpuNs, cmds, draws, wakes, encSleeps, syncs, syncNs, rtSleeps;
+        uint64_t faults, protectedPages, texChecks, gpuChecks, unarmed, became, hashed, hashNs, uploads;
     };
     auto take = [] {
         Mark m;
@@ -1286,6 +1295,14 @@ static void ab_frame() {
         m.rtSleeps = g_eq ? g_eq->rt_sleeps() : 0;
         m.syncs = g_eq_syncs_all.load();
         m.syncNs = g_eq_sync_ns_all.load();
+        wwatch::totals(m.faults, m.protectedPages);
+        m.texChecks = g_tex_checks_all;
+        m.gpuChecks = g_tex_gpu_checks_all;
+        m.unarmed = g_tex_unarmed_all;
+        m.became = g_tex_became_dynamic_all;
+        m.hashed = g_tex_hashed_all;
+        m.hashNs = g_tex_hash_ns_all;
+        m.uploads = g_tex_uploads_all;
         return m;
     };
     static Mark start = take();
@@ -1295,6 +1312,22 @@ static void ab_frame() {
     const double secs = now.wall - start.wall;
     const double frames = std::max<double>(1, (double)(now.frame - start.frame));
     const double gpuFrames = std::max<double>(1, (double)(now.gpuFrames - start.gpuFrames));
+    if (ab == AB_TEXTURES) {
+        const char* mode = texture_churn_on() ? "churn" : "armed";
+        LOG("[textures-ab] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, GPU busy %.2f ms/frame; per frame %.1f write "
+            "faults, %.1f pages protected, %.2f full checks of CPU textures + %.2f of GPU-written surfaces (%.2f left unarmed), "
+            "%.2f MiB hashed in %.3f ms, %.2f uploads, %.3f became dynamic (%.1f s, window %d)",
+            mode, 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames, 1000 * (now.rt - start.rt) / frames,
+            (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames, (now.faults - start.faults) / frames,
+            (now.protectedPages - start.protectedPages) / frames, (now.texChecks - start.texChecks) / frames,
+            (now.gpuChecks - start.gpuChecks) / frames, (now.unarmed - start.unarmed) / frames,
+            (now.hashed - start.hashed) / frames / 1048576.0, (now.hashNs - start.hashNs) / 1e6 / frames,
+            (now.uploads - start.uploads) / frames, (now.became - start.became) / frames, secs, ++window);
+        texture_churn_report(mode);
+        texture_churn_set(!texture_churn_on());
+        start = now;
+        return;
+    }
     const char* mode = ab == AB_BUFFERS ? (g_buffers_new ? "new" : "old") : g_eq->sleeping() ? "sleeping" : "spinning";
     LOG("[%s] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, encoding thread busy %.2f ms/frame, CPU %.2f ms/frame, "
         "GPU busy %.2f ms/frame (first start to last end %.2f), %.1f command buffers/frame, %.0f draws/frame; encoding thread woken "

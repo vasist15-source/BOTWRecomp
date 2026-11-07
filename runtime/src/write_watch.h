@@ -53,6 +53,10 @@ bool active();
 // this call. Hash the range only after arming it.
 uint64_t arm(uint32_t addr, uint32_t size);
 bool written_since(uint32_t addr, uint32_t size, uint64_t stamp);
+// how many pages of [addr, addr + size) written_since counts as written (each faulted once since the
+// arm), and in *edges how many of those are the range's first or last page, which it may share with
+// the memory next to it
+uint32_t written_pages(uint32_t addr, uint32_t size, uint64_t stamp, uint32_t* edges = nullptr);
 // written_since, or a hint for one of the pages newer than stamp
 bool changed_since(uint32_t addr, uint32_t size, uint64_t stamp);
 uint64_t write_seq();
@@ -77,6 +81,8 @@ void set_guest_regs_hook(bool (*f)(uint32_t* lr, uint32_t* r));
 
 // statistics for the renderers' periodic report: write faults and pages protected since the last call
 void take_stats(uint64_t& faults, uint64_t& protectedPages);
+// the same counts since init, never reset (in-run A/B windows)
+void totals(uint64_t& faults, uint64_t& protectedPages);
 // hints since the last call: calls and bytes covered
 void take_hint_stats(uint64_t& calls, uint64_t& bytes);
 // pages arm() failed to protect so far (they are reported as written on every check instead)

@@ -506,6 +506,36 @@ the kept installer copy have not been played yet. The release build is installed
   `encode_handoff_test --bench` (Hateno-like frame: 21.9 -> 16.4 ms of process CPU a frame; 64 or 128 draws per wake-up save
   nothing more and double or quadruple the sync wait). Not measured: 2x.
 
+### 2026-11-08: Metal: textures rewritten every frame stay unarmed (texture churn rule)
+- Texture change detection write-protects a texture's pages at each check (write_watch.h); a texture written every frame
+  paid every frame for a write fault (~6 us on the M4), a re-protect (~1.5 us) and a full hash. What churns at Hateno,
+  standing still (`[texchurn]` report): the 512x512 linear render target at 42917A00, written back to guest memory every
+  frame by our own copy, which faulted on all 65 of its pages (most of the ~78 faults a frame); and ~15 GPU-written
+  surfaces of 64-900 KiB whose first or last page holds data the game writes every frame (their own bytes never change).
+- Rule (`gfx/texture_churn.h`, `texchurn::check`, used by `check_texture` and `check_cpu_overwrite`): after 3 checks
+  caused by writes, each within 4 frames of the last (forced checks count their written pages too), a texture stays
+  unarmed and is hashed at every frame's first use for 64 frames, doubling to 2048 (the Vulkan buffer cache's rule).
+  Only if neither its clean checks' hashing nor one full hash per write check costs more than its write checks' faults
+  and re-protects (192 KiB per page written + 48 KiB per check, in bytes hashed meanwhile at ~37 GB/s). The size bound
+  came from the first A/B: while the player moved, the 63 MiB terrain array AC455000 (1024x1024 x83 BC1, streamed a slice
+  at a time) went dynamic and was hashed every frame, 26-59 MiB/frame. It now stays armed, as do surfaces whose one
+  written page costs less than their hash (at Hateno 900, 288 and 256 KiB: ~2.4 faults a frame remain).
+- Measured at Hateno, 1.5x, 60 fps, standing still, in-run A/B (`WWHD_TEXTURE_AB=1`, 10 windows of 10 s with the rule,
+  each against its two neighbours without it): write faults 78.8 -> 2.4 a frame and pages re-protected 78.3 -> 2.3,
+  render thread -0.31 ms/frame (se 0.06), process CPU -2.6 points (se 1.1; 230 -> 227 %), frame time unchanged (+0.04 ms,
+  at the cap until the Air throttled), GPU busy +0.16 ms (se 0.14), bytes hashed and hashing time unchanged (2.56 MiB in
+  0.07 ms a frame). Moving (3 pairs, too noisy for CPU): faults 93 -> 9 a frame, bytes hashed 6.75 -> 6.0 MiB a frame.
+  No wrong or frozen images were reported in either run.
+- Switches: `WWHD_TEX_CHURN=0` (off), `WWHD_TEXTURE_AB=1` (`[textures-ab]` lines: CPU, frame time, render thread, GPU
+  busy, faults, pages protected, checks, unarmed checks, bytes hashed and hashing time, uploads; a `[texchurn]` report of
+  the costliest surfaces after each window), `WWHD_LOG_TEXCHURN=1` (the report every 600 frames, and each texture that
+  becomes dynamic). The 300-frame `[gfx]` line adds unarmed checks; its texture hash time now includes the hashes of
+  GPU-written surfaces. Test: `texture_churn` (the rule, a cache over real page protection with the game's write
+  patterns, rule on, off and switched, a racing writer; never stale).
+- Found, not changed: every slice the game streams into the terrain array re-hashes and re-uploads all 63 MiB of it
+  (33-83 times in 10 s while moving; texture hash 48-262 ms and decode+upload 58-258 ms per 300 frames). Re-hashing and
+  re-uploading only the slices and levels whose pages were written would remove most of that.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

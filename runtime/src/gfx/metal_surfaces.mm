@@ -538,6 +538,17 @@ void resample(id<MTLTexture> src, id<MTLTexture> dst, const FormatInfo& fmt, uin
 static uint64_t sparse_hash(Surface* s);
 static void check_texture(Surface* s);
 uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces;
+// churn rule (texture_churn.h): on unless WWHD_TEX_CHURN=0; the texture A/B (WWHD_TEXTURE_AB=1) switches it
+static bool g_churn_on = !(getenv("WWHD_TEX_CHURN") && !strcmp(getenv("WWHD_TEX_CHURN"), "0"));
+bool texture_churn_on() { return g_churn_on; }
+void texture_churn_set(bool on) { g_churn_on = on; }
+void texture_churn_report(const char* why);
+// the 300-frame report's: checks that left a texture unarmed, textures that became dynamic
+uint64_t g_stat_unarmed_checks, g_stat_became_dynamic;
+// since start, never reset (in-run A/B windows): full checks of CPU textures, hashing checks of GPU-written
+// surfaces, checks that left a texture unarmed, textures that became dynamic, bytes hashed, hashing time
+uint64_t g_tex_checks_all, g_tex_gpu_checks_all, g_tex_unarmed_all, g_tex_became_dynamic_all, g_tex_hashed_all, g_tex_hash_ns_all;
+uint64_t g_tex_uploads_all;
 bool g_repeat_texture_init = false;
 
 namespace {
@@ -1398,32 +1409,59 @@ static bool data_overwritten(Surface* t) {
 static const std::vector<std::pair<uint32_t, uint32_t>>& level_ranges(Surface* s);
 static uint64_t content_hash(Surface* s);
 
+// statistics of one check (texture_churn.h): the churn report's counts and the 300-frame report's
+static void note_check(Surface* t, const texchurn::Check& c) {
+    auto& n = t->cc;
+    n.checks++;
+    n.forced += c.forced;
+    if (c.written) {
+        n.writeChecks++;
+        n.pages += c.pages;
+        n.edgeOnly += c.pages && c.edges == c.pages;
+    }
+    if (c.unarmed) {
+        n.unarmed++;
+        g_stat_unarmed_checks++;
+        g_tex_unarmed_all++;
+    }
+    if (c.became) {
+        g_stat_became_dynamic++;
+        g_tex_became_dynamic_all++;
+        // debug: WWHD_LOG_TEXCHURN=1 logs each texture that becomes dynamic (200 times)
+        static const bool log = getenv("WWHD_LOG_TEXCHURN") != nullptr;
+        static int logged = 0;
+        if (log && logged++ < 200) {
+            uint64_t size = 0;
+            for (auto& [a, len] : t->levelRanges) size += len;
+            LOG("[texchurn] frame %llu: %08X %ux%u x%u f%X mips %u (%s, %llu KiB, %u pages written) dynamic for %llu frames",
+                (unsigned long long)R.frame, t->addr, t->width, t->height, t->slices, t->format, t->mips,
+                t->gpuWritten ? "GPU-written" : "CPU", (unsigned long long)(size >> 10), c.pages,
+                (unsigned long long)(t->watch.churn.dynamicUntil - R.frame));
+        }
+    }
+}
+
 // a GPU-written surface whose guest memory the CPU has since changed: reloaded from it, as Cemu does
 // (LatteTC_HasTextureChanged hashes GPU-updated textures too). BotW streams its terrain and grass maps
 // into memory that earlier frames drew into.
 static void check_cpu_overwrite(Surface* t) {
     static const bool off = getenv("WWHD_NO_GPU_RELOAD") != nullptr;
     if (off || !wwatch::active() || !t->tex || t->fmt.depth) return;
-    const auto& ranges = level_ranges(t);
-    auto arm = [&] {
-        uint64_t stamp = ~0ull;
-        for (auto& [a, n] : ranges) stamp = std::min(stamp, wwatch::arm(a, n));
-        t->watchStamp = stamp;
-    };
+    // hashed after a write to its pages; a new one (or one we wrote back to) gets its baseline hash, an
+    // unarmed one (churn rule) is hashed at every check
+    const texchurn::Check c = texchurn::check(t->watch, level_ranges(t), R.frame, !t->gpuWatched, g_churn_on);
+    note_check(t, c);
+    if (!c.hash) return;
+    g_tex_gpu_checks_all++;
+    const uint64_t h = content_hash(t);
     if (!t->gpuWatched) {
-        arm();
-        t->gpuRamHash = content_hash(t);
+        t->gpuRamHash = h;
         t->gpuWatched = true;
         return;
     }
-    bool hit = false;
-    for (auto& [a, n] : ranges)
-        if (wwatch::written_since(a, n, t->watchStamp)) { hit = true; break; }
-    if (!hit) return;
-    arm();
-    const uint64_t h = content_hash(t);
     if (h == t->gpuRamHash) return;
     t->gpuRamHash = h;
+    t->cc.changes++;
     static int logged = 0;
     if (logged++ < 60)
         LOG("[tc] CPU wrote GPU surface %08X %ux%u x%u f%X mips %u: reloaded", t->addr, t->width, t->height, t->slices, t->format, t->mips);
@@ -1474,6 +1512,57 @@ void texture_cache_frame_end() {
         forget_texture_views();
     }
     g_repeat_texture_init = false;
+    // the texture A/B reports each of its windows instead (metal_main.mm ab_frame)
+    static const bool churnLog = getenv("WWHD_LOG_TEXCHURN") && !getenv("WWHD_TEXTURE_AB");
+    if (churnLog && R.frame % 600 == 599) texture_churn_report("600 frames");
+}
+
+// WWHD_LOG_TEXCHURN=1 (every 600 frames) and the texture A/B (each window): what the checks of rewritten
+// and unarmed surfaces cost since the last report, the 24 costliest surfaces by name (bytes hashed, plus
+// faults and re-protects in bytes hashed meanwhile, as texture_churn.h counts them); then the counts
+// start over.
+void texture_churn_report(const char* why) {
+    static uint64_t lastFrame = 0;
+    const double frames = (double)std::max<uint64_t>(1, R.frame - lastFrame);
+    lastFrame = R.frame;
+    struct Row { Surface* s; uint64_t cost; };
+    std::vector<Row> rows;
+    uint32_t unarmed = 0, dynamicNow = 0;
+    uint64_t checks = 0, writeChecks = 0, pages = 0, dynChecks = 0, changes = 0, bytes = 0;
+    for (Surface* s : g_all) {
+        const auto& c = s->cc;
+        unarmed += s->watch.unarmed;
+        dynamicNow += texchurn::dynamic(s->watch.churn, R.frame);
+        checks += c.checks;
+        writeChecks += c.writeChecks;
+        pages += c.pages;
+        dynChecks += c.unarmed;
+        changes += c.changes;
+        bytes += c.bytes;
+        if (c.writeChecks || c.unarmed)
+            rows.push_back({s, c.bytes + (uint64_t)c.pages * texchurn::kFaultBytes + (uint64_t)c.writeChecks * texchurn::kProtectBytes});
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.cost > b.cost; });
+    LOG("[texchurn] %s (%.0f frames, churn rule %s): per frame %.1f checks, %.2f after writes (%.1f pages written), %.2f unarmed, "
+        "%.2f content changes, %.2f MiB hashed; %zu surfaces rewritten or unarmed, %u unarmed now (%u dynamic)",
+        why, frames, g_churn_on ? "on" : "off", checks / frames, writeChecks / frames, pages / frames, dynChecks / frames, changes / frames,
+        bytes / frames / 1048576.0, rows.size(), unarmed, dynamicNow);
+    for (size_t i = 0; i < rows.size() && i < 24; i++) {
+        Surface* s = rows[i].s;
+        const auto& c = s->cc;
+        uint64_t size = 0;
+        for (auto& [a, n] : s->levelRanges) size += n;
+        char state[96] = "";
+        if (texchurn::dynamic(s->watch.churn, R.frame))
+            snprintf(state, sizeof state, "; dynamic for %llu more frames (back-off %u)",
+                     (unsigned long long)(s->watch.churn.dynamicUntil - R.frame), s->watch.churn.backoffs);
+        LOG("[texchurn]   %08X %ux%u x%u f%X tm%u mips %u, %llu KiB %s: %u checks (%u forced), %u after writes (%.1f pages each, %u "
+            "only at a level's first or last page), %u unarmed, %u changed, %.2f MiB hashed%s",
+            s->addr, s->width, s->height, s->slices, s->format, s->tileMode, s->mips, (unsigned long long)(size >> 10),
+            s->gpuWritten ? "GPU-written" : "CPU", c.checks, c.forced, c.writeChecks, c.writeChecks ? (double)c.pages / c.writeChecks : 0.0,
+            c.edgeOnly, c.unarmed, c.changes, c.bytes / 1048576.0, state);
+    }
+    for (Surface* s : g_all) s->cc = {};
 }
 
 // ---- lookups
@@ -1702,23 +1791,20 @@ static void check_texture(Surface* s) {
     const auto& ranges = level_ranges(s);
     bool full = s->dirty || !s->watched;
     if (wwatch::active()) {
-        if (!full)
-            for (auto& [a, n] : ranges)
-                if (wwatch::written_since(a, n, s->watchStamp)) {
-                    full = true;
-                    // debug: WWHD_LOG_TEXCHECK=1 logs textures re-checked because their pages were written
-                    static const bool log = getenv("WWHD_LOG_TEXCHECK") != nullptr;
-                    static int logged = 0;
-                    if (log && logged++ < 400)
-                        LOG("[texcheck] frame %llu %08X %ux%u fmt %X mips %u: write at %08X+%X", (unsigned long long)R.frame, s->addr,
-                            s->width, s->height, s->format, s->mips, a, n);
-                    break;
-                }
-        if (!full) return;
-        // arm before reading: a write from now on faults and stamps the pages after this stamp
-        uint64_t stamp = ~0ull;
-        for (auto& [a, n] : ranges) stamp = std::min(stamp, wwatch::arm(a, n));
-        s->watchStamp = stamp;
+        // armed before reading: a write from now on faults and stamps the pages after this stamp
+        // (unless the churn rule leaves the texture unarmed: then the next check hashes it again)
+        const texchurn::Check c = texchurn::check(s->watch, ranges, R.frame, full, g_churn_on);
+        note_check(s, c);
+        if (c.written && !c.forced) {
+            // debug: WWHD_LOG_TEXCHECK=1 logs textures re-checked because their pages were written
+            static const bool log = getenv("WWHD_LOG_TEXCHECK") != nullptr;
+            static int logged = 0;
+            if (log && logged++ < 400)
+                LOG("[texcheck] frame %llu %08X %ux%u fmt %X mips %u: %u pages written (%u at a level's first or last page)%s",
+                    (unsigned long long)R.frame, s->addr, s->width, s->height, s->format, s->mips, c.pages, c.edges,
+                    c.unarmed ? ", left unarmed" : "");
+        }
+        if (!c.hash) return;
     } else {
         full = full || ((R.frame + (s->addr >> 12)) & 63) == 0;
         uint64_t h = sparse_hash(s);
@@ -1728,7 +1814,10 @@ static void check_texture(Surface* s) {
     }
     s->watched = true;
     g_stat_full_checks++;
+    g_tex_checks_all++;
+    const uint64_t before = s->contentHash;
     upload_surface(s);
+    s->cc.changes += s->contentHash != before;
     s->dirty = false;
 }
 
@@ -1893,13 +1982,14 @@ static uint64_t sparse_hash(Surface* s) {
     return h;
 }
 
+// time spent hashing (both kinds of check) and in uploads (render thread), reported with the texture statistics
+double g_stat_hash_ms, g_stat_decode_ms;
+uint64_t g_stat_pass_splits;
+static double ms_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
 // every byte of every level the upload reads
 uint64_t g_stat_hashed_bytes;
-static uint64_t content_hash(Surface* s) {
-    const auto& ranges = level_ranges(s);
-    uint64_t total = 0;
-    for (auto& r : ranges) total += r.second;
-    g_stat_hashed_bytes += total;
+static uint64_t content_hash_of(const std::vector<std::pair<uint32_t, uint32_t>>& ranges, uint64_t total) {
     static const bool serial = getenv("WWHD_SERIAL_DECODE") != nullptr;
     if (total < (4u << 20) || serial) {
         uint64_t h = 0;
@@ -1918,24 +2008,32 @@ static uint64_t content_hash(Surface* s) {
     dispatch_apply(chunks.size(), DISPATCH_APPLY_AUTO, ^(size_t i) { out[i] = XXH3_64bits(mem::ptr(in[i].addr), in[i].size); });
     return XXH3_64bits(hs.data(), hs.size() * sizeof(uint64_t));
 }
-
-// time spent in uploads (render thread), reported with the texture statistics
-double g_stat_hash_ms, g_stat_decode_ms;
-uint64_t g_stat_pass_splits;
-static double ms_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static uint64_t content_hash(Surface* s) {
+    const auto& ranges = level_ranges(s);
+    uint64_t total = 0;
+    for (auto& r : ranges) total += r.second;
+    g_stat_hashed_bytes += total;
+    g_tex_hashed_all += total;
+    s->cc.bytes += total;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t h = content_hash_of(ranges, total);
+    const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    g_tex_hash_ns_all += ns;
+    g_stat_hash_ms += ns / 1e6;
+    return h;
+}
 
 void upload_surface(Surface* s) {
     // depth buffers are not loaded from guest memory (their contents come from the GPU)
     if (!s->tex || s->gpuWritten || s->fmt.depth) return;
     const FormatInfo& f = s->fmt;
     const auto& ranges = level_ranges(s);
-    const double t0 = ms_now();
     uint64_t hash = content_hash(s);
-    g_stat_hash_ms += ms_now() - t0;
     if (hash == s->contentHash && s->writeSeq) return;
     s->contentHash = hash;
     s->writeSeq = next_write_seq();  // fresh CPU data is now the newest version of this memory
     g_stat_uploads++;
+    g_tex_uploads_all++;
 
     if (enc_pass_open()) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
     end_encoder();

@@ -42,7 +42,8 @@ std::atomic<uint64_t>* g_stamp = nullptr;  // newest write stamp per page
 std::atomic<uint8_t>* g_flags = nullptr;
 std::atomic<uint64_t> g_clock{1};
 std::atomic<bool> g_active{false};
-std::atomic<uint64_t> g_faults{0}, g_protected{0};
+std::atomic<uint64_t> g_faults{0}, g_protected{0};              // since init (totals)
+std::atomic<uint64_t> g_faults_taken{0}, g_protected_taken{0};  // the totals at the last take_stats
 std::atomic<uint64_t> g_seq{0};                // advanced after each stamp is stored (write_seq)
 std::atomic<uint64_t>* g_hint = nullptr;       // newest hint stamp per page (enable_hints)
 std::atomic<bool> g_hints{false};
@@ -241,6 +242,19 @@ bool written_since(uint32_t addr, uint32_t size, uint64_t stamp) {
     return false;
 }
 
+uint32_t written_pages(uint32_t addr, uint32_t size, uint64_t stamp, uint32_t* edges) {
+    uint64_t first, last;
+    uint32_t n = 0, e = 0;
+    if (page_range(addr, size, first, last))
+        for (uint64_t p = first; p <= last; p++)
+            if (g_stamp[p].load(std::memory_order_acquire) > stamp) {
+                n++;
+                e += p == first || p == last;
+            }
+    if (edges) *edges = e;
+    return n;
+}
+
 void host_write_begin(uint32_t addr, uint32_t size) {
 #ifndef _WIN32
     if (g_trap && addr <= g_trap + g_trap_size && g_trap < addr + size) {
@@ -313,8 +327,14 @@ void hint(uint32_t addr, uint32_t size) {
 }
 
 void take_stats(uint64_t& faults, uint64_t& protectedPages) {
-    faults = g_faults.exchange(0, std::memory_order_relaxed);
-    protectedPages = g_protected.exchange(0, std::memory_order_relaxed);
+    const uint64_t f = g_faults.load(std::memory_order_relaxed), p = g_protected.load(std::memory_order_relaxed);
+    faults = f - g_faults_taken.exchange(f, std::memory_order_relaxed);
+    protectedPages = p - g_protected_taken.exchange(p, std::memory_order_relaxed);
+}
+
+void totals(uint64_t& faults, uint64_t& protectedPages) {
+    faults = g_faults.load(std::memory_order_relaxed);
+    protectedPages = g_protected.load(std::memory_order_relaxed);
 }
 
 uint64_t protect_failures() { return g_protect_failures.load(std::memory_order_relaxed); }

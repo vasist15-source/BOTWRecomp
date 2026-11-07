@@ -3190,12 +3190,14 @@ void report_skips() {
         g_stat_hash_ms, g_stat_decode_ms, (unsigned long long)g_stat_pass_splits);
     g_stat_hash_ms = g_stat_decode_ms = 0;
     g_stat_pass_splits = 0;
+    extern uint64_t g_stat_unarmed_checks, g_stat_became_dynamic;
     LOG("[gfx] last 300 frames: %llu full texture checks (%.1f MiB hashed), %llu uploads, %llu invalidates marking %llu surfaces, "
-        "%llu texture page write faults, %llu pages protected",
+        "%llu texture page write faults, %llu pages protected, %llu checks left textures unarmed (%llu became dynamic)",
         (unsigned long long)g_stat_full_checks, g_stat_hashed_bytes / 1048576.0, (unsigned long long)g_stat_uploads,
         (unsigned long long)g_stat_invalidates, (unsigned long long)g_stat_invalidated_surfaces, (unsigned long long)faults,
-        (unsigned long long)protectedPages);
+        (unsigned long long)protectedPages, (unsigned long long)g_stat_unarmed_checks, (unsigned long long)g_stat_became_dynamic);
     g_stat_full_checks = g_stat_uploads = g_stat_invalidates = g_stat_invalidated_surfaces = g_stat_hashed_bytes = 0;
+    g_stat_unarmed_checks = g_stat_became_dynamic = 0;
 }
 
 bool probe_draw_eligible(Surface* const* colors, const Surface* depth, Surface* const* sampled, int nSampled);

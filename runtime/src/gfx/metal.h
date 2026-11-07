@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "formats.h"
+#include "texture_churn.h"
 
 // A class newer than the kit's deployment target (macOS 13), for use inside its @available block: looked
 // up by name when the game runs. A direct reference ([MTL4CompilerDescriptor new]) is a weak import, which
@@ -86,10 +87,16 @@ struct Surface {
     uint32_t dataSize = 0;     // base level size in guest memory
     bool dirty = true;         // new, or invalidated by the game: do a full check
     // CPU textures: guest ranges of all levels (base first) and the write stamp (write_watch.h) they
-    // were armed with at the last full check; no newer stamp on their pages = unchanged
+    // were armed with at the last full check; no newer stamp on their pages = unchanged. Both kinds of
+    // check use the watch (texture_churn.h): a texture rewritten at nearly every check is dynamic for a
+    // while, its pages unarmed and hashed at every check.
     std::vector<std::pair<uint32_t, uint32_t>> levelRanges;
-    uint64_t watchStamp = 0;
+    texchurn::Watch watch;
     bool watched = false;
+    // since the last churn report (WWHD_LOG_TEXCHURN=1, the texture A/B): checks (forced: new, invalidated
+    // or written by our own copy), those after writes to its armed pages (pages written in all, how many
+    // of them only at a level's first or last page), checks that left it unarmed, content changes, bytes hashed
+    struct ChurnCounts { uint32_t checks, forced, writeChecks, pages, edgeOnly, unarmed, changes; uint64_t bytes; } cc{};
     // GPU-written surfaces outside MEM1: guest memory hash when watched, so a CPU write reloads them (Cemu)
     bool gpuWatched = false;
     uint64_t gpuRamHash = 0;
