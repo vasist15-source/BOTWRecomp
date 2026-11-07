@@ -433,9 +433,9 @@ bool make_plan(Plan& p, std::string& why) {
         p.weights = {0.75, 0.25};
         p.exe = (exe_dir / fs::path(g.args.empty() ? "wwhd" : g.args[0]).filename()).string();
         p.how = "Translates the game code into " + gen.string() + " and builds " + (build / "wwhd").string() + ".";
-        if (made_app) {  // then bundles it again where this app is, with the same game folders
+        if (made_app) {  // then bundles it again where this app is, with the same game and save folders
             p.steps.push_back({"/bin/sh", (src / "tools" / "make_app.sh").string(), app.parent_path().string()});
-            p.envs.push_back({"BOTW_DUMP=" + fs::path(config::game_dir).parent_path().string()});
+            p.envs.push_back({"BOTW_DUMP=" + fs::path(config::game_dir).parent_path().string(), "BOTW_SAVE=" + config::save_dir});
             p.weights = {0.7, 0.25, 0.05};
             p.how += " Then tools/make_app.sh makes " + app.string() + " again.";
         }
