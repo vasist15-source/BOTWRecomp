@@ -460,6 +460,12 @@ add_executable(texture_churn_test runtime/tools/texture_churn_test.cpp runtime/s
 target_include_directories(texture_churn_test PRIVATE runtime/src)
 target_compile_options(texture_churn_test PRIVATE -UNDEBUG)
 target_link_libraries(texture_churn_test PRIVATE Threads::Threads)
+# partial texture updates: pieces against the decode's reads (address library), a cache over real page
+# protection, a racing writer (runtime/src/gfx/texture_pieces.h, texture_pieces_layout.h)
+add_executable(texture_pieces_test runtime/tools/texture_pieces_test.cpp runtime/src/write_watch.cpp)
+target_include_directories(texture_pieces_test PRIVATE runtime/src)
+target_link_libraries(texture_pieces_test PRIVATE cemu_latte Threads::Threads)
+target_compile_options(texture_pieces_test PRIVATE -UNDEBUG -O2 "SHELL:-include \"${CEMU_DIR}/cemu_shim.h\"")
 # recompiled spin waits see other threads' stores (PPC_LOOP in runtime/include/ppc.h, issue #62):
 # built with the game code's flags
 if(NOT WIN32)
@@ -702,6 +708,7 @@ add_test(NAME interp_pacing COMMAND interp_pacing_test)
 add_test(NAME quit_prompt COMMAND quit_prompt_test)
 add_test(NAME write_watch COMMAND write_watch_test)
 add_test(NAME texture_churn COMMAND texture_churn_test)
+add_test(NAME texture_pieces COMMAND texture_pieces_test)
 add_test(NAME buffer_cache COMMAND buffer_cache_test)
 add_test(NAME upload_pool COMMAND upload_pool_test)
 if(APPLE)

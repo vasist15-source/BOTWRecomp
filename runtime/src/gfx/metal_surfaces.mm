@@ -19,6 +19,7 @@
 #include "runtime.h"
 #include "dynres.h"
 #include "write_watch.h"
+#include "texture_pieces_layout.h"
 #define XXH_INLINE_ALL
 #include "../../third_party/xxhash/xxhash.h"
 
@@ -323,6 +324,8 @@ static Surface* rescale(Surface* s) {
     }
     end_encoder();
     s->tex = t;
+    // a CPU texture's new texture holds a filtered copy: its next check after writes uploads every piece
+    if (!s->gpuWritten) s->pieces.stamp = 0;
     // every level of a new texture: its memory is undefined (NaN in float formats), and later passes that
     // blend into a level keep a NaN forever (the bloom mip chain: black lower screen after a switch).
     // A kept texture holds an earlier picture instead, and the copy below covers what is used of it.
@@ -542,13 +545,27 @@ uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalida
 static bool g_churn_on = !(getenv("WWHD_TEX_CHURN") && !strcmp(getenv("WWHD_TEX_CHURN"), "0"));
 bool texture_churn_on() { return g_churn_on; }
 void texture_churn_set(bool on) { g_churn_on = on; }
-void texture_churn_report(const char* why);
+void texture_churn_report(const char* why, int maxRows);
 // the 300-frame report's: checks that left a texture unarmed, textures that became dynamic
 uint64_t g_stat_unarmed_checks, g_stat_became_dynamic;
 // since start, never reset (in-run A/B windows): full checks of CPU textures, hashing checks of GPU-written
 // surfaces, checks that left a texture unarmed, textures that became dynamic, bytes hashed, hashing time
 uint64_t g_tex_checks_all, g_tex_gpu_checks_all, g_tex_unarmed_all, g_tex_became_dynamic_all, g_tex_hashed_all, g_tex_hash_ns_all;
 uint64_t g_tex_uploads_all;
+// partial updates (texture_pieces.h): on unless WWHD_TEX_PARTIAL=0; the partial A/B (WWHD_PARTIAL_AB=1)
+// switches it. Off, every check after writes hashes the texture in full and a change uploads all of it.
+static bool g_partial_on = !(getenv("WWHD_TEX_PARTIAL") && !strcmp(getenv("WWHD_TEX_PARTIAL"), "0"));
+bool texture_partial_on() { return g_partial_on; }
+void texture_partial_set(bool on) { g_partial_on = on; }
+// the 300-frame report's: checks that hashed only the chunks written
+uint64_t g_stat_partial_checks;
+// debug: WWHD_VERIFY_PARTIAL=1 (verify_partial): every partial check against a hash of every chunk
+static const bool g_verify_partial = getenv("WWHD_VERIFY_PARTIAL") != nullptr;
+static uint64_t g_verify_checks, g_verify_chunks, g_verify_missed, g_verify_raced;
+// since start, never reset: checks after writes to armed pages (CPU textures and GPU-written surfaces), those
+// that hashed only the chunks written, pieces they uploaded, bytes decoded and uploaded (every upload), and
+// the render thread's time decoding and encoding uploads
+uint64_t g_tex_write_checks_all, g_tex_partial_all, g_tex_pieces_all, g_tex_upload_bytes_all, g_tex_decode_ns_all;
 bool g_repeat_texture_init = false;
 
 namespace {
@@ -1407,13 +1424,16 @@ static bool data_overwritten(Surface* t) {
 
 // keep t's contents current before a use: CPU writes to its memory (once a frame), newer GPU writes to related surfaces
 static const std::vector<std::pair<uint32_t, uint32_t>>& level_ranges(Surface* s);
+static texpieces::Table& piece_table(Surface* s);
 static uint64_t content_hash(Surface* s);
+static uint64_t written_hash(Surface* s, uint64_t since, std::vector<uint32_t>& changed);
 
 // statistics of one check (texture_churn.h): the churn report's counts and the 300-frame report's
 static void note_check(Surface* t, const texchurn::Check& c) {
     auto& n = t->cc;
     n.checks++;
     n.forced += c.forced;
+    g_tex_write_checks_all += c.written && !c.forced;
     if (c.written) {
         n.writeChecks++;
         n.pages += c.pages;
@@ -1443,7 +1463,9 @@ static void note_check(Surface* t, const texchurn::Check& c) {
 
 // a GPU-written surface whose guest memory the CPU has since changed: reloaded from it, as Cemu does
 // (LatteTC_HasTextureChanged hashes GPU-updated textures too). BotW streams its terrain and grass maps
-// into memory that earlier frames drew into.
+// into memory that earlier frames drew into. A check after writes to its armed pages hashes only the
+// chunks on the pages written (texture_pieces.h): at Hateno the game writes, every frame, a first or last
+// page that surfaces of 100-900 KiB share with other data.
 static void check_cpu_overwrite(Surface* t) {
     static const bool off = getenv("WWHD_NO_GPU_RELOAD") != nullptr;
     if (off || !wwatch::active() || !t->tex || t->fmt.depth) return;
@@ -1453,7 +1475,14 @@ static void check_cpu_overwrite(Surface* t) {
     note_check(t, c);
     if (!c.hash) return;
     g_tex_gpu_checks_all++;
-    const uint64_t h = content_hash(t);
+    uint64_t h;
+    if (g_partial_on && texpieces::partial_ok(piece_table(t), c)) {
+        static std::vector<uint32_t> changed;  // render thread; nothing is uploaded from it here
+        changed.clear();
+        h = written_hash(t, c.since, changed);
+    } else {
+        h = content_hash(t);
+    }
     if (!t->gpuWatched) {
         t->gpuRamHash = h;
         t->gpuWatched = true;
@@ -1512,23 +1541,28 @@ void texture_cache_frame_end() {
         forget_texture_views();
     }
     g_repeat_texture_init = false;
-    // the texture A/B reports each of its windows instead (metal_main.mm ab_frame)
-    static const bool churnLog = getenv("WWHD_LOG_TEXCHURN") && !getenv("WWHD_TEXTURE_AB");
-    if (churnLog && R.frame % 600 == 599) texture_churn_report("600 frames");
+    // the texture A/Bs report each of their windows instead (metal_main.mm ab_frame)
+    static const bool churnLog = getenv("WWHD_LOG_TEXCHURN") && !getenv("WWHD_TEXTURE_AB") && !getenv("WWHD_PARTIAL_AB");
+    if (churnLog && R.frame % 600 == 599) texture_churn_report("600 frames", 24);
+    if (g_verify_partial && R.frame % 600 == 599)
+        LOG("[partial-verify] %llu partial checks verified so far (%llu chunks hashed again): %llu chunks changed with no page written since "
+            "the last arm (missed), %llu with a write racing the check",
+            (unsigned long long)g_verify_checks, (unsigned long long)g_verify_chunks, (unsigned long long)g_verify_missed,
+            (unsigned long long)g_verify_raced);
 }
 
-// WWHD_LOG_TEXCHURN=1 (every 600 frames) and the texture A/B (each window): what the checks of rewritten
-// and unarmed surfaces cost since the last report, the 24 costliest surfaces by name (bytes hashed, plus
-// faults and re-protects in bytes hashed meanwhile, as texture_churn.h counts them); then the counts
-// start over.
-void texture_churn_report(const char* why) {
+// WWHD_LOG_TEXCHURN=1 (every 600 frames) and the texture A/Bs (each window): what the checks of rewritten
+// and unarmed surfaces cost since the last report, the maxRows costliest surfaces by name (bytes hashed
+// and uploaded, plus faults and re-protects in bytes hashed meanwhile, as texture_churn.h counts them);
+// then the counts start over.
+void texture_churn_report(const char* why, int maxRows) {
     static uint64_t lastFrame = 0;
     const double frames = (double)std::max<uint64_t>(1, R.frame - lastFrame);
     lastFrame = R.frame;
     struct Row { Surface* s; uint64_t cost; };
     std::vector<Row> rows;
     uint32_t unarmed = 0, dynamicNow = 0;
-    uint64_t checks = 0, writeChecks = 0, pages = 0, dynChecks = 0, changes = 0, bytes = 0;
+    uint64_t checks = 0, writeChecks = 0, pages = 0, dynChecks = 0, changes = 0, bytes = 0, partial = 0, upBytes = 0;
     for (Surface* s : g_all) {
         const auto& c = s->cc;
         unarmed += s->watch.unarmed;
@@ -1539,15 +1573,19 @@ void texture_churn_report(const char* why) {
         dynChecks += c.unarmed;
         changes += c.changes;
         bytes += c.bytes;
+        partial += c.partial;
+        upBytes += c.upBytes;
         if (c.writeChecks || c.unarmed)
-            rows.push_back({s, c.bytes + (uint64_t)c.pages * texchurn::kFaultBytes + (uint64_t)c.writeChecks * texchurn::kProtectBytes});
+            rows.push_back({s, c.bytes + c.upBytes + (uint64_t)c.pages * texchurn::kFaultBytes + (uint64_t)c.writeChecks * texchurn::kProtectBytes});
     }
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.cost > b.cost; });
-    LOG("[texchurn] %s (%.0f frames, churn rule %s): per frame %.1f checks, %.2f after writes (%.1f pages written), %.2f unarmed, "
-        "%.2f content changes, %.2f MiB hashed; %zu surfaces rewritten or unarmed, %u unarmed now (%u dynamic)",
-        why, frames, g_churn_on ? "on" : "off", checks / frames, writeChecks / frames, pages / frames, dynChecks / frames, changes / frames,
-        bytes / frames / 1048576.0, rows.size(), unarmed, dynamicNow);
-    for (size_t i = 0; i < rows.size() && i < 24; i++) {
+    LOG("[texchurn] %s (%.0f frames, churn rule %s, partial updates %s): per frame %.1f checks, %.2f after writes (%.1f pages written, "
+        "%.2f hashed only the chunks written), %.2f unarmed, %.2f content changes, %.2f MiB hashed, %.2f MiB uploaded; %zu surfaces "
+        "rewritten or unarmed, %u unarmed now (%u dynamic)",
+        why, frames, g_churn_on ? "on" : "off", g_partial_on ? "on" : "off", checks / frames, writeChecks / frames, pages / frames,
+        partial / frames, dynChecks / frames, changes / frames, bytes / frames / 1048576.0, upBytes / frames / 1048576.0, rows.size(), unarmed,
+        dynamicNow);
+    for (size_t i = 0; i < rows.size() && (int)i < maxRows; i++) {
         Surface* s = rows[i].s;
         const auto& c = s->cc;
         uint64_t size = 0;
@@ -1556,11 +1594,13 @@ void texture_churn_report(const char* why) {
         if (texchurn::dynamic(s->watch.churn, R.frame))
             snprintf(state, sizeof state, "; dynamic for %llu more frames (back-off %u)",
                      (unsigned long long)(s->watch.churn.dynamicUntil - R.frame), s->watch.churn.backoffs);
-        LOG("[texchurn]   %08X %ux%u x%u f%X tm%u mips %u, %llu KiB %s: %u checks (%u forced), %u after writes (%.1f pages each, %u "
-            "only at a level's first or last page), %u unarmed, %u changed, %.2f MiB hashed%s",
+        LOG("[texchurn]   %08X %ux%u x%u f%X tm%u mips %u, %llu KiB %s (%zu pieces): %u checks (%u forced), %u after writes (%.1f pages "
+            "each, %u only at a level's first or last page, %u hashed only the chunks written), %u unarmed, %u changed (%u pieces uploaded "
+            "alone), %.2f MiB hashed, %.2f MiB uploaded%s",
             s->addr, s->width, s->height, s->slices, s->format, s->tileMode, s->mips, (unsigned long long)(size >> 10),
-            s->gpuWritten ? "GPU-written" : "CPU", c.checks, c.forced, c.writeChecks, c.writeChecks ? (double)c.pages / c.writeChecks : 0.0,
-            c.edgeOnly, c.unarmed, c.changes, c.bytes / 1048576.0, state);
+            s->gpuWritten ? "GPU-written" : "CPU", s->pieces.pieces.size(), c.checks, c.forced, c.writeChecks,
+            c.writeChecks ? (double)c.pages / c.writeChecks : 0.0, c.edgeOnly, c.partial, c.unarmed, c.changes, c.pieces, c.bytes / 1048576.0,
+            c.upBytes / 1048576.0, state);
     }
     for (Surface* s : g_all) s->cc = {};
 }
@@ -1651,6 +1691,7 @@ TexView* sampled_texture(const uint32_t* w, bool isDepthSampler) {
             t->writeSeq = 0;
             t->gpuWritten = false;
             t->levelRanges.clear();
+            t->pieces = {};
             t->lastCheckedFrame = R.frame;
             check_texture(t);
         }
@@ -1750,46 +1791,61 @@ TexView* surface_from_depth_buffer(uint32_t addr, uint32_t* numSlices) {
                        (uint32_t)db->surface.format.value(), first, false, true);
 }
 
-// Guest ranges of every level the upload reads (base first), computed once: a Surface's geometry
-// never changes after creation.
+static texpieces::Desc desc_of(const Surface* s) {
+    texpieces::Desc d;
+    d.addr = s->addr;
+    d.mipAddr = s->mipAddr;
+    d.format = s->format;
+    d.width = s->width;
+    d.height = s->height;
+    d.slices = s->slices;
+    d.dim = s->dim;
+    d.tileMode = s->tileMode;
+    d.swizzle = s->swizzle;
+    d.mips = s->mips;
+    return d;
+}
+
+// Guest ranges of every level the upload reads (base first; texture_pieces_layout.h), computed once for
+// the surface's layout (a sampled lookup with another swizzle or mip address clears them)
 static const std::vector<std::pair<uint32_t, uint32_t>>& level_ranges(Surface* s) {
     if (!s->levelRanges.empty()) return s->levelRanges;
-    for (uint32_t level = 0; level < s->mips; level++) {
-        uint32_t base;
-        if (level == 0) base = s->addr;
-        else if (!s->mipAddr) break;
-        else {
-            // mip offsets relative to the mip chain start; for level 1 too: a macro-tiled mip chain keeps its
-            // swizzle in the mip pointer's bits 8-10, which the address library strips (taken raw, level 1 was
-            // read up to 0x700 bytes off: zeros or neighbouring data, the black cards on Kakariko's roofs)
-            uint32_t sliceOffset = 0, sliceSize = 0;
-            sint32 sub = 0;
-            LatteAddrLib::CalculateMipAndSliceAddr(s->addr, s->mipAddr, (Latte::E_GX2SURFFMT)s->format, s->width, s->height,
-                                                   s->slices, (Latte::E_DIM)s->dim, (Latte::E_HWTILEMODE)s->tileMode,
-                                                   s->swizzle, 0, level, 0, &sliceOffset, &sliceSize, &sub);
-            base = sliceOffset;
-        }
-        LatteAddrLib::AddrSurfaceInfo_OUT info{};
-        LatteAddrLib::GX2CalculateSurfaceInfo((Latte::E_GX2SURFFMT)s->format, s->width, s->height, s->slices, (Latte::E_DIM)s->dim,
-                                              Latte::MakeGX2TileMode((Latte::E_HWTILEMODE)s->tileMode), 0, level, &info);
-        // clamp to the 4 GiB guest space (a bogus descriptor must not make the hash read past it)
-        uint32_t size = (uint32_t)std::min<uint64_t>(info.surfSize, 0x100000000ull - base);
-        s->levelRanges.push_back({base, size});
-        note_surface_range(s, base, size);
-    }
+    s->levelRanges = texpieces::level_ranges_of(desc_of(s));
+    for (auto& [base, size] : s->levelRanges) note_surface_range(s, base, size);
     s->dataSize = s->levelRanges[0].second;
     return s->levelRanges;
+}
+
+// the levels' pieces and chunks (texture_pieces.h), for the current level ranges
+static texpieces::Table& piece_table(Surface* s) {
+    const auto& ranges = level_ranges(s);
+    bool same = s->pieces.levels.size() == ranges.size();
+    for (size_t l = 0; same && l < ranges.size(); l++)
+        same = s->pieces.levels[l].addr == ranges[l].first && s->pieces.levels[l].size == ranges[l].second;
+    if (!same) texpieces::build(s->pieces, texpieces::levels_of(desc_of(s), ranges, s->fmt.bytesPerBlock * 8));
+    return s->pieces;
+}
+
+static void update_written(Surface* s, uint64_t since);
+// can the texture's own pieces be uploaded alone (texture_pieces.h)? Uploaded before from guest memory,
+// at the guest size (a scaled texture is filtered up whole)
+static bool pieces_uploadable(const Surface* s) {
+    return s->tex && !s->gpuWritten && !s->fmt.depth && s->writeSeq && s->sx == 1.0f && s->sy == 1.0f;
 }
 
 // Has the CPU changed this texture since its last check? Exact with write tracking (write_watch.h):
 // its pages were write-protected at that check, so any write since has stamped them. Changes the
 // game announces (GX2Invalidate on the range, GX2CopySurface into it, a loaded save state) set dirty.
-// Then every byte of every level is hashed and the texture re-uploaded if the hash differs.
+// Then every byte of every level is hashed and the texture re-uploaded if the hash differs; a check
+// caused by writes to its armed pages hashes only the chunks on the pages written and uploads only the
+// slices or levels that changed (texture_pieces.h).
 // Without write tracking (page protection unavailable on the host): the old sampled check, 256 words
 // per level every frame plus a full check every 64 frames, which can show a changed texture late.
 static void check_texture(Surface* s) {
     const auto& ranges = level_ranges(s);
     bool full = s->dirty || !s->watched;
+    bool partial = false;
+    uint64_t since = 0;
     if (wwatch::active()) {
         // armed before reading: a write from now on faults and stamps the pages after this stamp
         // (unless the churn rule leaves the texture unarmed: then the next check hashes it again)
@@ -1805,6 +1861,8 @@ static void check_texture(Surface* s) {
                     c.unarmed ? ", left unarmed" : "");
         }
         if (!c.hash) return;
+        partial = g_partial_on && pieces_uploadable(s) && texpieces::partial_ok(piece_table(s), c);
+        since = c.since;
     } else {
         full = full || ((R.frame + (s->addr >> 12)) & 63) == 0;
         uint64_t h = sparse_hash(s);
@@ -1816,7 +1874,8 @@ static void check_texture(Surface* s) {
     g_stat_full_checks++;
     g_tex_checks_all++;
     const uint64_t before = s->contentHash;
-    upload_surface(s);
+    if (partial) update_written(s, since);
+    else upload_surface(s);
     s->cc.changes += s->contentHash != before;
     s->dirty = false;
 }
@@ -1857,13 +1916,16 @@ static void level_dims(Surface* s, uint32_t level, uint32_t& w, uint32_t& h, uin
     bh = f.compressed ? (h + 3) / 4 : h;
 }
 
-// detile and convert one level into `out` (bw * bh * slices * hostBytesPerBlock bytes). Large levels
-// are split into bands of rows decoded on all cores (a 2048x2048 texture took ~15 ms on one: a
-// visible hitch whenever the game streamed one in); the result is the same as decoding serially.
-static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out) {
+// detile and convert slices [z0, z1) of one level into `out` (bw * bh * (z1 - z0) * hostBytesPerBlock
+// bytes; base: the level's address). Large levels are split into bands of rows decoded on all cores (a
+// 2048x2048 texture took ~15 ms on one: a visible hitch whenever the game streamed one in); the result is
+// the same as decoding serially.
+static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out, uint32_t z0 = 0, uint32_t z1 = ~0u) {
     const FormatInfo& f = s->fmt;
     uint32_t w, h, slices, bw, bh;
     level_dims(s, level, w, h, slices, bw, bh);
+    z1 = std::min(z1, slices);
+    if (z0 >= z1) return;
 
     // level geometry from the address library
     LatteAddrLib::AddrSurfaceInfo_OUT info{};
@@ -1897,14 +1959,14 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out
     uint32_t band = verify ? bh : std::max<uint32_t>(8, (uint32_t)(((262144 / std::max<size_t>(rowStride, 1)) + 7) & ~7u));
     band = std::min(band, bh);
     const uint32_t perSlice = (bh + band - 1) / band;
-    const size_t units = (size_t)slices * perSlice;
+    const size_t units = (size_t)(z1 - z0) * perSlice;
 
     auto run = [&](size_t u) {
-        const uint32_t z = (uint32_t)(u / perSlice);
+        const uint32_t z = z0 + (uint32_t)(u / perSlice);
         const uint32_t y0 = (uint32_t)(u % perSlice) * band, y1 = std::min(bh, y0 + band);
         static thread_local std::vector<uint8_t> tmp, check;  // the band in guest format (converted formats)
         uint8_t* rows;
-        if (direct) rows = out + ((size_t)z * bh + y0) * rowStride;
+        if (direct) rows = out + ((size_t)(z - z0) * bh + y0) * rowStride;
         else { tmp.resize((size_t)(y1 - y0) * rowStride); rows = tmp.data(); }
         LatteAddrLib::CachedSurfaceAddrInfo ci;
         if (macro) LatteAddrLib::SetupCachedSurfaceAddrInfo(&ci, z, 0, bpp, pitch, height, slices, 1, tm, false, pipeSwizzle, bankSwizzle);
@@ -1955,7 +2017,7 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, uint8_t* out
         if (!direct)
             for (uint32_t y = y0; y < y1; y++) {
                 const uint8_t* row = rows + (size_t)(y - y0) * rowStride;
-                uint8_t* dst = out + ((size_t)z * bh + y) * outRow;
+                uint8_t* dst = out + ((size_t)(z - z0) * bh + y) * outRow;
                 if (f.convert == Convert::NONE) memcpy(dst, row, rowStride);
                 else convert_row(f.convert, row, dst, bw);
             }
@@ -1987,40 +2049,132 @@ double g_stat_hash_ms, g_stat_decode_ms;
 uint64_t g_stat_pass_splits;
 static double ms_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// every byte of every level the upload reads
+// bytes hashed (both kinds of check)
 uint64_t g_stat_hashed_bytes;
-static uint64_t content_hash_of(const std::vector<std::pair<uint32_t, uint32_t>>& ranges, uint64_t total) {
-    static const bool serial = getenv("WWHD_SERIAL_DECODE") != nullptr;
-    if (total < (4u << 20) || serial) {
-        uint64_t h = 0;
-        for (auto& [a, n] : ranges) h = XXH3_64bits_withSeed(mem::ptr(a), n, h);
-        return h;
-    }
-    // large textures: 1 MiB chunks hashed on all cores, then the chunk hashes (a surface's ranges
-    // never change, so it is always hashed the same way)
-    struct Chunk { uint32_t addr, size; };
-    std::vector<Chunk> chunks;
-    for (auto& [a, n] : ranges)
-        for (uint64_t o = 0; o < n; o += 1u << 20) chunks.push_back({(uint32_t)(a + o), (uint32_t)std::min<uint64_t>(1u << 20, n - o)});
-    std::vector<uint64_t> hs(chunks.size());
-    uint64_t* out = hs.data();
-    const Chunk* in = chunks.data();
-    dispatch_apply(chunks.size(), DISPATCH_APPLY_AUTO, ^(size_t i) { out[i] = XXH3_64bits(mem::ptr(in[i].addr), in[i].size); });
-    return XXH3_64bits(hs.data(), hs.size() * sizeof(uint64_t));
-}
-static uint64_t content_hash(Surface* s) {
-    const auto& ranges = level_ranges(s);
-    uint64_t total = 0;
-    for (auto& r : ranges) total += r.second;
-    g_stat_hashed_bytes += total;
-    g_tex_hashed_all += total;
-    s->cc.bytes += total;
-    const auto t0 = std::chrono::steady_clock::now();
-    const uint64_t h = content_hash_of(ranges, total);
+static uint64_t xxh(const void* p, size_t n) { return XXH3_64bits(p, n); }
+static void note_hash(Surface* s, uint64_t bytes, std::chrono::steady_clock::time_point t0) {
     const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    g_stat_hashed_bytes += bytes;
+    g_tex_hashed_all += bytes;
+    s->cc.bytes += bytes;
     g_tex_hash_ns_all += ns;
     g_stat_hash_ms += ns / 1e6;
+}
+
+// Every byte of every level the upload reads, by chunks (texture_pieces.h), after the check's arm: the
+// content hash, and the next partial check's baseline. Large textures: groups of 16 chunks (up to 1 MiB)
+// hashed on all cores (a surface's chunks never change, so it is always hashed the same way).
+static uint64_t content_hash(Surface* s) {
+    texpieces::Table& t = piece_table(s);
+    const auto t0 = std::chrono::steady_clock::now();
+    static const bool serial = getenv("WWHD_SERIAL_DECODE") != nullptr;
+    const uint8_t* mem = mem::ptr(0);
+    const size_t n = t.chunks.size();
+    if (t.bytes < (4u << 20) || serial) {
+        texpieces::hash_chunks(t, mem, 0, n, xxh);
+    } else {
+        constexpr size_t kGroup = 16;
+        texpieces::Table* tp = &t;
+        dispatch_apply((n + kGroup - 1) / kGroup, DISPATCH_APPLY_AUTO,
+                       ^(size_t g) { texpieces::hash_chunks(*tp, mem, g * kGroup, std::min(n, (g + 1) * kGroup), xxh); });
+    }
+    const uint64_t h = texpieces::content(t, xxh);
+    texpieces::hashed(t, s->watch);
+    note_hash(s, t.bytes, t0);
     return h;
+}
+
+// debug: WWHD_VERIFY_PARTIAL=1 hashes every chunk again after each partial check. A chunk that changed with
+// no page written since the last arm is a write the page protection did not see (the partial check missed
+// it): logged, and its piece uploaded; one that changed with a page written since is a write racing the
+// check (the next check sees it). A summary every 600 frames ([partial-verify]).
+static void verify_partial(Surface* s, uint64_t since, std::vector<uint32_t>& changed) {
+    texpieces::Table& t = s->pieces;
+    static std::vector<uint64_t> now;  // render thread
+    now.resize(t.chunks.size());
+    for (size_t i = 0; i < t.chunks.size(); i++) now[i] = xxh(mem::ptr(t.chunks[i].addr), t.chunks[i].size);
+    g_verify_checks++;
+    g_verify_chunks += t.chunks.size();
+    for (uint32_t p = 0; p < (uint32_t)t.pieces.size(); p++) {
+        const texpieces::Piece& pc = t.pieces[p];
+        bool add = false;
+        for (uint32_t i = pc.chunk0; i < pc.chunk0 + pc.chunks; i++) {
+            if (now[i] == t.hashes[i]) continue;
+            const texpieces::Chunk& c = t.chunks[i];
+            const bool raced = wwatch::written_since(c.addr, c.size, since);
+            (raced ? g_verify_raced : g_verify_missed)++;
+            static int logged = 0;
+            if (!raced && logged++ < 100)
+                LOG("[partial-verify] frame %llu: %08X %ux%u x%u f%X tm%u mips %u (%s): level %u slices %u-%u, chunk %08X+%X changed with no page "
+                    "written since the last arm",
+                    (unsigned long long)R.frame, s->addr, s->width, s->height, s->slices, s->format, s->tileMode, s->mips,
+                    s->gpuWritten ? "GPU-written" : "CPU", pc.level, pc.z0, pc.z1, c.addr, c.size);
+            t.hashes[i] = now[i];
+            add = true;
+        }
+        if (add) {
+            auto at = std::lower_bound(changed.begin(), changed.end(), p);
+            if (at == changed.end() || *at != p) changed.insert(at, p);
+        }
+    }
+}
+
+// A check after writes to the armed pages (texture_pieces.h partial_ok): the chunks with a page written
+// since the last arm, re-hashed after this check's arm; the pieces with a changed chunk are appended to
+// `changed`. Returns the content hash.
+static uint64_t written_hash(Surface* s, uint64_t since, std::vector<uint32_t>& changed) {
+    texpieces::Table& t = s->pieces;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t bytes = texpieces::rehash_written(t, mem::ptr(0), since, changed, xxh);
+    note_hash(s, bytes, t0);
+    if (g_verify_partial) verify_partial(s, since, changed);  // not counted as hashing
+    const uint64_t h = texpieces::content(t, xxh);
+    texpieces::hashed(t, s->watch);
+    g_stat_partial_checks++;
+    g_tex_partial_all++;
+    s->cc.partial++;
+    return h;
+}
+
+static void note_upload(Surface* s, uint64_t bytes, double t1) {
+    const double ms = ms_now() - t1;
+    g_stat_decode_ms += ms;
+    g_tex_decode_ns_all += (uint64_t)(ms * 1e6);
+    g_tex_upload_bytes_all += bytes;
+    s->cc.upBytes += bytes;
+}
+
+// decodes slices [z0, z1) of a level into upload memory and encodes their copy into target (a 3D
+// texture's level whole); returns the bytes decoded
+static uint64_t upload_slices(Surface* s, id<MTLTexture> target, id<MTLBlitCommandEncoder> blit, uint32_t level, uint32_t z0, uint32_t z1) {
+    const FormatInfo& f = s->fmt;
+    uint32_t w, h, slices, bw, bh;
+    level_dims(s, level, w, h, slices, bw, bh);
+    const bool is3D = target.textureType == MTLTextureType3D;
+    if (is3D) z0 = 0, z1 = slices;
+    z1 = std::min(z1, slices);
+    if (z0 >= z1) return 0;
+    const uint32_t perSlice = bw * bh * f.hostBytesPerBlock;
+    // decode straight into upload-pool memory the blit reads (no temporary copy, no new buffer)
+    uint32_t stagingOffset = 0;
+    uint8_t* dst = nullptr;
+    id<MTLBuffer> staging = upload_reserve((uint32_t)((size_t)perSlice * (z1 - z0)), &stagingOffset, &dst);
+    decode_level(s, level, s->levelRanges[level].first, dst, z0, z1);
+    const uint32_t layers = (uint32_t)layer_count(target);
+    const MTLSize size = MTLSizeMake(f.compressed ? std::min<NSUInteger>(bw * 4, std::max<NSUInteger>(target.width >> level, 1)) : w,
+                                     f.compressed ? std::min<NSUInteger>(bh * 4, std::max<NSUInteger>(target.height >> level, 1)) : h,
+                                     is3D ? slices : 1);
+    for (uint32_t z = z0; z < (is3D ? 1u : std::min(z1, layers)); z++)
+        [blit copyFromBuffer:staging
+                 sourceOffset:stagingOffset + (NSUInteger)(z - z0) * perSlice
+            sourceBytesPerRow:bw * f.hostBytesPerBlock
+          sourceBytesPerImage:perSlice
+                   sourceSize:size
+                    toTexture:target
+             destinationSlice:z
+             destinationLevel:level
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+    return (uint64_t)perSlice * (z1 - z0);
 }
 
 void upload_surface(Surface* s) {
@@ -2057,32 +2211,8 @@ void upload_surface(Surface* s) {
         if (!target) return;
     }
     id<MTLBlitCommandEncoder> blit = TIMED_BLIT();
-    for (uint32_t level = 0; level < (scaled ? 1u : (uint32_t)ranges.size()); level++) {
-        uint32_t base = ranges[level].first;
-        uint32_t w, h, slices, bw, bh;
-        level_dims(s, level, w, h, slices, bw, bh);
-        // decode straight into upload-pool memory the blit reads (no temporary copy, no new buffer)
-        uint32_t stagingOffset = 0;
-        uint8_t* dst = nullptr;
-        id<MTLBuffer> staging = upload_reserve((uint32_t)((size_t)bw * bh * slices * f.hostBytesPerBlock), &stagingOffset, &dst);
-        decode_level(s, level, base, dst);
-        bool is3D = target.textureType == MTLTextureType3D;
-        uint32_t layers = (uint32_t)layer_count(target);
-        uint32_t perSlice = bw * bh * f.hostBytesPerBlock;
-        for (uint32_t z = 0; z < (is3D ? 1 : std::min(slices, layers)); z++) {
-            [blit copyFromBuffer:staging
-                     sourceOffset:stagingOffset + (NSUInteger)z * perSlice
-                sourceBytesPerRow:bw * f.hostBytesPerBlock
-              sourceBytesPerImage:perSlice
-                       sourceSize:MTLSizeMake(f.compressed ? std::min<NSUInteger>(bw * 4, std::max<NSUInteger>(target.width >> level, 1)) : w,
-                                              f.compressed ? std::min<NSUInteger>(bh * 4, std::max<NSUInteger>(target.height >> level, 1)) : h,
-                                              is3D ? slices : 1)
-                        toTexture:target
-                 destinationSlice:z
-                 destinationLevel:level
-                destinationOrigin:MTLOriginMake(0, 0, 0)];
-        }
-    }
+    uint64_t bytes = 0;
+    for (uint32_t level = 0; level < (scaled ? 1u : (uint32_t)ranges.size()); level++) bytes += upload_slices(s, target, blit, level, 0, ~0u);
     [blit endEncoding];
     if (scaled)
         for (uint32_t z = 0; z < std::min<uint32_t>(s->slices, (uint32_t)layer_count(s->tex)); z++) {
@@ -2094,7 +2224,31 @@ void upload_surface(Surface* s) {
             resample(sv, dv, f, 1);
             g_resample_why = nullptr;
         }
-    g_stat_decode_ms += ms_now() - t1;
+    note_upload(s, bytes, t1);
+}
+
+// A check after writes that may hash only what was written (check_texture): the chunks written are
+// hashed again and the pieces with a changed chunk uploaded, consecutive slices of a level together;
+// the rest of the texture keeps what earlier uploads put there, which is what guest memory still holds.
+static void update_written(Surface* s, uint64_t since) {
+    static std::vector<uint32_t> changed;  // render thread
+    changed.clear();
+    s->contentHash = written_hash(s, since, changed);
+    if (changed.empty()) return;
+    s->writeSeq = next_write_seq();  // fresh CPU data is now the newest version of this memory
+    g_stat_uploads++;
+    g_tex_uploads_all++;
+    g_tex_pieces_all += changed.size();
+    s->cc.pieces += (uint32_t)changed.size();
+    if (enc_pass_open()) g_stat_pass_splits++;  // an upload in the middle of a render pass ends it
+    end_encoder();
+    note_tex_write(s);
+    const double t1 = ms_now();
+    id<MTLBlitCommandEncoder> blit = TIMED_BLIT();
+    uint64_t bytes = 0;
+    texpieces::for_runs(s->pieces, changed, [&](uint32_t level, uint32_t z0, uint32_t z1) { bytes += upload_slices(s, s->tex, blit, level, z0, z1); });
+    [blit endEncoding];
+    note_upload(s, bytes, t1);
 }
 
 // ---------------------------------------------------------------- GX2CopySurface

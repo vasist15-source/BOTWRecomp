@@ -89,6 +89,8 @@ struct Check {
     bool became = false;    // became dynamic at this check
     uint32_t pages = 0;     // written: pages written since the last arm
     uint32_t edges = 0;     // ... how many of them are a range's first or last page
+    uint64_t since = 0;     // the stamp of the arm the last check left (0: new, or left unarmed); what a
+                            // partial update (texture_pieces.h) re-hashes was written since it
 };
 
 // One check of a texture whose guest memory is `ranges` ((address, size) pairs). force: hash whatever
@@ -103,6 +105,7 @@ Check check(Watch& w, const Ranges& ranges, uint64_t frame, bool force, bool on)
     Check c;
     c.forced = force;
     if (w.stamp && !w.unarmed) {  // armed at the last check (a stamp is never 0)
+        c.since = w.stamp;
         if (!force) {
             for (auto& [a, n] : ranges)
                 if (wwatch::written_since(a, n, w.stamp)) {

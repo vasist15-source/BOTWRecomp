@@ -536,6 +536,45 @@ the kept installer copy have not been played yet. The release build is installed
   (33-83 times in 10 s while moving; texture hash 48-262 ms and decode+upload 58-258 ms per 300 frames). Re-hashing and
   re-uploading only the slices and levels whose pages were written would remove most of that.
 
+### 2026-11-08: Metal: partial texture updates (only what was written is hashed and uploaded)
+- A check caused by writes to a texture's armed pages hashed every byte of the texture, and a change re-decoded and
+  re-uploaded all of it. While the player moved at Hateno the terrain array AC455000 (1024x1024 x83 BC1 sRGB, 11 levels)
+  had 33-83 such checks per 10 s, each one a change: 63 MiB hashed and uploaded every time (texture hash 48-262 ms and
+  decode+upload 58-258 ms per 300 frames).
+- Pieces (`gfx/texture_pieces.h`): one per slice of each level where a level's slices are separate ranges of guest memory
+  (2D arrays and cube maps in thin tile modes), else one per level (3D textures; thick tile modes interleave 4 slices);
+  each hashed in chunks (its bytes in each 64 KiB-aligned block), the content hash being the hash of the chunk hashes. A
+  check after writes (not forced, armed before and after it, `Check::since` the last arm's stamp, the chunk hashes taken
+  after that arm) re-hashes only the chunks with a page stamped since, read after the new arm, and decodes and blits only
+  the pieces with a changed chunk, consecutive slices of a level together (`decode_level` takes a slice range). First
+  looks, forced checks (dirty, CopySurface, save states), unarmed (dynamic), scaled and rescaled textures and new level
+  ranges keep the full path. GPU-written surfaces' checks (`check_cpu_overwrite`) hash only the chunks written too.
+- Layout (`gfx/texture_pieces_layout.h`: the level ranges as before, slices from Cemu's address library): what follows a
+  level's last slice is no longer hashed. The terrain array's levels 1-10 are laid out for 128 slices (7.6 MiB of its
+  63.1 MiB is padding after the 83rd slice), and that padding is where the game's writes land: in the A/B's full windows
+  its 24-64 write checks per 10 s never found a change, so its 63 MiB re-uploads are gone in both modes (decode+upload
+  while moving 0-9 ms per 300 frames, against 58-258 in the run before; across runs).
+- Measured at Hateno, 1.5x, 60 fps, riding and walking, in-run A/B (`WWHD_PARTIAL_AB=1`, 24 windows of 10 s after
+  loading, each against its two neighbours): bytes hashed 7.43 -> 2.53 MiB a frame, hashing time 0.142 -> 0.079 ms a
+  frame (se 0.004), process CPU -3.3 points (se 1.5; 209 -> 207 %), frame time, render thread and GPU busy unchanged
+  (+0.13, +0.15, +0.08 ms; se 0.18, 0.13, 0.18), no frame over 45 ms in either mode. The two GPU-written surfaces whose
+  edge page holds data the game writes every frame (42843000, 42A7F800): 150-165 -> 30-36 MiB hashed per window.
+  Partial windows uploaded fewer textures (0.34 against 0.50 a frame, the full windows' extra in bursts mid-window), so a
+  verification run followed (`WWHD_VERIFY_PARTIAL=1`, every partial check against a hash of every chunk, 4 minutes at
+  Hateno): 70,885 partial checks, 1.83 M chunks hashed again, no missed change and no racing write. No wrong or stale
+  textures were reported.
+- Switches: `WWHD_TEX_PARTIAL=0` (off), `WWHD_PARTIAL_AB=1` (`[partial-ab]` lines: CPU, frame time, render thread, GPU
+  busy, checks after writes, those that were partial, pieces uploaded, bytes hashed and hashing time, uploads, bytes
+  decoded and uploaded and that time, write faults, frames over 25 and 45 ms, the longest; then a `[texchurn]` report of
+  the 8 costliest surfaces, which now shows partial checks, pieces and MiB uploaded), `WWHD_VERIFY_PARTIAL=1`
+  (`[partial-verify]`). The 300-frame `[gfx]` line adds partial checks. Test: `texture_pieces` (every block the decode
+  reads inside its piece, for 27 layouts with the terrain array; a cache over real page protection with the game's write
+  patterns, partial on, off and switched: never stale, exactly the changed pieces uploaded; the terrain array at full
+  size; a racing writer with host writes). Not measured at 2x.
+- Not changed: 42917A00 (the 512x512 linear render target written back every frame) is still hashed in full each frame
+  after our own write-back; hashing the bytes we write back would need a write-back that keeps its pages armed, and a
+  game write in between would go unseen.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
