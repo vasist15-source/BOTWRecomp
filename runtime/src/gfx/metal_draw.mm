@@ -241,8 +241,24 @@ struct ProgramHash {
 };
 static std::unordered_map<uint32_t, ProgramHash> g_program_hashes;
 static ProgramHash* g_program_hash_last = nullptr;  // the entry of the latest program_hash call
+// rt_trim_on: the entries of recent programs by address, in front of the map (a lookup there cost a modulo by
+// its prime bucket count and a walk of the bucket). Entries are never erased, so a kept pointer stays good.
+static uint32_t g_program_memo_addr[1024];
+static ProgramHash* g_program_memo[1024];
 static uint64_t program_hash(uint32_t addr, uint32_t size) {
-    auto& e = g_program_hashes[addr];
+    ProgramHash* ep;
+    if (rt_trim_on()) {
+        const uint32_t slot = ((addr >> 8) * 0x9E3779B1u) >> 22;
+        ep = g_program_memo[slot];
+        if (!ep || g_program_memo_addr[slot] != addr) {
+            ep = &g_program_hashes[addr];
+            g_program_memo_addr[slot] = addr;
+            g_program_memo[slot] = ep;
+        }
+    } else {
+        ep = &g_program_hashes[addr];
+    }
+    auto& e = *ep;
     g_program_hash_last = &e;
     if (e.size != size || e.frame != R.frame) {
         e.size = size;
@@ -902,14 +918,23 @@ static dispatch_queue_t pipeline_queue() {  // pipeline builds: issued after tra
     return q;
 }
 
+// shader lookups of each stage ([0] vertex, [1] pixel) since the start: the generation's fast path, full
+// lookups, and full lookups that found the previous draw's shader again (a finer generation would have
+// skipped those). Render thread; read by the [rt-ab] lines and the 300-frame [gfx] line.
+static ShaderLookups g_shader_lookups{};
+ShaderLookups shader_lookups() { return g_shader_lookups; }
+void rt_trim_applied(bool on) { rprof::g_inline_ops = on; }
+
 static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
     // nothing shader-relevant changed since the previous draw: same shader. The draw sets the
     // primitive type without a register write (no generation bump); vertex keys read it (points, rects)
     struct Last { uint64_t gen = 0, frame = ~0ull, fsKey = 0; uint32_t prim = 0; Shader* s = nullptr; };
     static Last last[2];
     Last& L = last[vertex ? 0 : 1];
+    const int stage = vertex ? 0 : 1;
     const uint32_t prim = vertex ? regs[REGADDR::VGT_PRIMITIVE_TYPE] & 0x3F : 0;
     if (L.gen == g_shader_state_gen && L.frame == R.frame && (!vertex || (L.fsKey == fsKey && L.prim == prim))) {
+        g_shader_lookups.fast[stage]++;
         // debug: WWHD_VERIFY_SHADER_GEN=1 recomputes the lookup anyway and logs a register filter that missed a change
         static const bool verify = getenv("WWHD_VERIFY_SHADER_GEN") != nullptr;
         if (verify) {
@@ -922,6 +947,8 @@ static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* f
         return L.s;
     }
     Shader* s = get_shader_uncached(regs, vertex, fs, fsKey);
+    g_shader_lookups.full[stage]++;
+    g_shader_lookups.same[stage] += s && s == L.s;
     L = Last{g_shader_state_gen, R.frame, fsKey, prim, s};
     return s;
 }
@@ -1921,6 +1948,13 @@ static id<MTLDepthStencilState> get_depth_state(const uint32_t* regs, bool hasDe
 }
 
 // ---------------------------------------------------------------- samplers and textures
+// bind_stage's trimmed instantiation (rt_trim_on) passes what it binds unretained: the caches that hand them out
+// (texture views, samplers, the guest buffers) hold them, and q_texture / q_sampler / q_buffer retain what they
+// queue. A strong reference took a retain and a release per object, plus one for each inlined parameter copy
+// (0.3 ms a frame of the render thread in a town).
+template <bool U> using TexRef = std::conditional_t<U, __unsafe_unretained id<MTLTexture>, __strong id<MTLTexture>>;
+template <bool U> using SmpRef = std::conditional_t<U, __unsafe_unretained id<MTLSamplerState>, __strong id<MTLSamplerState>>;
+template <bool U> using BufRef = std::conditional_t<U, __unsafe_unretained id<MTLBuffer>, __strong id<MTLBuffer>>;
 static std::unordered_map<uint64_t, id<MTLSamplerState>> g_samplers;
 
 static MTLSamplerAddressMode address_mode(uint32_t c) {
@@ -1942,11 +1976,12 @@ void set_aniso(bool v) { g_aniso = v; LOG("[gfx] anisotropic filtering %s", v ? 
 // allowAniso: the bound texture is a real mipmapped asset (not a buffer the GPU rendered); the game also
 // reads its screen-sized lighting/occlusion buffers through mip-filtering samplers, and anisotropy there
 // blurs the screen-space effects
-static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = false) {
+// (the cache's own reference, unretained: bind_stage's trimmed path takes it without an autoreleased return)
+__attribute__((always_inline)) static inline void* get_sampler_ptr(const uint32_t* w, bool allowAniso) {
     const bool g_aniso_force = allowAniso && aniso_enabled();
     uint64_t h = hash_bytes(w, 12) ^ (g_aniso_force ? 0x5A5A5A5A5A5A5A5Aull : 0);
     auto it = g_samplers.find(h);
-    if (it != g_samplers.end()) return it->second;
+    if (it != g_samplers.end()) return (__bridge void*)it->second;
     LATTE_SQ_TEX_SAMPLER_WORD0_0 w0;
     LATTE_SQ_TEX_SAMPLER_WORD1_0 w1;
     memcpy(&w0, &w[0], 4);
@@ -1976,7 +2011,10 @@ static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = fals
     d.supportArgumentBuffers = YES;  // texture bindings 16 and up take their sampler from an argument buffer
     id<MTLSamplerState> s = [R.device newSamplerStateWithDescriptor:d];
     g_samplers[h] = s;
-    return s;
+    return (__bridge void*)s;
+}
+static id<MTLSamplerState> get_sampler(const uint32_t* w, bool allowAniso = false) {
+    return (__bridge id<MTLSamplerState>)get_sampler_ptr(w, allowAniso);
 }
 
 // the type the translated shader declares for a texture unit of this dimension. Cube maps are declared
@@ -1993,10 +2031,10 @@ static MTLTextureType texture_type_for_dim(Latte::E_DIM dim) {
     }
 }
 
-static id<MTLTexture> null_texture(MTLTextureType type) {
+__attribute__((always_inline)) static inline void* null_texture_ptr(MTLTextureType type) {  // (the cache's reference, unretained)
     static std::unordered_map<int, id<MTLTexture>> cache;
     auto it = cache.find((int)type);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) return (__bridge void*)it->second;
     MTLTextureDescriptor* d = [MTLTextureDescriptor new];
     d.textureType = type;
     d.pixelFormat = MTLPixelFormatRGBA8Unorm;
@@ -2010,24 +2048,26 @@ static id<MTLTexture> null_texture(MTLTextureType type) {
     for (NSUInteger i = 0; i < layer_count(t); i++)
         [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:i withBytes:&zero bytesPerRow:4 bytesPerImage:4];
     cache[(int)type] = t;
-    return t;
+    return (__bridge void*)t;
 }
+static id<MTLTexture> null_texture(MTLTextureType type) { return (__bridge id<MTLTexture>)null_texture_ptr(type); }
 
 // texture view with the shader's expected type and the resource's component swizzle
 static std::unordered_map<uint64_t, id<MTLTexture>> g_views;
 void forget_texture_views() { g_views.clear(); }
 
 // a host view of a cache view: its mips and slices, the requested texture type and the component swizzle
-static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t word4) {
+template <bool U = false>  // U: the surface's texture taken unretained (bind_stage's trimmed path)
+__attribute__((always_inline)) static inline void* texture_view_ptr(TexView* tv, MTLTextureType type, uint32_t word4) {  // (g_views' reference, unretained)
     Surface* s = tv->tex;
     LATTE_SQ_TEX_RESOURCE_WORD4_N w4;
     memcpy(&w4, &word4, 4);
     uint32_t sel[4] = {(uint32_t)w4.get_DST_SEL_X(), (uint32_t)w4.get_DST_SEL_Y(), (uint32_t)w4.get_DST_SEL_Z(), (uint32_t)w4.get_DST_SEL_W()};
-    id<MTLTexture> base = s->tex;
+    TexRef<U> base = s->tex;
     uint64_t key = (uint64_t)(uintptr_t)tv * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)(__bridge void*)base ^ ((uint64_t)type << 56) ^
                    ((uint64_t)(sel[0] | sel[1] << 4 | sel[2] << 8 | sel[3] << 12) << 40);
     auto it = g_views.find(key);
-    if (it != g_views.end()) return it->second;
+    if (it != g_views.end()) return (__bridge void*)it->second;
     static const MTLTextureSwizzle sw[8] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha,
                                             MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleZero, MTLTextureSwizzleZero};
     MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(sw[sel[0]], sw[sel[1]], sw[sel[2]], sw[sel[3]]);
@@ -2045,8 +2085,8 @@ static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t wo
     if ((type == MTLTextureType2D || type == MTLTextureType1D) && slices > 1) slices = 1;
     if (type == MTLTextureType1D && base.textureType != MTLTextureType1D && base.textureType != MTLTextureType1DArray) type = MTLTextureType2D;
     if (type == MTLTextureType2D && (base.textureType == MTLTextureType1D || base.textureType == MTLTextureType1DArray)) type = MTLTextureType1D;
-    if (type == MTLTextureType3D && base.textureType != MTLTextureType3D) { g_views[key] = nil; return nil; }
-    if (base.textureType == MTLTextureType3D && type != MTLTextureType3D) { g_views[key] = nil; return nil; }
+    if (type == MTLTextureType3D && base.textureType != MTLTextureType3D) { g_views[key] = nil; return nullptr; }
+    if (base.textureType == MTLTextureType3D && type != MTLTextureType3D) { g_views[key] = nil; return nullptr; }
     id<MTLTexture> v;
     if (s->fmt.depth) {
         // depth formats can't be swizzled; samplers read .x
@@ -2064,7 +2104,10 @@ static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t wo
                 (unsigned long)numMip, (unsigned long)firstSlice, (unsigned long)slices);
     }
     g_views[key] = v;
-    return v;
+    return (__bridge void*)v;
+}
+static id<MTLTexture> texture_view(TexView* tv, MTLTextureType type, uint32_t word4) {
+    return (__bridge id<MTLTexture>)texture_view_ptr(tv, type, word4);
 }
 
 // WWHD_SNAPSHOT=1 copies uniform blocks and small vertex buffers at draw time instead of reading
@@ -2125,7 +2168,17 @@ static inline void bc_sync() {
     memset(g_bc.smp, 0, sizeof g_bc.smp);
     memset(g_bc.buf, 0, sizeof g_bc.buf);
 }
-static inline void bc_texture(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLTexture> tex, uint32_t i) {
+// guest_buffer without the autorelease hand-off of its result (R.guest holds the buffers)
+static inline void* guest_buffer_raw(uint32_t addr, uint32_t* offset) {
+    for (auto& g : R.guest)
+        if (addr - g.base < g.size) {
+            *offset = addr - g.base;
+            return (__bridge void*)g.buf;
+        }
+    return nullptr;
+}
+template <bool U = false>
+static inline void bc_texture(id<MTLRenderCommandEncoder> enc, bool vertex, TexRef<U> tex, uint32_t i) {
     if (i < BindCache::kSlots) {
         const void* p = (__bridge const void*)tex;
         if (g_bc.tex[!vertex][i] == p) return;
@@ -2133,7 +2186,8 @@ static inline void bc_texture(id<MTLRenderCommandEncoder> enc, bool vertex, id<M
     }
     q_texture(vertex, tex, i);
 }
-static inline void bc_sampler(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLSamplerState> smp, uint32_t i) {
+template <bool U = false>
+static inline void bc_sampler(id<MTLRenderCommandEncoder> enc, bool vertex, SmpRef<U> smp, uint32_t i) {
     if (i < 16) {
         const void* p = (__bridge const void*)smp;
         if (g_bc.smp[!vertex][i] == p) return;
@@ -2141,7 +2195,8 @@ static inline void bc_sampler(id<MTLRenderCommandEncoder> enc, bool vertex, id<M
     }
     q_sampler(vertex, smp, i);
 }
-static inline void bc_buffer(id<MTLRenderCommandEncoder> enc, bool vertex, id<MTLBuffer> buf, NSUInteger off, uint32_t i) {
+template <bool U = false>
+static inline void bc_buffer(id<MTLRenderCommandEncoder> enc, bool vertex, BufRef<U> buf, NSUInteger off, uint32_t i) {
     if (i < BindCache::kSlots) {
         const void* p = (__bridge const void*)buf;
         if (g_bc.buf[!vertex][i] == p) {
@@ -2194,7 +2249,8 @@ static bool lod_bias_on() {
     return on;
 }
 
-static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
+template <bool U>
+static void bind_stage_t(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
     LatteDecompilerShader* dec = sh->dec;
     float texScale[18][2];
     for (auto& t : texScale) t[0] = t[1] = 1.0f;
@@ -2216,7 +2272,9 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         TexView* tv = unit < 18 && g_unit_tex_valid[vertex ? 0 : 1][unit] ? g_unit_tex[vertex ? 0 : 1][unit]
                                                                          : sampled_texture(tw, dec->textureUsesDepthCompare[unit]);
         Surface* s = tv ? tv->tex : nullptr;
-        id<MTLTexture> tex = s && s->tex ? texture_view(tv, type, tw[4]) : nil;
+        TexRef<U> tex = nil;
+        if constexpr (U) tex = s && s->tex ? (__bridge id<MTLTexture>)texture_view_ptr<true>(tv, type, tw[4]) : nil;
+        else tex = s && s->tex ? texture_view(tv, type, tw[4]) : nil;
         if (s && unit < 18) { texScale[unit][0] = s->sx; texScale[unit][1] = s->sy; }
         uint32_t samplerIdx = dec->textureUnitSamplerAssignment[unit];
         if (capturing() && s && (vertex || (s->gpuWritten && s->slices > 1))) capture_full(s);
@@ -2242,9 +2300,12 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             snprintf(what, sizeof what, "read by %s %08X tex%u", vertex ? "VS" : "PS", regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8, unit);
             g_probe_reads.push_back({s, tv->firstSlice, tv->firstMip, what});
         }
-        if (!tex) tex = null_texture(type);
+        if constexpr (U) { if (!tex) tex = (__bridge id<MTLTexture>)null_texture_ptr(type); }
+        else { if (!tex) tex = null_texture(type); }
         const uint32_t* sw = &regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3];
-        id<MTLSamplerState> smp = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
+        SmpRef<U> smp = nil;
+        if constexpr (U) smp = (__bridge id<MTLSamplerState>)get_sampler_ptr(sw, s && !s->gpuWritten && s->mips > 1);
+        else smp = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
         // WWHD_LOD_BIAS_LOG=1: each distinct texture/sampler pair with a LOD bias, once (gfx/sampler_lod_bias.h)
         static const bool logBias = getenv("WWHD_LOD_BIAS_LOG") != nullptr;
         if (logBias && gfx::sampler_lod_bias::raw(sw[1]) != 0) {
@@ -2264,8 +2325,8 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             extraCount = std::max<uint32_t>(extraCount, binding - MAX_MTL_SAMPLERS + 1);
             smp = nil;
         }
-        bc_texture(enc, vertex, tex, binding);
-        if (smp) bc_sampler(enc, vertex, smp, binding);
+        bc_texture<U>(enc, vertex, tex, binding);
+        if (smp) bc_sampler<U>(enc, vertex, smp, binding);
     }
     if (extraCount) {
         Upload u = upload(extraSamplers, (uint32_t)sizeof extraSamplers);
@@ -2377,7 +2438,9 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
         uint32_t addr = regs[blockBase + i * 7];
         uint32_t size = std::min<uint32_t>(regs[blockBase + i * 7 + 1] + 1, 0x10000);
         uint32_t off = 0;
-        id<MTLBuffer> gb = addr ? guest_buffer(addr, &off) : nil;
+        BufRef<U> gb = nil;
+        if constexpr (U) gb = addr ? (__bridge id<MTLBuffer>)guest_buffer_raw(addr, &off) : nil;
+        else gb = addr ? guest_buffer(addr, &off) : nil;
         DLOG("[draw]   %s ub%d %08X size %X", vertex ? "VS" : "PS", i, addr, size);
         if (!gb) continue;
         // capture: the contents of the blocks of some programs (WWHD_UB_DUMP=<program address>[,...], e.g. 3C599B00)
@@ -2398,9 +2461,13 @@ static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Sh
             Upload u = upload(mem::ptr(addr), size);
             bc_buffer(enc, vertex, u.buf, u.offset, binding);
         } else {
-            bc_buffer(enc, vertex, gb, off, binding);
+            bc_buffer<U>(enc, vertex, gb, off, binding);
         }
     }
+}
+static void bind_stage(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors) {
+    if (rt_trim_on()) bind_stage_t<true>(enc, regs, sh, vertex, colors);
+    else bind_stage_t<false>(enc, regs, sh, vertex, colors);
 }
 
 // ---------------------------------------------------------------- render pass

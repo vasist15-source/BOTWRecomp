@@ -662,6 +662,37 @@ the kept installer copy have not been played yet. The release build is installed
   playing) have nothing to stand against. Not done, and not needed at this count: warming only recently used
   pipelines, setting state at draw time, a pipeline binary archive (5,987 pipelines build in 4.7 s).
 
+### 2026-11-10: Metal: render thread per-draw trims (-0.70 ms/frame of render thread CPU)
+- From the Time Profiler run of 2026-11-10 (town, 1.5x, 60 fps; render thread 7.0 ms/frame for ~4,200 draws): what
+  the render thread spent outside real work.
+  - Target scale rules: every bind of a target walked the rule list and looked up the graphic pack's `$shadowRes` by
+    string (0.33 ms/frame). Now worked out once per surface (`Surface::rules`, checked against the size, format,
+    layers, levels and tile mode they read); the pack value is read once (packs are fixed at launch). The factors
+    themselves (internal resolution, dynamic resolution, aspect ratio) are still read at every call. A one-time check
+    per surface compares the cached answer with the old path and logs `[gfx] target rules differ` (none in the run).
+  - `bind_stage` retained and released every texture, sampler and uniform buffer it bound, twice with the inlined
+    bind-cache calls (objc_retain/release 0.3 ms/frame). Its trimmed copy takes them unretained: the caches hold
+    them (texture views, samplers, guest buffers; `texture_view_ptr`, `get_sampler_ptr`, `null_texture_ptr`,
+    `guest_buffer_raw` return the cache's pointer without an autoreleased return) and `q_texture` / `q_sampler` /
+    `q_buffer` retain what they queue. No retain or release is left in its bind loop. `draw()`'s own (pipeline,
+    depth state, vertex buffers; 0.15 ms) are untouched.
+  - The render profiler's untimed op path is inline (`render_prof.h`), program hashes are found through a 1,024-slot
+    table in front of their map.
+- Measured at 1.5x, 60 fps, in and around a town, in-run A/B (`WWHD_RT_TRIM_AB=1`, 17 windows of 10 s after loading,
+  each against its two neighbours): render thread CPU 7.53 -> 6.92 ms/frame (-0.70, se 0.07; 1.68 -> 1.52 us per
+  draw, se 0.007), process CPU -1.6 points (se 0.6; 188 -> 187 %), frame time at the cap in both (-0.05 ms, se 0.02),
+  GPU busy -0.13 ms (se 0.03), no frame over 25 ms in either mode after loading. Standing at one spot (windows 13-20,
+  ~4,450 draws): 7.50 -> 6.69 ms. No rendering difference reported in the play-test.
+- Shader lookups (new counters, `[rt-ab]` and a 300-frame `[gfx]` line): per frame ~2,600 per stage took the
+  generation's fast path and ~1,900 a full lookup, so the fast path hits as before (4c5e11c did not change its
+  condition). Of the full lookups, 45 % (vertex) and 78 % (pixel) found the previous draw's shader again: the one
+  generation shared by both stages makes a vertex-only change look up the pixel shader too. Lead: a generation per
+  stage (VS-only: `SQ_PGM_START_VS`/`FS`, `SQ_VTX_SEMANTIC`, VS texture units; PS-only: `SQ_PGM_START_PS`, PS texture
+  units; Vulkan keeps the shared one).
+- Switches: `WWHD_RT_TRIM=0` (the old paths), `WWHD_RT_TRIM_AB=1` (`[rt-ab]` lines: CPU, frame time, render thread,
+  GPU busy, draws, shader lookups, frames over 25 and 45 ms). In the A/B's old half the old `bind_stage` is one
+  extra call per stage. Not measured at 2x. ctest: 125 of 135, the 10 known failures.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

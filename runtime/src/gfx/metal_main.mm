@@ -1258,6 +1258,11 @@ void pass_timing_arm(double lastFrameMs);
 //     one (one lock per kind of object, then a hash map), with the game threads' CPU time, cycles and
 //     instructions, lookups of each kind, those that took the table's lock and found it held, and OSMutex
 //     calls that found their object's lock held or waited for another thread.
+//   WWHD_RT_TRIM_AB=1 ([rt-ab]): the render thread's per-draw trims (rt_trim_on: target scale rules
+//     cached per surface, bind_stage without retain/release of what it binds, the profiler's untimed ops
+//     inline, program hashes found through a small table) or the old paths, with the shader lookups each
+//     stage made (the generation's fast path, full lookups, and those that found the previous draw's
+//     shader again).
 // Each line: process CPU, frame time, render thread CPU time, the encoding thread's busy time (executing
 // records) and CPU time (its waits included), GPU busy and the span from a frame's first GPU start to its
 // last end, command buffers and draws, how often the encoding thread was woken and slept, and the render
@@ -1267,6 +1272,9 @@ void pass_timing_arm(double lastFrameMs);
 // and the frames over 25 and 45 ms. An A/B in one run, like WWHD_LOD_BIAS=ab: a fanless Mac's heat drifts
 // too much between runs.
 static bool g_buffers_new = true;  // render thread
+// the render thread's per-draw trims (WWHD_RT_TRIM=0: off; WWHD_RT_TRIM_AB=1 alternates). Render thread only.
+static bool g_rt_trim = [] { const char* e = getenv("WWHD_RT_TRIM"); return !e || strcmp(e, "0") != 0; }();
+bool rt_trim_on() { return g_rt_trim; }
 bool buffers_share() { return g_buffers_new; }
 bool buffers_batch() { return g_buffers_new; }
 bool texture_churn_on();
@@ -1278,7 +1286,7 @@ extern uint64_t g_tex_checks_all, g_tex_gpu_checks_all, g_tex_unarmed_all, g_tex
     g_tex_hash_ns_all, g_tex_uploads_all;
 extern uint64_t g_tex_write_checks_all, g_tex_partial_all, g_tex_pieces_all, g_tex_upload_bytes_all, g_tex_decode_ns_all;
 static void ab_frame() {
-    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES, AB_PARTIAL, AB_LOOKUP };
+    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES, AB_PARTIAL, AB_LOOKUP, AB_RT_TRIM };
     static const int ab = [] {
         auto on = [](const char* name) { const char* e = getenv(name); return e && !strcmp(e, "1"); };
         return on("WWHD_ENCODE_AB")    ? AB_ENCODE
@@ -1286,6 +1294,7 @@ static void ab_frame() {
                : on("WWHD_TEXTURE_AB") ? AB_TEXTURES
                : on("WWHD_PARTIAL_AB") ? AB_PARTIAL
                : on("WWHD_LOOKUP_AB")  ? AB_LOOKUP
+               : on("WWHD_RT_TRIM_AB") ? AB_RT_TRIM
                                        : AB_NONE;
     }();
     if (ab == AB_NONE || (ab == AB_ENCODE && !g_eq)) return;
@@ -1309,6 +1318,7 @@ static void ab_frame() {
         uint64_t writeChecks, partial, pieces, upBytes, decodeNs;
         uint64_t guestNs, cycles, instructions;
         objtable::Counts lookups;
+        ShaderLookups shaders;
     };
     auto take = [] {
         Mark m;
@@ -1351,6 +1361,7 @@ static void ab_frame() {
         m.cycles = riOk ? ri.ri_cycles : 0;
         m.instructions = riOk ? ri.ri_instructions : 0;
         m.lookups = objtable::counts();
+        m.shaders = shader_lookups();
         return m;
     };
     static Mark start = take();
@@ -1410,6 +1421,23 @@ static void ab_frame() {
             (b.locked - a.locked) / frames, (b.lockWaits - a.lockWaits) / frames, (b.mutexWaits - a.mutexWaits) / frames,
             (b.mutexBlocks - a.mutexBlocks) / frames, over25, over45, longest, secs, ++window);
         objtable::set_locked(!objtable::locked());
+        over25 = over45 = 0;
+        longest = 0;
+        start = now;
+        return;
+    }
+    if (ab == AB_RT_TRIM) {
+        const ShaderLookups &a = start.shaders, &b = now.shaders;
+        auto per = [&](const uint64_t* x, const uint64_t* y, int k) { return (y[k] - x[k]) / frames; };
+        LOG("[rt-ab] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, GPU busy %.2f ms/frame, %.0f draws/frame; shader "
+            "lookups per frame: vertex %.0f fast, %.0f full (%.0f found the previous shader), pixel %.0f fast, %.0f full (%.0f); "
+            "%u frames over 25 ms, %u over 45 ms, longest %.0f ms (%.1f s, window %d)",
+            g_rt_trim ? "trimmed" : "old", 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames, 1000 * (now.rt - start.rt) / frames,
+            (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames, (now.draws - start.draws) / frames, per(a.fast, b.fast, 0),
+            per(a.full, b.full, 0), per(a.same, b.same, 0), per(a.fast, b.fast, 1), per(a.full, b.full, 1), per(a.same, b.same, 1),
+            over25, over45, longest, secs, ++window);
+        g_rt_trim = !g_rt_trim;
+        rt_trim_applied(g_rt_trim);
         over25 = over45 = 0;
         longest = 0;
         start = now;
@@ -1605,6 +1633,15 @@ void swap() {
             }
         }
         lastCpu = cpu;
+        {
+            static ShaderLookups last{};
+            const ShaderLookups n = shader_lookups();
+            auto per = [](uint64_t a, uint64_t b) { return (b - a) / 300.0; };
+            LOG("[gfx] last 300 frames: shader lookups/frame: vertex %.0f fast, %.0f full (%.0f found the previous shader), pixel %.0f "
+                "fast, %.0f full (%.0f)", per(last.fast[0], n.fast[0]), per(last.full[0], n.full[0]), per(last.same[0], n.same[0]),
+                per(last.fast[1], n.fast[1]), per(last.full[1], n.full[1]), per(last.same[1], n.same[1]));
+            last = n;
+        }
         enc_report();
         {
             uint64_t pool_chunks_made(), pool_bytes_made();  // metal_draw.mm
