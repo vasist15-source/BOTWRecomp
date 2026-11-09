@@ -113,6 +113,20 @@ struct Surface {
     float ax = 1.0f, ay = 1.0f;  // ... and the aspect-ratio factors (screen-shaped targets, metal_surfaces.mm)
     float sx = 1.0f, sy = 1.0f;
     float minScale = 0.0f;  // at least this factor: a depth buffer drawn with colour targets scaled more (match_depth_scale)
+    // what the target scale rules and the aspect ratio make of this surface (metal_surfaces.mm target_rules): they
+    // read only its size, format, layers, levels and tile mode, which it keeps, and settings fixed at launch, so
+    // they are worked out once instead of on every bind of a target (a linear walk of the rules and string
+    // lookups of the graphic pack's values: 0.33 ms a frame of the render thread in a town). The fields they
+    // were worked out from are kept with them and compared.
+    struct TargetRules {
+        uint32_t width = 0, height = 0, format = 0, slices = 0, mips = 0, tileMode = 0;
+        bool isDepth = false, compressed = false, valid = false;
+        uint8_t kind = 0;          // metal_surfaces.mm kRule*
+        bool extent = false;       // a Cemu pack's TextureRedefine gives its size (kx, ky)
+        bool screen = false;       // screen-shaped: takes the aspect ratio's factors
+        float kx = 1.0f, ky = 1.0f;
+    };
+    mutable TargetRules rules;
     // dynamic resolution (dynres.h): the factor of the internal resolution in `scale` (1: off, or a target
     // that keeps its size), a depth buffer that follows its colour targets' factor (match_depth_scale), and
     // textures of other recent scales kept for the next change (metal_surfaces.mm rescale)
@@ -245,6 +259,12 @@ id<MTLBuffer> guest_buffer(uint32_t addr, uint32_t* offset);
 // WWHD_BUFFER_AB A/B turns them off (render thread).
 bool buffers_share();
 bool buffers_batch();
+// the render thread's per-draw trims (metal_main.mm: WWHD_RT_TRIM=0 off, WWHD_RT_TRIM_AB=1 alternates). Render thread.
+bool rt_trim_on();
+void rt_trim_applied(bool on);  // metal_draw.mm: what follows the switch outside metal_main.mm (the profiler)
+// shader lookups of each stage ([0] vertex, [1] pixel) since the start (metal_draw.mm get_shader)
+struct ShaderLookups { uint64_t fast[2], full[2], same[2]; };
+ShaderLookups shader_lookups();
 struct PoolRetire;                 // the upload chunks a commit gives back
 PoolRetire* pool_take_used();      // render thread, at a commit (nullptr: nothing to give back)
 void pool_attach(id<MTLCommandBuffer> cmd, PoolRetire* r);  // given back when cmd completes (nil: now)

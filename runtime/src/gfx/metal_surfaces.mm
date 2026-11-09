@@ -139,6 +139,7 @@ static bool screen_shaped(const Surface* s) {
 // targets no rule scales and linear ones (the game reads them back: 1x1 probes, the 3x3 exposure, the
 // 8x8 ... 512x512 squares; none matches a rule today). *dyn: the dynamic factor in the result.
 static float target_scale_rules(const Surface* s, bool* follows = nullptr);
+static float target_scale_rules_old(const Surface* s, bool* follows);
 static float target_scale(const Surface* s, float* dyn = nullptr) {
     bool follows = false;
     const float base = std::max(target_scale_rules(s, &follows), s->minScale);
@@ -148,24 +149,50 @@ static float target_scale(const Surface* s, float* dyn = nullptr) {
     if (dyn) *dyn = d;
     return base * d;
 }
-static float target_scale_rules(const Surface* s, bool* follows) {
-    uint32_t width,height;
-    if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
-    if (s->fmt.compressed) return 1.0f;
+static float shadow_scale_env() {  // WWHD_SHADOW_SCALE (0: not set)
     static const float shadow = getenv("WWHD_SHADOW_SCALE") ? parse_scale(getenv("WWHD_SHADOW_SCALE")) : 0.0f;
     static const bool shadow_logged = [] {  // issue #67: show that the switch was picked up
         if (shadow) LOG("[gfx] WWHD_SHADOW_SCALE=%g: shadow maps at %gx the console's 1024x1024", shadow, shadow);
         return true;
     }();
     (void)shadow_logged;
+    return shadow;
+}
+// which targets follow the internal resolution: the sizes and formats of the BotW "Graphics" pack's
+// TextureRedefine rules (what Cemu scales; everything else keeps the console's size). Scaling every
+// target broke data targets the game reads by position (white water at 2x).
+// WWHD_SCALE_ALL_TARGETS=1: every target as before.
+struct TargetRule { uint16_t w, h; std::initializer_list<uint16_t> formats; bool notLinearAligned, shadow = false; };
+static const TargetRule* target_rule_table(size_t* n);
+static float target_scale_rules_old(const Surface* s, bool* follows) {
+    uint32_t width,height;
+    if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
+    if (s->fmt.compressed) return 1.0f;
+    const float shadow = shadow_scale_env();
     // the Graphics pack's Shadows option ($shadowRes; its default follows the internal resolution)
     const float packShadow = (float)graphic_packs::value("Graphics", "$shadowRes", res_scale());
     if (s->isDepth && s->slices > 1) return shadow ? shadow : packShadow;
-    // which targets follow the internal resolution: the sizes and formats of the BotW "Graphics" pack's
-    // TextureRedefine rules (what Cemu scales; everything else keeps the console's size). Scaling every
-    // target broke data targets the game reads by position (white water at 2x).
-    // WWHD_SCALE_ALL_TARGETS=1: every target as before.
-    struct Rule { uint16_t w, h; std::initializer_list<uint16_t> formats; bool notLinearAligned, shadow = false; };
+    static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
+    if (all) {
+        if (follows) *follows = true;
+        return res_scale();
+    }
+    size_t nRules;
+    const TargetRule* rules = target_rule_table(&nRules);
+    for (size_t i = 0; i < nRules; i++) {
+        const TargetRule& r = rules[i];
+        if (r.w != s->width || r.h != s->height) continue;
+        if (r.notLinearAligned && s->tileMode == 1) continue;  // tileModesExcluded = 0x001 (video playback)
+        for (uint16_t f : r.formats)
+            if (f == s->format) {
+                if (follows) *follows = !r.shadow;
+                return r.shadow ? (shadow ? shadow : packShadow) : res_scale();
+            }
+    }
+    return 1.0f;
+}
+static const TargetRule* target_rule_table(size_t* n) {
+    using Rule = TargetRule;
     static const Rule kRules[] = {
         {1280, 720, {0x001,0x005,0x007,0x019,0x01a,0x41a,0x80e,0x806,0x816,0x820}, true},
         {864, 480, {0x019}, false},
@@ -219,21 +246,75 @@ static float target_scale_rules(const Surface* s, bool* follows) {
         {384, 360, {0x005}, false, true},
         {360, 360, {0x005}, false, true},
     };
+    *n = sizeof kRules / sizeof kRules[0];
+    return kRules;
+}
+// What the rules make of a surface (Surface::rules), worked out on its first bind and again only if one of
+// the fields they read differs: kRuleOne keeps the console's size (*follows untouched), kRuleShadowArray
+// (the shadow cascades) and kRuleShadow (the pack's shadow-sized colour targets: *follows = false) take the
+// shadow factor, kRuleRes follows the internal resolution (*follows = true). The factors themselves are
+// read at each call: the internal resolution and the aspect ratio change while playing.
+enum : uint8_t { kRuleOne, kRuleShadowArray, kRuleShadow, kRuleRes };
+static bool screen_shaped(const Surface* s);
+static const Surface::TargetRules& target_rules(const Surface* s) {
+    Surface::TargetRules& r = s->rules;
+    if (r.valid && r.width == s->width && r.height == s->height && r.format == s->format && r.slices == s->slices && r.mips == s->mips &&
+        r.tileMode == s->tileMode && r.isDepth == s->isDepth && r.compressed == s->fmt.compressed)
+        return r;
+    r = Surface::TargetRules{};
+    r.width = s->width; r.height = s->height; r.format = s->format; r.slices = s->slices; r.mips = s->mips; r.tileMode = s->tileMode;
+    r.isDepth = s->isDepth; r.compressed = s->fmt.compressed; r.valid = true;
+    uint32_t width, height;
+    r.extent = !s->fmt.compressed && s->mips == 1 &&
+               mods::cemu::texture_extent(s->width, s->height, s->format, s->slices, s->tileMode, width, height);
+    if (r.extent) { r.kx = float(width) / s->width; r.ky = float(height) / s->height; }
+    r.screen = screen_shaped(s);
+    // as target_scale_rules_old decides it
     static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
-    if (all) {
+    r.kind = kRuleOne;
+    if (r.extent || s->fmt.compressed) return r;
+    if (s->isDepth && s->slices > 1) { r.kind = kRuleShadowArray; return r; }
+    if (all) { r.kind = kRuleRes; return r; }
+    size_t nRules;
+    const TargetRule* rules = target_rule_table(&nRules);
+    for (size_t i = 0; i < nRules && r.kind == kRuleOne; i++) {
+        const TargetRule& t = rules[i];
+        if (t.w != s->width || t.h != s->height) continue;
+        if (t.notLinearAligned && s->tileMode == 1) continue;  // tileModesExcluded = 0x001 (video playback)
+        for (uint16_t f : t.formats)
+            if (f == s->format) { r.kind = t.shadow ? kRuleShadow : kRuleRes; break; }
+    }
+    // the old path's answer for this surface, once: the same factor and the same follows
+    bool fo = false, fn = r.kind == kRuleRes;
+    const float vo = target_scale_rules_old(s, &fo);
+    const float shadow = shadow_scale_env();
+    const float vn = r.kind == kRuleRes ? res_scale() : r.kind == kRuleOne ? 1.0f
+                     : shadow ? shadow : (float)graphic_packs::value("Graphics", "$shadowRes", res_scale());
+    static int mismatches = 0;
+    if ((vo != vn || fo != fn) && mismatches++ < 20)
+        LOG("[gfx] target rules differ for %08X %ux%u f%X slices %u mips %u tile %u: old %g%s, cached %g%s", s->addr, s->width, s->height,
+            s->format, s->slices, s->mips, s->tileMode, vo, fo ? " (follows)" : "", vn, fn ? " (follows)" : "");
+    return r;
+}
+static float target_scale_rules(const Surface* s, bool* follows) {
+    if (!rt_trim_on()) return target_scale_rules_old(s, follows);
+    const Surface::TargetRules& r = target_rules(s);
+    switch (r.kind) {
+    case kRuleRes:
         if (follows) *follows = true;
         return res_scale();
+    case kRuleShadow:
+        if (follows) *follows = false;
+        [[fallthrough]];
+    case kRuleShadowArray: {
+        if (const float shadow = shadow_scale_env()) return shadow;
+        // the Graphics pack's Shadows option ($shadowRes; its default follows the internal resolution). The
+        // packs' values are fixed at launch (graphic_packs::active).
+        static const double packShadow = graphic_packs::value("Graphics", "$shadowRes", NAN);
+        return std::isnan(packShadow) ? res_scale() : (float)packShadow;
     }
-    for (const Rule& r : kRules) {
-        if (r.w != s->width || r.h != s->height) continue;
-        if (r.notLinearAligned && s->tileMode == 1) continue;  // tileModesExcluded = 0x001 (video playback)
-        for (uint16_t f : r.formats)
-            if (f == s->format) {
-                if (follows) *follows = !r.shadow;
-                return r.shadow ? (shadow ? shadow : packShadow) : res_scale();
-            }
+    default: return 1.0f;
     }
-    return 1.0f;
 }
 bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) {
     Surface s;
@@ -246,6 +327,13 @@ bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) {
 }
 // extra horizontal / vertical factor for the aspect ratio
 static void target_aspect(const Surface* s, float& kx, float& ky) {
+    if (rt_trim_on()) {
+        const Surface::TargetRules& r = target_rules(s);
+        if (r.extent) { kx = r.kx; ky = r.ky; return; }
+        kx = r.screen ? g_aspect_kx : 1.0f;
+        ky = r.screen ? g_aspect_ky : 1.0f;
+        return;
+    }
     uint32_t width,height;
     if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height)){
         kx=float(width)/s->width;ky=float(height)/s->height;return;

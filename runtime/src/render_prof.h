@@ -40,8 +40,29 @@ inline void mark(Phase p) {
 }
 
 // op timing around execute_one: begin() returns 0 when this call is not timed
-uint64_t op_begin(Op op);
-void op_end(Op op, uint64_t started);
+constexpr uint32_t kSampleMask = 63;  // draws and register writes: one call in 64 is timed
+extern bool g_on;                     // enabled()
+extern bool g_inline_ops;             // the untimed path inline (WWHD_RT_TRIM; the Metal renderer's [rt-ab] switches it)
+extern uint64_t g_op_count[kOps];     // this window's ops
+extern uint32_t g_op_sample[kOps];
+uint64_t op_begin_old(Op op);         // the out-of-line path, as before the inline one
+uint64_t op_begin_timed(Op op);
+void op_end_old(Op op, uint64_t started);
+void op_end_timed(Op op, uint64_t started);
+inline uint64_t op_begin(Op op) {
+    if (!g_inline_ops) return op_begin_old(op);
+    if (!g_on) return 0;
+    g_op_count[op]++;
+    if ((op == kOpDraw || op == kOpRegs) && (++g_op_sample[op] & kSampleMask)) {
+        if (op == kOpDraw) g_draw_sampled = false;  // also after a sampled draw that threw
+        return 0;
+    }
+    return op_begin_timed(op);
+}
+inline void op_end(Op op, uint64_t started) {
+    if (!g_inline_ops) return op_end_old(op, started);
+    if (started) op_end_timed(op, started);
+}
 
 // uploads: the kind of the copies made while the scope lives
 extern int g_upload_kind;

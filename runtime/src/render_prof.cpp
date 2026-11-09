@@ -75,10 +75,9 @@ bool g_track_unique = false;
 uint32_t g_reg_dirty = 0;
 
 namespace {
-constexpr uint32_t kSampleMask = 63;  // draws and register writes: one call in 64 is timed
 struct Window {
     uint64_t frames = 0, holdFrames = 0;
-    uint64_t opCount[kOps]{}, opTimed[kOps]{}, opNs[kOps]{};
+    uint64_t opTimed[kOps]{}, opNs[kOps]{};  // (the counts: g_op_count)
     uint64_t phaseNs[kDrawPhases]{};
     uint64_t upload[kUploadKinds]{}, uploadHold[kUploadKinds]{};
     uint64_t uniqueFrames = 0, unique[kUploadKinds]{}, uniqueAll = 0, uniqueCopied[kUploadKinds]{};
@@ -91,7 +90,6 @@ uint64_t frameUpload[kUploadKinds]{};
 std::array<std::vector<std::pair<uint64_t, uint64_t>>, kUploadKinds> reads;
 std::vector<uint32_t> otherRegs(0x10000);  // changed-value writes of non-buffer registers, this window
 uint64_t windowStart = 0, cpuStart = 0, frameCounter = 0, stepsStart = 0;
-uint32_t sampleCounter[kOps]{};
 
 struct ShaderStats {
     uint64_t variants = 0, newPrograms = 0, unusedOnly = 0;
@@ -110,13 +108,11 @@ void mark_slow(Phase p) {
     g_mark = t;
 }
 
-uint64_t op_begin(Op op) {
-    if (!enabled()) return 0;
-    W.opCount[op]++;
-    if ((op == kOpDraw || op == kOpRegs) && (++sampleCounter[op] & kSampleMask)) {
-        if (op == kOpDraw) g_draw_sampled = false;  // also after a sampled draw that threw
-        return 0;
-    }
+bool g_on = enabled();
+bool g_inline_ops = [] { const char* e = getenv("WWHD_RT_TRIM"); return !e || strcmp(e, "0") != 0; }();
+uint64_t g_op_count[kOps]{};
+uint32_t g_op_sample[kOps]{};
+uint64_t op_begin_timed(Op op) {
     uint64_t t = now_ns();
     if (op == kOpDraw) {
         g_draw_sampled = true;
@@ -124,11 +120,23 @@ uint64_t op_begin(Op op) {
     }
     return t;
 }
-void op_end(Op op, uint64_t started) {
-    if (!started) return;
+uint64_t op_begin_old(Op op) {
+    if (!enabled()) return 0;
+    g_op_count[op]++;
+    if ((op == kOpDraw || op == kOpRegs) && (++g_op_sample[op] & kSampleMask)) {
+        if (op == kOpDraw) g_draw_sampled = false;  // also after a sampled draw that threw
+        return 0;
+    }
+    return op_begin_timed(op);
+}
+void op_end_timed(Op op, uint64_t started) {
     W.opTimed[op]++;
     W.opNs[op] += now_ns() - started;
     if (op == kOpDraw) g_draw_sampled = false;
+}
+void op_end_old(Op op, uint64_t started) {
+    if (!started) return;
+    op_end_timed(op, started);
 }
 
 void add_upload(uint64_t bytes) { frameUpload[g_upload_kind] += bytes; }
@@ -261,7 +269,7 @@ void frame_end(bool hold) {
     const double frames = (double)W.frames, wallMs = (t - windowStart) / 1e6;
     const uint64_t cpu = thread_cpu_ns(), steps = interp::logic_steps();
     auto opMs = [&](int op) {  // estimated ms per frame (sampled ops scaled up)
-        return W.opTimed[op] ? W.opNs[op] / 1e6 * ((double)W.opCount[op] / W.opTimed[op]) / frames : 0.0;
+        return W.opTimed[op] ? W.opNs[op] / 1e6 * ((double)g_op_count[op] / W.opTimed[op]) / frames : 0.0;
     };
     std::string out;
     char line[1024];
@@ -279,15 +287,15 @@ void frame_end(bool hold) {
     static const char* opNames[kOps] = {"regs", "draw", "clear", "copy", "scan", "invalidate", "flush", "drawdone", "swap", "other"};
     std::string ops;
     for (int op = 0; op < kOps; op++) {
-        if (!W.opCount[op]) continue;
-        snprintf(line, sizeof line, " %s %.2f (%.0f/frame)", opNames[op], opMs(op), W.opCount[op] / frames);
+        if (!g_op_count[op]) continue;
+        snprintf(line, sizeof line, " %s %.2f (%.0f/frame)", opNames[op], opMs(op), g_op_count[op] / frames);
         ops += line;
     }
     add("[prof] ops ms/frame:%s", ops.c_str());
     if (W.opTimed[kOpDraw]) {
         static const char* phaseNames[kDrawPhases] = {"shader", "indices", "targets", "pipeline", "uniforms", "textures",
                                                       "descriptors", "pass", "record", "vertex", "submit"};
-        const double scale = (double)W.opCount[kOpDraw] / W.opTimed[kOpDraw] / frames / 1e6;
+        const double scale = (double)g_op_count[kOpDraw] / W.opTimed[kOpDraw] / frames / 1e6;
         std::string ph;
         double sum = 0;
         for (int p = 0; p < kDrawPhases; p++) {
@@ -296,7 +304,7 @@ void frame_end(bool hold) {
             sum += W.phaseNs[p] * scale;
         }
         add("[prof] draw phases ms/frame (1 draw in %u sampled):%s; untracked %.2f; %.2f us/draw", kSampleMask + 1,
-            ph.c_str(), std::max(0.0, opMs(kOpDraw) - sum), opMs(kOpDraw) * 1e3 * frames / std::max<uint64_t>(1, W.opCount[kOpDraw]));
+            ph.c_str(), std::max(0.0, opMs(kOpDraw) - sum), opMs(kOpDraw) * 1e3 * frames / std::max<uint64_t>(1, g_op_count[kOpDraw]));
     }
     static const char* syncNames[kSyncs] = {"DrawDone", "CopySurface", "flip", "other"};
     std::string syncs;
@@ -384,6 +392,7 @@ void frame_end(bool hold) {
         report = out;
     }
     W = Window{};
+    std::fill(std::begin(g_op_count), std::end(g_op_count), 0);
     std::fill(otherRegs.begin(), otherRegs.end(), 0);
     windowStart = t;
     cpuStart = cpu;
