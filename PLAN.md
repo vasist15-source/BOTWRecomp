@@ -642,10 +642,25 @@ the kept installer copy have not been played yet. The release build is installed
   GPU busy (12.6-13.8 ms) and render thread time are the same before and after, no compile fails or is retried, no
   `[hitch]` follows within 1,000 frames, and our pipeline count never shrinks. Whether the driver drops compiled
   variants and compiles them again is not visible from here.
-- **Not play-tested yet.** To measure in play: the `launch:` lines against a launch with `WWHD_WIDE_FETCH_KEYS=1`
-  on the kept old cache (`~/Library/Caches/BotW/shaders.wide-keys.bin`), `[hitch]` counts, whether the AGX line still
-  appears, and how many pipelines a session binds. Not done: warming only recently used pipelines (5,987 pipelines
-  build in seconds), setting state at draw time, a pipeline binary archive.
+- Play-test (2026-11-10, 1.5x, 60 fps, 38,100 frames = 10.6 minutes: Hateno, Kakariko, a shrine, menus; the build
+  reports itself as 806ebb6-dirty, its source is this commit's): no wrong or missing rendering reported. Against the
+  last session of the old build (806ebb6, 2026-11-08, 16,200 frames):
+  - cached shaders and pipelines ready 8.9 s after the process started (2.7 s to the first draw, replay with the
+    one-time rewrite 1.5 s, pipeline build 4.7 s: done by frame 280), before by frame 3918 after a 4.3 s replay;
+    from the replay's start to the end of the queue the process used 4.8 s of CPU and 21 J.
+  - the AGX line did not appear.
+  - the two hitches while the save loads are still there (59 and 64 ms, texture uploads) but build no pipelines
+    (before: +125 and +337 in those frames, the queue being far from done). 4 hitches in 10.6 minutes: those two, one
+    first visit (115 ms, 110 ms of it waiting for 4 new shaders), one of 67 ms with no texture or shader work. Before:
+    3 in 4.5 minutes.
+  - no draw skipped for a compile before frame 18,600; 84 in all, at two first visits.
+  - the cache grew by 37 pipelines and 10 shaders in the session (before: +224 pipelines in 4.5 minutes).
+  - 2,340 of the 6,024 pipelines were asked for by a draw (1,220 in the first minute).
+  - GPU busy 12.95 ms and render thread 6.80 ms a frame after frame 900 (before 13.02 and 6.80; other places).
+- Not measured: the first minute's CPU % and energy under the old keys (no launch with `WWHD_WIDE_FETCH_KEYS=1` was
+  made; the old build did not log them), so the new build's 60 s and 120 s lines (165 % of a core, 5.2 W, while
+  playing) have nothing to stand against. Not done, and not needed at this count: warming only recently used
+  pipelines, setting state at draw time, a pipeline binary archive (5,987 pipelines build in 4.7 s).
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
