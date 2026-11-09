@@ -37,6 +37,7 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include <set>
 #include <cstdarg>
 #include <ctime>
+#include <libproc.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -330,37 +331,112 @@ void pool_attach(id<MTLCommandBuffer> cmd, PoolRetire* r) {
 void pool_retire(id<MTLCommandBuffer> cmd) { pool_attach(cmd, pool_take_used()); }
 
 // ---------------------------------------------------------------- fetch shaders
+// A fetch shader is named by its program and the strides of the vertex buffers its attributes read.
+// Those strides decide between vertex-descriptor fetch and manual fetch in the shader, and are
+// written into a manual fetch and into the pipeline's vertex descriptor; nothing reads the strides
+// of the other buffer slots, which keep whatever an earlier draw bound there. The key used to hash
+// all 16, so every stale combination made a new fetch shader, and with it a new translation of the
+// vertex shader (its key holds the fetch shader's) and new pipelines. One player's BotW cache
+// (2026-11-08), counted with `wwhd --shader-cache-report` under both keys: 502 fetch programs were
+// 17,308 fetch shaders (now 558), 1,376 vertex programs 54,812 translations (now 2,921), and the
+// queue built at every launch 95,982 pipelines (now 5,987). WWHD_WIDE_FETCH_KEYS=1: all 16 strides,
+// as before. Caches written before name shaders and pipelines by the wide key: replays map it too
+// (fetch_wide_key, map_old_names) and the first replay rewrites the file under the new names.
 struct FetchShaderEntry {
     LatteFetchShader* fs;
+    uint64_t key;  // the fetch shader's own key (an entry found under a wide key names it)
 };
-static std::unordered_map<uint64_t, LatteFetchShader*> g_fetch;
+static std::unordered_map<uint64_t, FetchShaderEntry> g_fetch;
+// per fetch program: the buffers its attributes read, and its latest fetch shader (most draws of a
+// program ask for the same one: no second lookup)
+struct FetchProgram {
+    uint32_t buffers = 0;  // bit per vertex buffer
+    bool known = false;
+    uint64_t lastKey = 0;
+    LatteFetchShader* last = nullptr;
+};
+static std::unordered_map<uint64_t, FetchProgram> g_fetch_programs;
+static bool wide_fetch_keys() {
+    static const bool on = [] { const char* e = getenv("WWHD_WIDE_FETCH_KEYS"); return e && *e && strcmp(e, "0"); }();
+    return on;
+}
+static uint32_t vertex_stride(const uint32_t* regs, uint32_t buffer) {
+    return (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + buffer * 7 + 2] >> 11) & 0xFFFF;
+}
+// (a buffer outside the mask counts as stride 0: a key over all 16 whose other strides are 0 is the same fetch shader)
+static uint64_t fetch_key(uint64_t programHash, const uint32_t* regs, uint32_t buffers) {
+    uint64_t h = programHash;
+    for (uint32_t b = 0; b < 16; b++) h = (h ^ (buffers & (1u << b) ? vertex_stride(regs, b) : 0)) * 1099511628211ull;
+    return h;
+}
+static uint32_t fetch_buffers(const LatteFetchShader* fs) {
+    uint32_t m = 0;
+    for (auto& g : fs->bufferGroups)
+        if (g.attributeBufferIndex < 16) m |= 1u << g.attributeBufferIndex;
+    return m;
+}
+static bool fetch_program(const uint32_t* regs, uint32_t* prog, uint32_t* size, bool* ours) {
+    *prog = regs[mmSQ_PGM_START_FS] << 8;
+    if (!*prog) return false;
+    // either our compact encoding (from GX2InitFetchShaderEx) or real fetch shader microcode shipped with the game
+    *ours = ld32(*prog) == 0x57574653;
+    *size = *ours ? 16 + ld32(*prog + 4) * 16 : regs[mmSQ_PGM_START_FS + 1] << 3;
+    return *size <= 0x1000;
+}
+// the key over all 16 strides of these registers' fetch shader: its name in caches written before
+static uint64_t fetch_wide_key(const uint32_t* regs) {
+    uint32_t prog, size;
+    bool ours;
+    return fetch_program(regs, &prog, &size, &ours) ? fetch_key(hash_bytes(mem::ptr(prog), size), regs, 0xFFFF) : 0;
+}
 
 static LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut) {
-    uint32_t prog = regs[mmSQ_PGM_START_FS] << 8;
-    if (!prog) return nullptr;
-    // either our compact encoding (from GX2InitFetchShaderEx) or real fetch shader microcode shipped with the game
-    bool ours = ld32(prog) == 0x57574653;
-    uint32_t size = ours ? 16 + ld32(prog + 4) * 16 : regs[mmSQ_PGM_START_FS + 1] << 3;
-    if (size > 0x1000) return nullptr;
+    uint32_t prog, size;
+    bool ours;
+    if (!fetch_program(regs, &prog, &size, &ours)) return nullptr;
     // hashed every draw: games rebuild fetch shaders in place within a frame (a per-frame cache gave
     // grass a stale vertex layout: flattened blades)
-    uint64_t h = hash_bytes(mem::ptr(prog), size);
-    // strides decide between vertex-descriptor fetch and manual fetch in the shader
-    for (uint32_t b = 0; b < 16; b++) h = (h ^ ((regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + b * 7 + 2] >> 11) & 0xFFFF)) * 1099511628211ull;
-    *keyOut = h;
+    const uint64_t ph = hash_bytes(mem::ptr(prog), size);
+    FetchProgram& fp = g_fetch_programs[ph];
+    // until the program's first parse shows its buffers (or when it failed to parse): all 16
+    const uint32_t buffers = fp.known && !wide_fetch_keys() ? fp.buffers : 0xFFFF;
+    uint64_t h = fetch_key(ph, regs, buffers);
+    if (fp.last && fp.lastKey == h) {
+        *keyOut = h;
+        return fp.last;
+    }
     auto it = g_fetch.find(h);
-    if (it != g_fetch.end()) return it->second;
+    if (it != g_fetch.end()) {
+        *keyOut = it->second.key;
+        if (it->second.fs) { fp.lastKey = h; fp.last = it->second.fs; }
+        return it->second.fs;
+    }
     LatteFetchShader* fs = ours ? gx2::build_fetch_shader(prog)
                                 : LatteShaderRecompiler_createFetchShader(h, (uint32*)regs, (uint32*)mem::ptr(prog), size);
     if (fs && ours) {
         for (auto& g : fs->bufferGroups) {
-            uint32_t stride = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
+            uint32_t stride = vertex_stride(regs, g.attributeBufferIndex);
             if (stride % 4) fs->mtlFetchVertexManually = true;
             for (sint32 i = 0; i < g.attribCount; i++)
                 if (g.attrib[i].offset + GetMtlVertexFormatSize(g.attrib[i].format) > stride) fs->mtlFetchVertexManually = true;
         }
     }
-    g_fetch[h] = fs;
+    if (fs && !fp.known) {
+        // the program's first parse: its buffers, and with them this fetch shader's key
+        fp.buffers = fetch_buffers(fs);
+        fp.known = true;
+        if (!wide_fetch_keys()) {
+            h = fetch_key(ph, regs, fp.buffers);
+            auto known = g_fetch.find(h);  // (only if an earlier parse of the program failed)
+            if (known != g_fetch.end() && known->second.fs) {
+                *keyOut = known->second.key;
+                return known->second.fs;
+            }
+        }
+    }
+    g_fetch[h] = {fs, h};
+    if (fs) { fp.lastKey = h; fp.last = fs; }
+    *keyOut = h;
     return fs;
 }
 
@@ -663,7 +739,7 @@ static void compile_msl(Shader* sh, const char* rawSrc, uint64_t key) {
 // unitMask: the texture units the program samples (all 18 until its first translation is known); units
 // it never reads must not change its key, or every stale binding the game leaves behind makes a new
 // "shader" (BotW: hundreds of thousands of identical translations)
-namespace { extern bool g_cache_replaying; }  // shader cache (below)
+namespace { extern bool g_cache_replaying, g_cache_report; }  // shader cache (below)
 static uint32_t g_key_gather[2][400], g_key_gather_n[2];  // debug copy of the latest gather per stage
 static const bool g_key_diff = getenv("WWHD_KEY_DIFF") != nullptr;
 static const uint32_t* last_key_words(bool vertex, uint32_t* n) { *n = g_key_gather_n[vertex ? 0 : 1]; return g_key_gather[vertex ? 0 : 1]; }
@@ -1182,6 +1258,21 @@ static void verify_key(const uint32_t* regs, bool vertex, LatteFetchShader* fs, 
     }
 }
 
+// Replays: the names the shader of these registers has in caches written with older keys. Its wide
+// key (before the narrow shader keys; wideUnits: the program's units as known before its first
+// translation), and for a vertex shader its narrow key over the fetch shader's wide key (before the
+// fetch key was limited to the buffers the fetch shader reads). Pipeline recipes of those caches name
+// their shaders by these.
+static void map_old_names(const uint32_t* regs, bool vertex, const LatteFetchShader* fs, uint64_t fsKey, uint64_t base,
+                          const ProgramUse& use, uint32_t wideUnits, Shader* s) {
+    const uint64_t fsWide = vertex ? fetch_wide_key(regs) : fsKey;
+    g_shaders.emplace(wide_key(regs, vertex, fs, fsWide, base, wideUnits), s);
+    if (vertex && fsWide != fsKey) {
+        const uint64_t linkage = linkage_key(regs, vertex, fs, base ^ fsWide * 31);
+        g_shaders.emplace(use.known ? variant_key(regs, vertex, use, linkage) : linkage, s);
+    }
+}
+
 static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
     const uint32_t addr = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
     const uint32_t size = regs[(vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS) + 1] << 3;
@@ -1196,15 +1287,17 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     auto it = g_shaders.find(key);
     if (it != g_shaders.end()) {
         Shader* shared = it->second;
-        // replayed records name shaders by their wide key: map it to the shader this state shares
-        if (g_cache_replaying || key_verify()) {
-            const uint64_t wide = wide_key(regs, vertex, fs, fsKey, base, use.units);
-            g_shaders.emplace(wide, shared);
-            if (key_verify() && !g_cache_replaying && wide != shared->key) verify_key(regs, vertex, fs, addr, size, base, wide, shared);
+        // replayed records name shaders by older keys: map them to the shader this state shares
+        if (g_cache_replaying) map_old_names(regs, vertex, fs, fsKey, base, use, use.units, shared);
+        if (key_verify() && (!g_cache_replaying || g_cache_report)) {
+            // once per wide key, over the fetch shader's wide key: every state the narrow keys fold together
+            // (`--shader-cache-report` checks every recorded state of the cache this way)
+            const uint64_t wide = wide_key(regs, vertex, fs, vertex ? fetch_wide_key(regs) : fsKey, base, use.units);
+            if (wide != shared->key) verify_key(regs, vertex, fs, addr, size, base, wide, shared);
         }
         return shared;
     }
-    const uint64_t wide = wide_key(regs, vertex, fs, fsKey, base, use.units);
+    const uint32_t wideUnits = use.units;  // (all 18 before the program's first translation)
 
     auto* s = new Shader();
     s->noPosition = vertex && !((const LatteContextRegister*)regs)->IsRasterizationEnabled();
@@ -1235,7 +1328,7 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         if (use.known) s->key = key = variant_key(regs, vertex, use, linkage);
     }
     g_shaders[key] = s;  // (the recipe was recorded by translate_shader)
-    if (g_cache_replaying) g_shaders.emplace(wide, s);
+    if (g_cache_replaying) map_old_names(regs, vertex, fs, fsKey, base, use, wideUnits, s);
     return s;
 }
 
@@ -1503,8 +1596,10 @@ struct Pipeline {
     std::atomic<int> status{CS_PENDING};
     int attempts = 0;                         // builds started (render thread)
     uint64_t retryFrame = 0;                  // a failed build is retried from this frame on (0: not scheduled)
+    bool bound = false;                       // a draw asked for it (not only the background build)
 };
 static std::unordered_map<uint64_t, Pipeline*> g_pipelines;
+static size_t g_pipelines_bound = 0;  // pipelines draws asked for this session, of all those built
 // for the hitch log (metal_main.mm): shader and pipeline work so far
 void compile_counters(size_t* shaders, size_t* pipelines, double* decompileMs, double* mslMs) {
     *shaders = g_translations;
@@ -1625,17 +1720,16 @@ struct TargetFormats {
     uint32_t color[8] = {};
     uint32_t depth = 0;
 };
-static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, uint64_t fsKey, const TargetFormats& t);
+static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, const LatteFetchShader* fs, uint64_t fsKey,
+                                  const TargetFormats& t);
 // write-mask nibbles cleared for the draw being set up: colour slots of a merged render pass that
 // the draw does not target (see ensure_pass); part of the pipeline key and of its cache recipe
 static uint32_t g_target_mask_clear = 0;
 
-static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, LatteFetchShader* fs,
-                                               uint64_t fsKey, const TargetFormats& tf) {
-    FormatInfo cfmt[8], dfmt;
-    for (int i = 0; i < 8; i++)
-        if (tf.color[i]) cfmt[i] = format_info(tf.color[i], false);
-    if (tf.depth) dfmt = format_info(tf.depth, true);
+// A pipeline's name: its shaders, the fetch shader (whose key holds the strides of the buffers it
+// reads: the vertex descriptor's), the attachments' Metal formats, blending and the write mask.
+static uint64_t pipeline_key(const uint32_t* regs, Shader* vs, Shader* ps, uint64_t fsKey, const TargetFormats& tf,
+                             const FormatInfo* cfmt, const FormatInfo& dfmt, uint32_t targetMask) {
     uint64_t h = hash_bytes(&vs, sizeof(vs));
     h = hash_bytes(&ps, sizeof(ps), h);
     h ^= fsKey;
@@ -1647,17 +1741,28 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
     h = hash_bytes(&df, 4, h);
     h = hash_regs(regs, REGADDR::CB_BLEND0_CONTROL, 8, h);
     h = hash_regs(regs, REGADDR::CB_COLOR_CONTROL, 1, h);
-    const uint32_t targetMask = regs[REGADDR::CB_TARGET_MASK] & ~g_target_mask_clear;
     h = hash_bytes(&targetMask, 4, h);
     // vertices only (stream-out passes, both faces culled): follows the vertex shader, which the
     // decompiler built without a position output under the same rule (a raster pipeline would fail to
     // build; cache replays have no rasterizer registers here, the shader's own registers decided)
+    h ^= vs->noPosition ? 0x9E3779B97F4A7C15ull : 0;
+    return h;
+}
+
+static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, LatteFetchShader* fs,
+                                               uint64_t fsKey, const TargetFormats& tf) {
+    FormatInfo cfmt[8], dfmt;
+    for (int i = 0; i < 8; i++)
+        if (tf.color[i]) cfmt[i] = format_info(tf.color[i], false);
+    if (tf.depth) dfmt = format_info(tf.depth, true);
+    const uint32_t targetMask = regs[REGADDR::CB_TARGET_MASK] & ~g_target_mask_clear;
+    const uint64_t h = pipeline_key(regs, vs, ps, fsKey, tf, cfmt, dfmt, targetMask);
     const bool rasterKill = vs->noPosition;
-    h ^= rasterKill ? 0x9E3779B97F4A7C15ull : 0;
     auto it = g_pipelines.find(h);
     Pipeline* pl;
     if (it != g_pipelines.end()) {
         pl = it->second;
+        if (!pl->bound && !g_building_ahead) { pl->bound = true; g_pipelines_bound++; }
         // a failed build is retried a few times on later frames (see kCompileAttempts)
         if (pl->status.load(std::memory_order_acquire) != CS_FAILED || !retry_due(pl, g_draw_must_run))
             return wait_compiled(pl->status) ? pl->state : nil;
@@ -1666,7 +1771,8 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
     } else {
         pl = new Pipeline();
         g_pipelines[h] = pl;
-        cache_record_pipeline(regs, vs, ps, fsKey, tf);
+        if (!g_building_ahead) { pl->bound = true; g_pipelines_bound++; }
+        cache_record_pipeline(regs, vs, ps, fs, fsKey, tf);
     }
     const int attempt = ++pl->attempts;
     const bool injectFailure = attempt <= g_test_fail_compiles;
@@ -1695,7 +1801,7 @@ static id<MTLRenderPipelineState> get_pipeline(const uint32_t* regs, Shader* vs,
                 minStride = std::max(minStride, a.offset + GetMtlVertexFormatSize(a.format));
                 if (a.fetchType == LatteConst::VertexFetchType2::INSTANCE_DATA) instanced = true;
             }
-            uint32_t stride = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
+            uint32_t stride = vertex_stride(regs, g.attributeBufferIndex);
             auto layout = vd.layouts[GET_MTL_VERTEX_BUFFER_INDEX(g.attributeBufferIndex)];
             if (stride == 0) {
                 stride = minStride;
@@ -2716,6 +2822,45 @@ static bool build_indices(uint32_t prim, uint32_t count, uint32_t indexType, uin
 
 // ---------------------------------------------------------------- draw
 
+// ---------------------------------------------------------------- what the launch costs
+// The shader cache replay and the background build of its pipelines are the work of the first
+// minute after a launch: the log says how long they took and what the process spent meanwhile
+// (CPU time and, where the system reports it, energy), and the same for the first 60 and 120 s,
+// which compare across builds whatever the queue's length.
+namespace {
+struct Cost {
+    double wall_ms = 0, cpu_s = 0;
+    uint64_t energy_nj = 0;  // 0: not reported
+};
+Cost cost_now() {
+    Cost c;
+    c.wall_ms = now_ms();
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    c.cpu_s = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+    rusage_info_v6 ri{};
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t*)&ri) == 0) c.energy_nj = ri.ri_energy_nj;
+    return c;
+}
+const double g_process_start_ms = now_ms();  // (static initialization: the process's start, near enough)
+struct LaunchStats {
+    Cost at_replay;        // when the cache replay began (the first draw)
+    double replay_ms = 0;
+    int windows = 0;       // fixed windows reported so far
+} g_launch_stats;
+std::string cost_since(const Cost& a) {
+    const Cost b = cost_now();
+    const double secs = (b.wall_ms - a.wall_ms) / 1000.0;
+    char buf[160];
+    int n = snprintf(buf, sizeof buf, "process CPU %.1f s (%.0f %% of a core)", b.cpu_s - a.cpu_s,
+                     secs > 0 ? 100.0 * (b.cpu_s - a.cpu_s) / secs : 0.0);
+    if (b.energy_nj > a.energy_nj && a.energy_nj)
+        snprintf(buf + n, sizeof buf - n, ", energy %.1f J (%.2f W)", (b.energy_nj - a.energy_nj) / 1e9,
+                 secs > 0 ? (b.energy_nj - a.energy_nj) / 1e9 / secs : 0.0);
+    return buf;
+}
+}  // namespace
+
 // ---------------------------------------------------------------- persistent shader cache
 // Every newly translated shader and every new pipeline is appended to a recipe file: the shader
 // microcode plus the register state that shaped its translation. At startup the recipes are
@@ -2727,12 +2872,23 @@ constexpr uint32_t kRecShader = 1, kRecPipeline = 2;
 FILE* g_cache_out = nullptr;
 bool g_cache_replaying = false;
 bool g_cache_disabled = false;
+bool g_cache_report = false;  // `wwhd --shader-cache-report`: replay and count only (nothing compiled or written)
 
 struct PipelineRecipe {
     uint64_t vsKey, psKey, fsKey;
     TargetFormats tf;
     uint32_t blend[8], colorControl, targetMask, strides[16];
+    uint32_t reserved;  // 0 (the struct's tail padding, which older records wrote as it came)
 };
+static_assert(sizeof(PipelineRecipe) == 168, "PipelineRecipe is a record of the shader cache file");
+// A recipe names the buffers its fetch shader reads by their stride bits only: the rest of those
+// words and the other buffers' words (stale bindings) change nothing about the pipeline, and
+// recipes that differ only there are one pipeline. WWHD_WIDE_FETCH_KEYS=1 keeps every word.
+void recipe_strides(PipelineRecipe& r, const uint32_t* words, const LatteFetchShader* fs) {
+    const uint32_t buffers = wide_fetch_keys() ? 0xFFFF : fetch_buffers(fs);
+    for (uint32_t b = 0; b < 16; b++)
+        r.strides[b] = wide_fetch_keys() ? words[b] : buffers & (1u << b) ? words[b] & (0xFFFFu << 11) : 0;
+}
 std::vector<PipelineRecipe> g_pending_pipelines;
 // hashes of the pipeline recipes already in the cache file or head start, so a pipeline the game asks
 // for before its queued recipe is built isn't appended again
@@ -2846,7 +3002,8 @@ static void cache_record_shader(const uint32_t* regs, bool vertex) {
     cache_write(kRecShader, v);
 }
 
-static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, uint64_t fsKey, const TargetFormats& t) {
+static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, const LatteFetchShader* fs, uint64_t fsKey,
+                                  const TargetFormats& t) {
     if (g_cache_replaying || !g_cache_out) return;
     PipelineRecipe r{};
     r.vsKey = vs->key;
@@ -2856,7 +3013,9 @@ static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, 
     for (int i = 0; i < 8; i++) r.blend[i] = regs[REGADDR::CB_BLEND0_CONTROL + i];
     r.colorControl = regs[REGADDR::CB_COLOR_CONTROL];
     r.targetMask = regs[REGADDR::CB_TARGET_MASK] & ~g_target_mask_clear;
-    for (int i = 0; i < 16; i++) r.strides[i] = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + i * 7 + 2];
+    uint32_t words[16];
+    for (int i = 0; i < 16; i++) words[i] = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + i * 7 + 2];
+    recipe_strides(r, words, fs);
     std::vector<uint8_t> v;
     put(v, r);
     if (!g_known_pipelines.insert(hash_bytes(v.data(), v.size())).second) return;
@@ -2868,7 +3027,8 @@ static void cache_load() {
     std::string path = cache_path();
     if (path == "0") { g_cache_disabled = true; return; }
     double t0 = now_ms();
-    size_t shaders = 0, pipelines = 0;
+    g_launch_stats.at_replay = cost_now();
+    size_t shaders = 0, pipelines = 0, recipes = 0;
     if (FILE* f = fopen(path.c_str(), "rb")) {
         static std::vector<uint32_t> regs(0x10000);
         std::unordered_map<std::string, uint32_t> copies;
@@ -2900,8 +3060,7 @@ static void cache_load() {
             if (hdr[0] == kRecPipeline) {
                 PipelineRecipe r;
                 if (get(p, end, r) && g_known_pipelines.insert(hash_bytes(raw.data(), raw.size())).second) {
-                    g_pending_pipelines.push_back(r);
-                    pipelines++;
+                    recipes++;
                     keepPipelines.push_back({r, Rec{{hdr[0], hdr[1], hdr[2]}, comp}});
                 }
                 continue;
@@ -2932,6 +3091,7 @@ static void cache_load() {
             uint64_t fsKey = 0;
             LatteFetchShader* fs = vertex ? get_fetch_shader(regs.data(), &fsKey) : nullptr;
             if (vertex && !fs) continue;
+            if (vertex) g_fetch.emplace(fetch_wide_key(regs.data()), FetchShaderEntry{fs, fsKey});  // its name in older caches
             const size_t before = g_translations;
             get_shader_uncached(regs.data(), vertex, fs, fsKey);
             if (g_translations > before) keepShaders.push_back(Rec{{hdr[0], hdr[1], hdr[2]}, std::move(comp)});
@@ -2940,35 +3100,57 @@ static void cache_load() {
         fclose(f);
         g_cache_replaying = false;
         g_defer_compiles = false;
+        // Pipeline recipes as their shaders and fetch shader are named now, each pipeline once: a recipe
+        // naming an older key (a wide shader key, or a fetch shader by all 16 strides) may name a shader
+        // whose own recipe was dropped as a duplicate, and many of them are one pipeline now (BotW:
+        // 105,811 recipes written with wide fetch keys). Recipes that don't resolve are queued as they are
+        // (a head start may bring their shaders) and dropped when the build finds them unresolved.
+        struct Live { PipelineRecipe named; Rec* rec; bool renamed; };
+        std::vector<Live> live;
+        {
+            std::unordered_set<uint64_t> seen;
+            for (auto& [r, rec] : keepPipelines) {
+                auto vi = g_shaders.find(r.vsKey), pi = g_shaders.find(r.psKey);
+                auto fi = g_fetch.find(r.fsKey);
+                if (vi == g_shaders.end() || pi == g_shaders.end() || fi == g_fetch.end() || !fi->second.fs) {
+                    g_pending_pipelines.push_back(r);
+                    continue;
+                }
+                PipelineRecipe named = r;
+                named.vsKey = vi->second->key;
+                named.psKey = pi->second->key;
+                named.fsKey = fi->second.key;
+                recipe_strides(named, r.strides, fi->second.fs);
+                named.reserved = 0;
+                const uint64_t h = hash_bytes(&named, sizeof named);
+                if (!seen.insert(h).second) continue;  // the same pipeline
+                g_known_pipelines.insert(h);
+                g_pending_pipelines.push_back(named);
+                live.push_back({named, &rec, memcmp(&named, &r, sizeof r) != 0});
+            }
+            pipelines = g_pending_pipelines.size();
+        }
         // rewrite the file without the dead weight when it is mostly that: recipes of shaders already made
-        // (older keys, or a variant per stale register), pipelines whose shaders no longer resolve. It only
-        // ever grew (BotW: 294k shader recipes for 55k shaders, 530 MB). WWHD_NO_CACHE_COMPACT=1: keep it.
-        size_t livePipelines = 0;
-        for (auto& [r, rec] : keepPipelines)
-            if (g_shaders.count(r.vsKey) && g_shaders.count(r.psKey) && g_fetch.count(r.fsKey)) livePipelines++;
-        const size_t kept = keepShaders.size() + livePipelines;
-        if (!getenv("WWHD_NO_CACHE_COMPACT") && records > 1000 && kept * 10 < records * 7) {
+        // (older keys, or a variant per stale register), pipelines whose shaders no longer resolve or that
+        // are one pipeline now. It only ever grew (BotW: 294k shader recipes for 55k shaders, 530 MB).
+        // WWHD_NO_CACHE_COMPACT=1: keep it.
+        const size_t kept = keepShaders.size() + live.size();
+        // (a report compacts only when asked to, WWHD_REPORT_COMPACT=1: for checking the rewrite on a copy)
+        if ((!g_cache_report || getenv("WWHD_REPORT_COMPACT")) && !getenv("WWHD_NO_CACHE_COMPACT") && records > 1000 &&
+            kept * 10 < records * 7) {
             const std::string tmp = path + ".compact";
             if (FILE* o = fopen(tmp.c_str(), "wb")) {
                 bool ok = true;
                 for (auto& rec : keepShaders)
                     ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 && fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
-                // pipelines name their shaders as the shaders are named now: a recipe naming a wide key (a cache
-                // from before the narrow keys) may name a shader whose own recipe was dropped as a duplicate
-                std::unordered_set<uint64_t> written;
-                for (auto& [r, rec] : keepPipelines) {
-                    auto vi = g_shaders.find(r.vsKey), pi = g_shaders.find(r.psKey);
-                    if (vi == g_shaders.end() || pi == g_shaders.end() || !g_fetch.count(r.fsKey)) continue;
-                    PipelineRecipe named = r;
-                    named.vsKey = vi->second->key;
-                    named.psKey = pi->second->key;
-                    if (!written.insert(hash_bytes(&named, sizeof named)).second) continue;  // the same pipeline
-                    if (named.vsKey != r.vsKey || named.psKey != r.psKey) {
-                        uLongf csize = compressBound(sizeof named);
+                for (auto& l : live) {
+                    Rec& rec = *l.rec;
+                    if (l.renamed) {
+                        uLongf csize = compressBound(sizeof l.named);
                         rec.comp.resize(csize);
-                        if (compress2(rec.comp.data(), &csize, (const Bytef*)&named, sizeof named, 6) != Z_OK) continue;
+                        if (compress2(rec.comp.data(), &csize, (const Bytef*)&l.named, sizeof l.named, 6) != Z_OK) continue;
                         rec.comp.resize(csize);
-                        rec.hdr[1] = sizeof named;
+                        rec.hdr[1] = sizeof l.named;
                         rec.hdr[2] = (uint32_t)csize;
                     }
                     ok = ok && fwrite(rec.hdr, sizeof rec.hdr, 1, o) == 1 && fwrite(rec.comp.data(), 1, rec.comp.size(), o) == rec.comp.size();
@@ -2976,7 +3158,7 @@ static void cache_load() {
                 ok = fclose(o) == 0 && ok;
                 if (ok && rename(tmp.c_str(), path.c_str()) == 0)
                     LOG("[gfx] shader cache compacted: %zu of %zu records kept (%zu shaders, %zu pipelines)", kept, records,
-                        keepShaders.size(), livePipelines);
+                        keepShaders.size(), live.size());
                 else
                     remove(tmp.c_str());
             }
@@ -2984,16 +3166,19 @@ static void cache_load() {
     }
     void headstart_load();  // shader_headstart.mm
     headstart_load();
-    warm_deferred_in_background(g_deferred_shaders);
-    g_cache_out = fopen(path.c_str(), "ab");
+    if (!g_cache_report) {
+        warm_deferred_in_background(g_deferred_shaders);
+        g_cache_out = fopen(path.c_str(), "ab");
+    }
+    g_launch_stats.replay_ms = now_ms() - t0;
     if (shaders || pipelines) {
         size_t srcBytes = 0, programs = 0;
         std::unordered_set<uint64_t> bases;
         std::unordered_set<const Shader*> seen;  // g_shaders also maps wide keys to the shaders they share
         for (auto& [k, sh] : g_shaders)
             if (sh && sh->dec && sh->dec->strBuf_shaderSource && seen.insert(sh).second) srcBytes += sh->dec->strBuf_shaderSource->getLen();
-        LOG("[gfx] shader cache: replayed %zu shaders (%zu translations), %zu pipelines queued (%.0f ms) from %s; %.0f MiB of shader source held",
-            shaders, g_translations, pipelines, now_ms() - t0, path.c_str(), srcBytes / 1048576.0);
+        LOG("[gfx] shader cache: replayed %zu shaders (%zu translations), %zu pipelines queued (%zu recipes read, %zu fetch programs; %.0f ms) from %s; %.0f MiB of shader source held",
+            shaders, g_translations, pipelines, recipes, g_fetch_programs.size(), now_ms() - t0, path.c_str(), srcBytes / 1048576.0);
         (void)programs;
         (void)bases;
     }
@@ -3009,6 +3194,10 @@ static void build_pending_pipelines(int budget, int maxInFlight) {
     static std::vector<uint32_t> regs(0x10000);
     g_cache_replaying = true;
     g_building_ahead = true;
+    // a recipe's write mask is the one its pipeline was built with: the latest draw's merged-pass mask
+    // (left set between frames) must not clear more of it, or the build makes a pipeline no draw asks for
+    const uint32_t drawMaskClear = g_target_mask_clear;
+    g_target_mask_clear = 0;
     // the queue holds ~10^5 recipes at startup; per-frame calls check a window of it and resume from a
     // cursor next frame instead of rescanning everything (`--warm-shaders` passes INT_MAX: full scan)
     static size_t cursor = 0;
@@ -3020,7 +3209,7 @@ static void build_pending_pipelines(int budget, int maxInFlight) {
         auto vi = g_shaders.find(r.vsKey), pi = g_shaders.find(r.psKey);
         auto fi = g_fetch.find(r.fsKey);
         auto finallyFailed = [](Shader* sh) { return sh->state == CS_FAILED && (!sh->dec || sh->attempts >= kCompileAttempts); };
-        if (vi == g_shaders.end() || pi == g_shaders.end() || fi == g_fetch.end() || !fi->second ||
+        if (vi == g_shaders.end() || pi == g_shaders.end() || fi == g_fetch.end() || !fi->second.fs ||
             finallyFailed(vi->second) || finallyFailed(pi->second)) {
             g_pending_pipelines[i] = g_pending_pipelines.back();  // unusable recipe
             g_pending_pipelines.pop_back();
@@ -3034,13 +3223,14 @@ static void build_pending_pipelines(int budget, int maxInFlight) {
         regs[REGADDR::CB_COLOR_CONTROL] = r.colorControl;
         regs[REGADDR::CB_TARGET_MASK] = r.targetMask;
         for (int k = 0; k < 16; k++) regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + k * 7 + 2] = r.strides[k];
-        get_pipeline(regs.data(), vi->second, pi->second, fi->second, r.fsKey, r.tf);
+        get_pipeline(regs.data(), vi->second, pi->second, fi->second.fs, fi->second.key, r.tf);
         g_pending_pipelines[i] = g_pending_pipelines.back();
         g_pending_pipelines.pop_back();
         g_recipes_built++;
         budget--;
     }
     cursor = i;
+    g_target_mask_clear = drawMaskClear;
     g_building_ahead = false;
     g_cache_replaying = false;
 }
@@ -3076,6 +3266,21 @@ void cache_warm_step() {
         queued = false;
         LOG("[gfx] background pipelines done by frame %llu: %zu built, %zu unresolved", (unsigned long long)R.frame,
             g_recipes_built, g_recipes_dropped);
+        if (g_launch_stats.at_replay.wall_ms > 0)
+            LOG("[gfx] launch: cached shaders and pipelines ready %.1f s after the process started (%.1f s to the first draw, replay "
+                "%.1f s, pipeline build %.1f s; %zu pipelines); since the replay began: %s",
+                (now_ms() - g_process_start_ms) / 1000.0, (g_launch_stats.at_replay.wall_ms - g_process_start_ms) / 1000.0,
+                g_launch_stats.replay_ms / 1000.0,
+                (now_ms() - g_launch_stats.at_replay.wall_ms - g_launch_stats.replay_ms) / 1000.0, g_pipelines.size(),
+                cost_since(g_launch_stats.at_replay).c_str());
+    }
+    if (g_launch_stats.windows < 2 && g_launch_stats.at_replay.wall_ms > 0 &&
+        now_ms() - g_launch_stats.at_replay.wall_ms >= 60000.0 * (g_launch_stats.windows + 1)) {
+        g_launch_stats.windows++;
+        LOG("[gfx] launch: first %d s after the shader cache replay began (frame %llu): %s; %zu pipelines built, %zu recipes queued, "
+            "%zu bound by draws",
+            60 * g_launch_stats.windows, (unsigned long long)R.frame, cost_since(g_launch_stats.at_replay).c_str(), g_pipelines.size(),
+            g_pending_pipelines.size(), g_pipelines_bound);
     }
 }
 
@@ -3172,8 +3377,8 @@ void report_skips() {
         if (g_skip[i]) n += snprintf(buf + n, sizeof buf - n, " %s=%llu", kSkipNames[i], (unsigned long long)g_skip[i]);
     if (n) LOG("[gfx] skipped draws:%s", buf);
     if (g_streamout_draws) LOG("[gfx] stream-out draws so far: %llu (%llu without a render target)", (unsigned long long)g_streamout_draws, (unsigned long long)g_streamout_notarget);
-    LOG("[gfx] %zu shaders (%zu names), %zu pipelines; ms decompile %.0f, msl %.0f, pipeline %.0f", g_translations, g_shaders.size(), g_pipelines.size(),
-        g_t_decompile, g_t_msl, g_t_pipeline);
+    LOG("[gfx] %zu shaders (%zu names), %zu pipelines (%zu bound by draws this session); ms decompile %.0f, msl %.0f, pipeline %.0f",
+        g_translations, g_shaders.size(), g_pipelines.size(), g_pipelines_bound, g_t_decompile, g_t_msl, g_t_pipeline);
     if (g_key_checks)
         LOG("[gfx shader key] %llu wide keys verified, %llu violations", (unsigned long long)g_key_checks,
             (unsigned long long)g_key_violations);
@@ -3913,6 +4118,7 @@ bool headstart_translate(const uint32_t* regs, bool vertex, bool compileNow) {
     g_defer_compiles = !compileNow;
     uint64_t fsKey = 0;
     LatteFetchShader* fs = vertex ? get_fetch_shader(regs, &fsKey) : nullptr;
+    if (fs) g_fetch.emplace(fetch_wide_key(regs), FetchShaderEntry{fs, fsKey});  // its name in older head starts
     Shader* s = (!vertex || fs) ? get_shader_uncached(regs, vertex, fs, fsKey) : nullptr;
     if (s && compileNow) compile_deferred(s);
     g_cache_replaying = replaying;
@@ -3942,4 +4148,55 @@ size_t headstart_build_pipelines(int maxInFlight, size_t& built, size_t& dropped
     return g_pending_pipelines.size();
 }
 
+// `wwhd --shader-cache-report`: replay the shader cache (WWHD_SHADER_CACHE, or the user's) and the
+// head start as a launch does, without compiling, building or writing anything, and print what they
+// hold: shaders by stage, fetch shaders, and the distinct pipelines the queued recipes name. With
+// WWHD_WIDE_FETCH_KEYS=1 the same file is counted under the old fetch keys.
+int cache_report() {
+    g_cache_report = true;
+    cache_load();
+    size_t vs = 0, ps = 0, failed = 0, srcBytes = 0;
+    std::unordered_set<const Shader*> seen;
+    for (auto& [k, sh] : g_shaders) {
+        if (!sh || !seen.insert(sh).second) continue;
+        if (!sh->dec) { failed++; continue; }
+        (sh->dec->shaderType == LatteConst::ShaderType::Vertex ? vs : ps)++;
+        if (sh->dec->strBuf_shaderSource) srcBytes += sh->dec->strBuf_shaderSource->getLen();
+    }
+    std::unordered_set<const LatteFetchShader*> fetch;
+    size_t manual = 0;
+    for (auto& [k, e] : g_fetch)
+        if (e.fs && fetch.insert(e.fs).second && e.fs->mtlFetchVertexManually) manual++;
+    std::unordered_set<uint64_t> pipelines;
+    std::unordered_set<uint64_t> pairs;
+    size_t unresolved = 0;
+    static std::vector<uint32_t> regs(0x10000);
+    for (const PipelineRecipe& r : g_pending_pipelines) {
+        auto vi = g_shaders.find(r.vsKey), pi = g_shaders.find(r.psKey);
+        auto fi = g_fetch.find(r.fsKey);
+        if (vi == g_shaders.end() || pi == g_shaders.end() || fi == g_fetch.end() || !fi->second.fs) { unresolved++; continue; }
+        for (int k = 0; k < 8; k++) regs[REGADDR::CB_BLEND0_CONTROL + k] = r.blend[k];
+        regs[REGADDR::CB_COLOR_CONTROL] = r.colorControl;
+        FormatInfo cfmt[8], dfmt;
+        for (int i = 0; i < 8; i++)
+            if (r.tf.color[i]) cfmt[i] = format_info(r.tf.color[i], false);
+        if (r.tf.depth) dfmt = format_info(r.tf.depth, true);
+        pipelines.insert(pipeline_key(regs.data(), vi->second, pi->second, fi->second.key, r.tf, cfmt, dfmt, r.targetMask));
+        Shader* pair[2] = {vi->second, pi->second};
+        pairs.insert(hash_bytes(pair, sizeof pair));
+    }
+    if (g_key_checks)
+        LOG("[gfx shader key] %llu recorded states translated again and compared with the shader they share, %llu violations",
+            (unsigned long long)g_key_checks, (unsigned long long)g_key_violations);
+    LOG("[cache report] %s fetch keys: %zu shaders (%zu vertex, %zu pixel, %zu failed; %zu names; %.0f MiB of source), "
+        "%zu fetch shaders of %zu fetch programs (%zu fetch in the shader), %zu recipes queued -> %zu pipelines over %zu shader pairs "
+        "(%zu unresolved); replay %.0f ms",
+        wide_fetch_keys() ? "wide" : "narrow", vs + ps + failed, vs, ps, failed, g_shaders.size(), srcBytes / 1048576.0, fetch.size(),
+        g_fetch_programs.size(), manual, g_pending_pipelines.size(), pipelines.size(), pairs.size(), unresolved,
+        g_launch_stats.replay_ms);
+    return 0;
+}
+
 }  // namespace gfx
+
+int gfx_cache_report() { return gfx::cache_report(); }  // main.cpp: --shader-cache-report

@@ -62,6 +62,7 @@ namespace gfxvk { int android_display_smoke_test(); void save_renderer_caches();
 #endif
 #ifdef WWHD_HAS_METAL
 int gfx_headstart_warm();  // gfx/shader_headstart.mm
+int gfx_cache_report();   // gfx/metal_draw.mm
 namespace gfx { int readback_test(); }
 #endif
 
@@ -396,6 +397,7 @@ int main(int argc, char** argv) {
     }
 #endif
     bool warm_shaders = false;
+    bool shader_cache_report = false;
 #ifdef WWHD_HAS_METAL
     bool metal_readback_test = false;
 #endif
@@ -412,6 +414,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--aoc") && i + 1 < argc) config::aoc_dir = argv[++i];
         else if (!strcmp(argv[i], "--trace")) g_trace_hle = true;
         else if (!strcmp(argv[i], "--warm-shaders")) warm_shaders = true;
+        else if (!strcmp(argv[i], "--shader-cache-report")) shader_cache_report = true;
 #ifdef WWHD_HAS_METAL
         else if (!strcmp(argv[i], "--metal-readback-test")) metal_readback_test = true;
 #endif
@@ -552,6 +555,10 @@ int main(int argc, char** argv) {
     // the game runs on its own threads; the process main thread belongs to the window system
     render::init();
     mods::cemu::set_vulkan(render::active()==render::Api::Vulkan);
+#ifdef WWHD_HAS_METAL
+    // count what the shader cache holds (shaders, fetch shaders, pipelines) without compiling anything, then quit
+    if (shader_cache_report) return render::active() == render::Api::Metal ? gfx_cache_report() : 1;
+#endif
     if (warm_shaders) {
         // compile the shader head start once (fills the macOS Metal shader cache), then quit
 #ifdef WWHD_HAS_METAL

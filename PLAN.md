@@ -603,6 +603,50 @@ the kept installer copy have not been played yet. The release build is installed
 - Not changed: every wake-up from an HLE wait still takes one global mutex in `park_gate` (`g_frz_m`, for save
   states), and each wait gives up and retakes its core (per-core locks).
 
+### 2026-11-10: Metal: fetch shaders keyed by the vertex buffers they read (16x fewer pipelines)
+- Symptom: the shader cache held 105,811 pipeline recipes (95,982 pipelines) and grew by ~12,000 in a day of play;
+  every launch replayed it for 4.3 s, held 1.2 GiB of shader source and built the pipelines in the background for
+  ~65 s (frame 3918 at 60 fps, ~1,460 a second), and Apple's GPU driver logged `AGX: exceeded compiled variants
+  footprint limit` once per session, both times when about 18,000 of them were built (frames 754 and 770).
+- Cause, from the cache file (its records parsed offline, then counted by the runtime under both keys): the
+  pipeline key itself is fine (pipelines per shader pair: 1.27; formats, blending and the write mask are real
+  differences). The vertex shaders were the problem: 1,376 vertex programs had 54,812 translations, pixel shaders
+  1,349 for 1,300 programs. A vertex shader's key holds its fetch shader's, and the fetch shader's key hashed the
+  strides of all 16 vertex buffer slots. Only the buffers the fetch shader's attributes read matter (manual fetch
+  or not, the stride written into a manual fetch, the vertex descriptor's stride); the other slots keep whatever an
+  earlier draw bound. Per vertex program and fetch program, the strides of the buffers read differ in 104 cases;
+  the stale ones made 49,734 combinations. The PS input table, which PLAN's older note blamed, splits almost nothing
+  now (54,504 -> 54,294 without it).
+- Fix: `get_fetch_shader` hashes the strides of the fetch program's own buffers (learned at its first parse,
+  `g_fetch_programs`); the vertex shader and pipeline keys follow. Recipes store only those strides.
+- Old caches: a replay maps each record's old names too (the fetch shader's key over 16 strides, the vertex
+  shader's narrow key over it, the wide key over it), so every old pipeline recipe resolves; recipes are then renamed
+  and deduplicated before they are queued, and the first launch rewrites the file. An older build (or
+  `WWHD_WIDE_FETCH_KEYS=1`) reading the rewritten file resolves only the pipelines whose stale strides were 0 (227 of
+  5,987) and builds the rest on first use.
+- Counted on a copy of the player's cache with `wwhd --shader-cache-report` (new: replays the cache as a launch
+  does, compiles and writes nothing), old keys (`WWHD_WIDE_FETCH_KEYS=1`) -> new:
+  fetch shaders 17,308 -> 558 (502 programs), shaders 56,161 -> 4,270 (vertex 54,812 -> 2,921, pixel 1,349),
+  pipelines 95,982 -> 5,987 (0 unresolved), shader source held 1,207 -> 102 MiB, replay 4.26 -> 1.40 s (0.34 s once
+  the file is rewritten), peak memory of the replay 866 -> 459 MiB, cache file 236 -> 15.6 MiB (175,950 -> 10,257
+  records). The old count matches the last session's log (95,982 pipelines).
+- Checked: `WWHD_MTL_SHADER_KEY_VERIFY=1` with the report translates every recorded state again and compares it
+  with the shader it now shares (MSL, resource mapping, texture, output and uniform metadata): 54,761 states, 0
+  differences. The rewritten copy read again gives the same counts. ctest: 125 of 135, the 10 known failures.
+- Also: the background build cleared the latest draw's merged-pass write mask from the recipes it built (the mask
+  stays set between frames), which could build a pipeline no draw asks for; it builds with the recipe's own mask now.
+- New log lines: `[gfx] launch: ...` when the queue is done (time since the process started, replay, build, process
+  CPU and energy since the replay began) and for the first 60 and 120 s; the 300-frame line counts the pipelines draws
+  asked for this session ("bound by draws").
+- What happens at the AGX line (old logs): nothing we can see. The build rate (7,200-7,800 pipelines per 300 frames),
+  GPU busy (12.6-13.8 ms) and render thread time are the same before and after, no compile fails or is retried, no
+  `[hitch]` follows within 1,000 frames, and our pipeline count never shrinks. Whether the driver drops compiled
+  variants and compiles them again is not visible from here.
+- **Not play-tested yet.** To measure in play: the `launch:` lines against a launch with `WWHD_WIDE_FETCH_KEYS=1`
+  on the kept old cache (`~/Library/Caches/BotW/shaders.wide-keys.bin`), `[hitch]` counts, whether the AGX line still
+  appears, and how many pipelines a session binds. Not done: warming only recently used pipelines (5,987 pipelines
+  build in seconds), setting state at draw time, a pipeline binary archive.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
