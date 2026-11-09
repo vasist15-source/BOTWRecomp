@@ -245,17 +245,25 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
         {
             // one pass over the changed span: the shader-generation check (by table) and only the
             // changed words copied
+            // v may be a display list in guest memory that a game thread is rewriting: the words can
+            // change after the memcmp above (they then matched g_regs, and the unbounded scans ran off
+            // both ends: crash-20261110-015432, v[0xFFFFFFFF]). So the scans stop at the span's ends
+            // and each word is read once, for the check and the copy alike.
             uint32 lo = 0;
-            while (g_regs[first + lo] == v[lo]) lo++;  // memcmp found a difference
-            uint32 hi = n - 1;
-            while (g_regs[first + hi] == v[hi]) hi--;
-            for (uint32 i = lo; i <= hi; i++)
-                if (g_regs[first + i] != v[i] && key_changes(first + i, g_regs[first + i], v[i])) {
+            while (lo < n && g_regs[first + lo] == v[lo]) lo++;
+            uint32 hi = n;  // one past the last changed word
+            while (hi > lo && g_regs[first + hi - 1] == v[hi - 1]) hi--;
+            bool bumped = false;
+            for (uint32 i = lo; i < hi; i++) {
+                const uint32 nv = v[i];
+                if (g_regs[first + i] == nv) continue;
+                if (!bumped && key_changes(first + i, g_regs[first + i], nv)) {
                     g_shader_state_gen++;
                     note_gen_bump(first + i);
-                    break;
+                    bumped = true;
                 }
-            copy_words(&g_regs[first + lo], v + lo, hi - lo + 1);
+                g_regs[first + i] = nv;
+            }
         }
     }
     if (g_shadow && g_shadow != v) copy_words(&g_shadow[first], v, n);
