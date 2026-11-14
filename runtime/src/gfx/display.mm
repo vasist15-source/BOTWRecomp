@@ -738,6 +738,7 @@ void run_appkit_loop() {
     // orderly exit (Quit, Cmd+Q): the renderer writes its caches (Vulkan pipeline / SPIR-V caches)
     [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil
                                                   usingBlock:^(NSNotification*) {
+        input::stop_rumble_now();  // the controllers' motors still before _Exit (rumble_apple.mm)
         render::shutdown();
         // leave without running static destructors: the GX2 render thread and the game threads may
         // still be using them (exit() here crashed in the renderer's caches, Metal and Vulkan alike)

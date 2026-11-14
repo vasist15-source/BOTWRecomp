@@ -56,6 +56,10 @@ uint64_t now_us() {
 // WWHD_RUMBLE=0 starts with the motors off (and the saved option is not read); any other value on
 const char* env() { return getenv("WWHD_RUMBLE"); }
 std::atomic<bool> g_enabled{!env() || atoi(env()) != 0};
+std::atomic<void (*)()> g_wake{nullptr};
+void wake() {
+    if (auto w = g_wake.load(std::memory_order_acquire)) w();
+}
 }  // namespace
 
 bool log_enabled() {
@@ -70,26 +74,35 @@ void gamepad_pattern(uint32_t chan, const uint8_t* bits, uint32_t nbits) {
         for (uint32_t i = 0; bits && i < (std::min(nbits, Motor::kMaxBits) + 7) / 8; i++) snprintf(hex + 2 * i, 3, "%02x", bits[i]);
         LOG("[rumble] %.3f game: GamePad pattern of %u bits (%s), %.0f ms", now_us() / 1e6, nbits, hex, std::min(nbits, Motor::kMaxBits) * Motor::kBitUs / 1000.0);
     }
-    std::lock_guard lk(g_mu);
-    g_motor.gamepad_pattern(bits, nbits, now_us());
+    {
+        std::lock_guard lk(g_mu);
+        g_motor.gamepad_pattern(bits, nbits, now_us());
+    }
+    wake();
 }
 
 void gamepad_stop(uint32_t chan) {
     if (chan != 0) return;
     if (log_enabled()) LOG("[rumble] %.3f game: GamePad motor stop", now_us() / 1e6);
-    std::lock_guard lk(g_mu);
-    g_motor.gamepad_stop();
+    {
+        std::lock_guard lk(g_mu);
+        g_motor.gamepad_stop();
+    }
+    wake();
 }
 
 void pro_motor(uint32_t chan, bool on) {
     if (chan != 0) return;
     const uint64_t now = now_us();
-    std::lock_guard lk(g_mu);
-    // the game repeats the state every frame while an effect runs: log the changes only
-    static bool logged = false;
-    if (log_enabled() && on != logged) LOG("[rumble] %.3f game: Pro Controller motor %s", now / 1e6, on ? "on" : "off");
-    logged = on;
-    g_motor.pro_motor(on, now);
+    {
+        std::lock_guard lk(g_mu);
+        // the game repeats the state every frame while an effect runs: log the changes only
+        static bool logged = false;
+        if (log_enabled() && on != logged) LOG("[rumble] %.3f game: Pro Controller motor %s", now / 1e6, on ? "on" : "off");
+        logged = on;
+        g_motor.pro_motor(on, now);
+    }
+    wake();
 }
 
 void reset() {
@@ -101,6 +114,7 @@ void reset() {
 bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
 void set_enabled(bool on) {
     if (g_enabled.exchange(on) != on) LOG("[rumble] controller rumble %s", on ? "on" : "off");
+    if (on) wake();
 }
 bool env_override() { return env() != nullptr; }
 
@@ -109,5 +123,13 @@ float host_level(uint64_t window_us) {
     std::lock_guard lk(g_mu);
     return g_motor.level(now_us(), window_us);
 }
+
+bool host_active() {
+    if (!enabled()) return false;
+    std::lock_guard lk(g_mu);
+    return g_motor.active(now_us());
+}
+
+void set_host_wake(void (*w)()) { g_wake.store(w, std::memory_order_release); }
 
 }  // namespace rumble

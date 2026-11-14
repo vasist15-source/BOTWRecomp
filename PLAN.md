@@ -693,6 +693,35 @@ the kept installer copy have not been played yet. The release build is installed
   GPU busy, draws, shader lookups, frames over 25 and 45 ms). In the A/B's old half the old `bind_stage` is one
   extra call per stage. Not measured at 2x. ctest: 125 of 135, the 10 known failures.
 
+### 2026-11-14: controller rumble on the Mac host (not yet play-tested)
+- Before, only the SDL host rumbled. The AppKit/Metal host's `has_rumble()` was false, so Settings > Controls > Rumble
+  was greyed out. `gfx/rumble_apple.mm` now plays rumble.h's level on every connected controller with haptics. It is
+  adapted from nxnative's `dm/host/haptics_apple.m` (NX2Apple engine, docs/reference/services.md):
+  - Core Haptics engine on `GCHapticsLocalityHandles` (`Default` if the pad does not list it, or if that engine
+    cannot be made or started). The game drives one motor here, so the route is always the one engine both handles
+    share, which is what nxnative merges a split route into on Xbox (there, separate left/right handle engines
+    override each other when no advanced players exist).
+  - An advanced looping player first. If the pad's haptics server has none (Xbox, DualShock 4-mode pads:
+    NSCocoaErrorDomain 4097, and the engine is unusable afterwards), a new engine with plain players playing 0.5 s
+    pulses that end on their own. A stop only silences them: a plain player cut mid-event left an Xbox pad's motors
+    running after the process was gone.
+  - Every Core Haptics call is inside `@try` (an engine that stopped on its own raises an NSException). A raise drops
+    the engine, and the next effect builds a new one after a backoff (1-8 s).
+  - A pad GameController calls a DualShock 4 (Sony 054C / 05C4, 09CC, 0BA0, which includes pads that present
+    themselves as one) is driven through its HID effects report (0x11 Bluetooth with CRC, 0x05 USB), both motors at
+    the level.
+- Threads: a serial queue owns every engine and device. A timer on it reads `rumble::host_level` 60 times a second
+  while some motor runs (`rumble::host_active`), then suspends itself. The game's requests wake it
+  (`rumble::set_host_wake`), so there are no wakeups when idle and no busy-wait. Main-thread stalls do not matter: the
+  Pro motor counts as off after 0.5 s without a refresh, and GamePad patterns end by themselves.
+- Still: the settings overlay open, the app not active, and for good from quit (Cmd+Q / willTerminate, before
+  `_Exit`), the game's exit (atexit), Restart now (before execv) and the crash handlers. `input::stop_rumble_now`
+  waits up to 0.3 s on the queue.
+- `WWHD_LOG_RUMBLE=1` logs each pad's route (`[rumble] host: … Core Haptics on Handles`, `has no advanced players …
+  plain players`, `DualShock 4 effects report`) and every level sent. Built only. To play-test: horse gallop, hits
+  taken, charged attack (low levels may be too weak on rotating motors, as on nxnative), with the overlay
+  opened mid-effect and Cmd+Tab away.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

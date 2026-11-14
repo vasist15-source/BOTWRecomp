@@ -177,11 +177,8 @@ void release_keys() {
     memset(g_keys, 0, sizeof(g_keys));
 }
 
-// Rumble would go to the host game controllers through GameController.framework (GCController
-// haptics); this host has none of its own yet (see platform/input_sdl.cpp for the SDL host, which
-// does rumble). The game's requests are kept by rumble.h all the same.
-bool has_rumble() { return false; }
-void stop_rumble_now() {}
+// rumble: rumble_apple.mm (has_rumble, stop_rumble_now)
+void init_rumble();
 
 // modifier keys arrive as flagsChanged; the device-dependent bits tell left from right
 static bool modifier_down(uint16_t code, NSEventModifierFlags f) {
@@ -410,6 +407,7 @@ void init() {
         note_dominant_labels();
     }];
     note_dominant_labels();
+    init_rumble();
     // GameController values are polled on the main thread
     [NSTimer scheduledTimerWithTimeInterval:1.0 / 240 repeats:YES block:^(NSTimer*) {
         // v: every controller combined, as the settings overlay reads it; game: the same with each
