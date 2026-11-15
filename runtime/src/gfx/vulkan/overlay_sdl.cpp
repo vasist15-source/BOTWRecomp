@@ -336,6 +336,12 @@ const char* name() { return "SDL"; }
 void set_clipboard(const std::string& text) { SDL_SetClipboardText(text.c_str()); }
 bool can_restart() { return false; }  // no prompt to ask first on this host yet
 void restart_game() {}
+void quit_game() {
+    // the main loop's SDL_EVENT_QUIT ends the game (backend.cpp quit_game: dumps, screenshots, caches)
+    SDL_Event e{};
+    e.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&e);
+}
 #ifdef __ANDROID__
 bool can_open_folder() { return false; }  // app-private storage: no file manager shows it
 void open_folder(const std::string&) {}

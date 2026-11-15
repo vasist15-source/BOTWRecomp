@@ -85,6 +85,15 @@ static bool device_values(GCController* c, float* v) {
     return true;
 }
 
+// the Home (Guide / PS) button opens the port's Home menu (overlay.cpp): without this the system takes
+// it for its own overlay (Launchpad, Game Center) and the app never sees it pressed
+static void keep_home_button(GCController* c) {
+    if (@available(macOS 11.0, *)) {
+        GCControllerButtonInput* home = c.extendedGamepad.buttonHome;
+        if (home) home.preferredSystemGestureState = GCSystemGestureStateDisabled;
+    }
+}
+
 // each connected controller's values, keyed by the controller: a reconnected one is a new object
 static std::vector<std::pair<uintptr_t, overlay::PadValues>> devices_values() {
     std::vector<std::pair<uintptr_t, overlay::PadValues>> out;
@@ -398,11 +407,15 @@ void init() {
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
     // the Automatic face preset follows the pad that was plugged in first (issue #78 follow-up)
     g_connect_order = [NSMutableArray array];
-    for (GCController* c in [GCController controllers]) [g_connect_order addObject:c];
+    for (GCController* c in [GCController controllers]) {
+        [g_connect_order addObject:c];
+        keep_home_button(c);
+    }
     NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification* n) {
         GCController* c = n.object;
         if (c && ![g_connect_order containsObject:c]) [g_connect_order addObject:c];
+        keep_home_button(c);
         note_dominant_labels();
     }];
     [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification* n) {

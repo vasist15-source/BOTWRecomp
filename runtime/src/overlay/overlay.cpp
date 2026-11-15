@@ -86,6 +86,16 @@ const bool g_no_host = getenv("WWHD_NO_HOST_INPUT") != nullptr;  // test runs ig
 // has the user's keyboard)
 const bool g_no_host_keys = g_no_host && !getenv("WWHD_TEST_POST_KEYS");
 bool g_pad_b_used = false;  // B answered a dialog this frame: it does not also close the menu
+// what the open overlay shows: the settings window, or the Home menu (Home on a controller or the key
+// bound to Home: Resume, Settings, Quit) and its quit confirmation. Settings opened from the Home menu
+// go back to it (B, Esc, the close button); opened with F1 / Cmd+, / Select they close.
+enum Screen : int { kScreenSettings, kScreenHome, kScreenQuit };
+std::atomic<int> g_screen{kScreenSettings};
+std::atomic<bool> g_settings_from_home{false};
+std::atomic<bool> g_focus_screen{false};  // the screen just changed: it takes keyboard / controller focus
+void open_screen(bool open, int screen);
+void back();
+void home_pressed();
 
 // input events from the host's main thread, replayed into ImGui on the render thread
 struct Event {
@@ -451,8 +461,10 @@ void read_controller() {
     input::host_controller_values(U.values);
     using namespace input_map;
     const double t = now_s();
-    // Home: toggles; Select / Minus (View / Share): held half a second opens, a press closes
-    if (controller_pressed(kPadHome)) set_open(!is_open());
+    // Home (the controller input bound to Home, the Guide / PS button by default): the Home menu, a
+    // press again resumes; Select / Minus (View / Share): held half a second opens Settings, a press closes
+    const int home = input_map::current().pad[input_map::kHome];
+    if (U.cap_action < 0 && home > kPadNone && home < kPadCount && controller_pressed(home)) home_pressed();
     if (controller_down(kPadOptions)) {
         if (!U.options_latched) {
             if (is_open()) {
@@ -1517,10 +1529,12 @@ void tab_about() {
     ImGui::PopStyleColor();
     ImGui::Spacing();
 #ifdef __APPLE__
-    note("Settings overlay: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in the app menu, or hold Select / "
-         "press Home on a controller. Esc, F1 or B closes. "
+    note("Home menu (Resume, Settings, Quit): Home on a controller or H on the keyboard (the Home rows of Controls and "
+         "Keyboard & Mouse change them). Settings directly: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in "
+         "the app menu, or hold Select on a controller. Esc, B or the close button goes back. "
 #else
-    note("Settings overlay: F1, or hold Select / press Home on a controller. Esc, F1 or B closes. "
+    note("Home menu (Resume, Settings, Quit): Home on a controller or H on the keyboard (the Home rows of Controls and "
+         "Keyboard & Mouse change them). Settings directly: F1, or hold Select on a controller. Esc or B goes back. "
 #endif
          "L / R switch pages on a controller. The game keeps running and sees no input while this menu is open.");
     note("When the game asks for text (your name), a text window appears over the game: type on the keyboard "
@@ -2086,14 +2100,16 @@ void settings_window() {
         for (int i = 0; i < kTabs; i++)
             if (sidebar_item(i, U.tab == i)) want = i;
         // keyboard / controller hint at the bottom
-        const float hint_h = kSmallSize * 2 + 8;
+        const float hint_h = kSmallSize * 3 + 12;
         ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + 8, ImGui::GetWindowHeight() - hint_h - 14));
         ImGui::PushFont(nullptr, kSmallSize);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 0.40f));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
-        ImGui::TextUnformatted("Esc or B closes");
+        ImGui::TextUnformatted(g_settings_from_home ? "Esc or B: back to the menu" : "Esc or B closes");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
         ImGui::TextUnformatted("L / R switch pages");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
+        ImGui::TextUnformatted("Sliders: A, then \xE2\x97\x80 \xE2\x96\xB6");
         ImGui::PopStyleColor();
         ImGui::PopFont();
         ImGui::EndChild();
@@ -2133,10 +2149,90 @@ void settings_window() {
         g_page = nullptr;
     }
     ImGui::End();
-    // B (not while choosing an input or in a list), Esc or the close button closes the menu
-    if (!open) set_open(false);
-    if (U.cap_action < 0 && navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
-        set_open(false);
+    // B (not while choosing an input or in a list), Esc or the close button: back to the Home menu when
+    // it opened these settings, else the menu closes
+    if (!open) back();
+    else if (U.cap_action < 0 && navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        back();
+    g_pad_b_used = false;
+}
+
+// one row of the Home menu: a full-width capsule, filled while focused (controller, keyboard) or under
+// the pointer; `danger`: the quit button (red)
+bool home_row(const char* label, bool danger = false) {
+    const float w = ImGui::GetContentRegionAvail().x, h = 46;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(label, ImVec2(w, h), ImGuiButtonFlags_EnableNav);
+    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused(), down = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec4 fill = !hot ? ImVec4(1, 1, 1, 0.08f) : danger ? with_alpha(kRed, down ? 0.75f : 0.90f) : down ? kAccentDown : kAccent;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(fill), h * 0.5f);
+    const char* end = ImGui::FindRenderedTextEnd(label);
+    ImGui::PushFont(g_bold, kBodySize + 1);
+    const ImVec2 ts = ImGui::CalcTextSize(label, end);
+    dl->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f),
+                col32(hot ? ImVec4(1, 1, 1, 1) : danger ? kRed : kLabel), label, end);
+    ImGui::PopFont();
+    return clicked;
+}
+
+// the Home menu: Resume, Settings, Quit (then Quit / Cancel), on Liquid Glass like the settings window
+void home_window() {
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const int screen = g_screen.load();
+    const bool quit = screen == kScreenQuit;
+    const float w = std::min(380.0f, ds.x * 0.9f);
+    ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0), ImVec2(w, ds.y * 0.95f));
+    if (g_focus_screen.exchange(false) || U.just_opened) {
+        ImGui::SetNextWindowFocus();
+        U.just_opened = false;
+    }
+    const ImGuiWindowFlags fl = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                                ImGuiWindowFlags_AlwaysAutoResize;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22, 22));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 9));
+    // one window per screen, so each one starts with its default button focused
+    if (ImGui::Begin(quit ? "##home_quit" : "##home_menu", nullptr, fl)) {
+        ImGui::PushFont(g_bold, kTitleSize);
+        ImGui::TextUnformatted(quit ? "Quit Breath of the Wild?" : "Breath of the Wild");
+        ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, kSecondary);
+        if (quit) ImGui::TextWrapped("Progress since your last in-game save is lost.");
+        else ImGui::TextUnformatted("The game keeps running behind this menu.");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 4));
+        if (!quit) {
+            if (home_row("Resume")) set_open(false);
+            ImGui::SetItemDefaultFocus();
+            if (home_row("Settings")) {
+                g_settings_from_home = true;
+                g_screen = kScreenSettings;
+                U.just_opened = true;  // the settings window takes focus
+            }
+            if (home_row("Quit", true)) {
+                g_screen = kScreenQuit;
+                g_focus_screen = true;
+            }
+        } else {
+            if (home_row("Quit", true)) {
+                LOG("[overlay] quit from the Home menu");
+                hostui::post([] { hostui::quit_game(); });
+            }
+            if (home_row("Cancel")) back();
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::Dummy(ImVec2(0, 2));
+        ImGui::PushFont(nullptr, kSmallSize);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 0.40f));
+        ImGui::TextUnformatted(quit ? "A chooses  ·  B or Esc goes back" : "A chooses  ·  B, Esc or Home resumes");
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    if (navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used) back();
     g_pad_b_used = false;
 }
 
@@ -2154,6 +2250,7 @@ void collect_glass(float scale) {
         p.radius = w->WindowRounding * scale;
         p.shadow = 0.35f;
         if (!strncmp(w->Name, "Settings###settings", 19)) p.tint = 0.46f;
+        else if (!strncmp(w->Name, "##home_", 7)) p.tint = 0.46f;
         else if (!strcmp(w->Name, "##perf")) p.tint = 0.40f, p.shadow = 0.25f;
         else if (!strcmp(w->Name, "##savestate_notice")) p.tint = 0.42f, p.radius = std::min(p.h * 0.5f, 22 * scale);
         else if (!strcmp(w->Name, "##text_entry")) p.tint = 0.50f;
@@ -2173,7 +2270,14 @@ int glass_panels(const GlassPanel** out) {
     return (int)g_panels.size();
 }
 void set_glass(bool on) { g_glass = on; }
-void set_open(bool open) {
+void set_open(bool open) { open_screen(open, kScreenSettings); }
+void open_home_menu() { open_screen(true, kScreenHome); }
+namespace {
+void open_screen(bool open, int screen) {
+    if (open && !is_open()) {
+        g_screen = screen;
+        g_settings_from_home = false;
+    }
     if (g_open.exchange(open) == open) return;
     for (auto& k : g_held_keys) k = false;
     input::release_keys();  // keys held now belong to the menu (opening) or are not stuck in the game (closing)
@@ -2182,8 +2286,32 @@ void set_open(bool open) {
         mods::mouse_release();
         U.just_opened = true;
     }
-    LOG("[overlay] %s", open ? "opened" : "closed");
+    LOG("[overlay] %s%s", open ? "opened" : "closed",
+        open && screen == kScreenHome ? " (Home menu)" : "");
 }
+// B, Esc, the close button: Quit -> the Home menu, Settings -> the Home menu when it opened them, else close
+void back() {
+    const int s = g_screen.load();
+    if (s == kScreenQuit || (s == kScreenSettings && g_settings_from_home.load())) {
+        g_settings_from_home = false;
+        g_screen = kScreenHome;
+        g_focus_screen = true;
+    } else {
+        set_open(false);
+    }
+}
+// Home: opens the Home menu; while it shows (or Settings over the game), closes the overlay
+void home_pressed() {
+    if (!is_open()) open_home_menu();
+    else set_open(false);
+}
+bool home_key(int code) {
+    const input_map::Mapping m = input_map::current();
+    for (int k : m.keys[input_map::kHome])
+        if (k == code) return true;
+    return false;
+}
+}  // namespace
 // controller inputs still held when the overlay closes stay from the game in the host's input pump, each
 // until released (gfx/input.mm, release_gate.h); keys held then were released by set_open, and their
 // repeats press nothing
@@ -2217,6 +2345,13 @@ bool key(int code, bool down, bool repeat, int mods) {
         if (down && !repeat && !g_capturing_keys.load()) set_open(!is_open());
         if (!g_capturing_keys.load()) return true;
     }
+    // the key bound to Home (H by default; Keyboard & Mouse page): the Home menu. It doesn't reach the game
+    // (the Wii U's Home button does nothing in it). While Settings show it types as any key does.
+    if (!g_capturing_keys.load() && !(mods & (kCtrl | kAlt | kSuper)) && !text_entry::active() && home_key(code) &&
+        (!is_open() || g_screen.load() != kScreenSettings)) {
+        if (down && !repeat) home_pressed();
+        return true;
+    }
     if (!is_open()) {
         // the game's text prompt (text_entry.h) has the keyboard while it shows
         if (!text_entry::active()) return false;
@@ -2233,7 +2368,7 @@ bool key(int code, bool down, bool repeat, int mods) {
         return true;
     }
     if (code == kVK_Escape && down && !repeat) {
-        set_open(false);
+        back();
         return true;
     }
     push({Event::Key, code, down, 0, 0, mods});
@@ -2330,7 +2465,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         if (open && !was_open) { U.gamepad_navigation.reset_trace(); wwhd_trace::emit("open frame=%d", U.init ? ImGui::GetFrameCount() : 0); }
         was_open = open;
     }
-    perf::set_demand(perf, open && U.tab == kGraphics);
+    perf::set_demand(perf, open && g_screen.load() == kScreenSettings && U.tab == kGraphics);
     // Headless report QA uses the same formatter as the clipboard button; no clipboard mutation.
     static const char* testReport = getenv("WWHD_TEST_PERF_REPORT");
     static const uint64_t reportAt = getenv("WWHD_TEST_PERF_REPORT_AT")
@@ -2403,7 +2538,10 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
     ImGui::NewFrame();
     g_wants_text = open && io.WantTextInput;
     guesthud::frame();
-    if (open) settings_window();
+    if (open) {
+        if (g_screen.load() == kScreenSettings) settings_window();
+        else home_window();
+    }
     if (text) {
         float pad[input_map::kPadCount];
         std::copy(std::begin(U.values), std::end(U.values), pad);

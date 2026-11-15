@@ -220,6 +220,15 @@ void request_restart() {
     }
 }
 
+// hostui::quit_game (main thread): Quit Game in the pause menu, which the game confirmed with its own
+// window, so no sheet asks again
+void quit_without_asking() {
+    if (g_confirmed) return;  // already quitting
+    if (g_asking || g_saving) return;  // the quit prompt is open: its answer decides
+    LOG("[quit] quit from the game's pause menu");
+    quit_now();
+}
+
 // with the windows (display.mm): the TV window's delegate and the application's
 void install_quit_prompt(NSWindow* tv) {
     static WWQuitDelegate* d = [WWQuitDelegate new];  // both delegate properties are weak

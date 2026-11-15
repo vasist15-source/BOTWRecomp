@@ -32,6 +32,9 @@ namespace overlay {
 
 bool is_open();             // any thread
 void set_open(bool open);   // any thread
+// any thread: the Home menu (Resume, Settings, Quit), as Home on a controller or the key bound to Home
+// opens it (F1, Cmd+, and set_open open the settings window)
+void open_home_menu();
 // the game sees no input: the overlay has it (captures()). Controller inputs held when it closes stay
 // from the game until each is released (the host's input pump, release_gate.h).
 bool blocks_input();
