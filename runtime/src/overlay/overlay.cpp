@@ -1563,7 +1563,7 @@ void tab_controls() {
         hostui::post([v] { hostui::set("rumble", v ? "1" : "0"); });
     }
     help(input::has_rumble() ? "Controller vibration when the game asks for it. Off keeps the motors still."
-                             : "Controller vibration: this host does not drive controller motors yet.");
+                             : "Controller vibration: no connected controller can vibrate.");
     ImGui::SameLine(0, 24);
     static bool gyro_open = false;
     {

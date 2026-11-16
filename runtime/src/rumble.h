@@ -59,6 +59,12 @@ bool env_override();             // WWHD_RUMBLE is set: it decides the start val
 
 // ---- host (main thread, once per update): the motor strength now, 0..1; 0 while the option is off
 float host_level(uint64_t window_us);
+// some motor runs or will run (a pattern still playing, the Pro Controller motor on and fresh);
+// false while the option is off. A host that polls host_level may sleep while this is false.
+bool host_active();
+// Any thread: called (outside the lock, on the caller's thread) after each game request and after
+// the option turns on, so a host that sleeps while nothing runs wakes up. Keep it cheap.
+void set_host_wake(void (*wake)());
 
 bool log_enabled();              // WWHD_LOG_RUMBLE=1: log requests and motor changes
 

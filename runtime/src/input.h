@@ -41,8 +41,9 @@ void held_keys(bool* keys);         // 256 entries: keys held for the game (keyb
 void prompt_text(const std::u16string& initial, int max_len,
                  std::function<void(bool ok, std::u16string text)> done);
 
-// The host drives the controllers' rumble motors (SDL host; the game's requests are kept by
-// rumble.h). The AppKit host does not yet.
+// The host drives the controllers' rumble motors from rumble.h's level (SDL host:
+// platform/input_sdl.cpp; AppKit host: gfx/rumble_apple.mm). True while a controller that can rumble
+// is connected (the SDL host: always).
 bool has_rumble();
 // Any thread: the motors still at once and for good; the process ends (quit, exit, crash handler).
 void stop_rumble_now();

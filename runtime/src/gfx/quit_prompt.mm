@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "../input.h"
 #include "../quit_prompt.h"
 #include "../savestate.h"
 #include "renderer.h"
@@ -127,6 +128,7 @@ void ask() {
 // change), then starts this executable again with the same arguments (execv: the same log and folders)
 void restart_now() {
     LOG("[quit] restarting the game");
+    input::stop_rumble_now();  // execv: the controllers' motors still first (rumble_apple.mm)
     render::restart();  // returns only when the game could not start again
     LOG("[quit] the restart failed; quitting instead");
     dispatch_async(dispatch_get_main_queue(), ^{
