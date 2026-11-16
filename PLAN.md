@@ -722,6 +722,16 @@ the kept installer copy have not been played yet. The release build is installed
   taken, charged attack (low levels may be too weak on rotating motors, as on nxnative), with the overlay
   opened mid-effect and Cmd+Tab away.
 
+### 2026-11-17: release 0.3.0: the Home menu, the menu pause, rumble, the perf work since 0.2.0
+- BOTWRecomp-0.3.0.dmg (6,325,005 bytes, tag v0.3.0): main with the Home menu (de065cd, play-tested), the menu pause
+  and the game menu style (ba92ab4) and controller rumble on the Mac host (88d7d0f), plus everything since 0.2.0: batched
+  commits, encoder sleeps, texture churn rule, partial texture updates, lock-free sync lookup, fetch keys, render thread
+  trims and the display-list crash fix.
+- Released at the user's word with the menu pause, the game menu style and rumble not play-tested yet; the release
+  notes say so. ctest 125 of 135, the 10 known failures; rumble_test passes.
+- The player's path from the DMG, mounted read-only, in a scratch home with an empty environment: install with
+  --keep-build, 307 files compiled, linked and bundled in 335 s; the binary has the pause, rumble and menu style code.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
