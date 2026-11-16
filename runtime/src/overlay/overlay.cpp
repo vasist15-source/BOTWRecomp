@@ -6,6 +6,7 @@
 #include "../audio_out.h"
 #include "guest_hud.h"
 #include "gamepad_nav.h"
+#include "../game_pause.h"
 #include "perf_average.h"
 #ifdef __ANDROID__
 #include "android_telemetry.h"
@@ -210,18 +211,35 @@ void post_changed(std::function<void()> fn) {
 // ---------------------------------------------------------------- style
 // macOS dark appearance on Liquid Glass: the Metal renderer blurs the game picture behind every window
 // (GlassPanel); the windows themselves draw no background then, only cards, controls and text.
-std::atomic<bool> g_glass{false};
+std::atomic<bool> g_glass{false};   // the renderer can draw Liquid Glass (Metal)
 std::vector<GlassPanel> g_panels;  // this frame's (frame(), render thread)
-ImFont* g_font = nullptr;          // SF Pro (system font), Arial Unicode merged in for missing glyphs
-ImFont* g_bold = nullptr;          // the same, rendered heavier: titles
+ImFont* g_font = nullptr;          // the theme's body font: SF Pro (Liquid Glass) / Avenir Next (game style)
+ImFont* g_bold = nullptr;          // the same, heavier: titles
+ImFont* g_glass_font = nullptr;    // SF Pro (system font), Arial Unicode merged in for missing glyphs
+ImFont* g_glass_bold = nullptr;
+ImFont* g_game_font = nullptr;     // Avenir Next Medium / Demi Bold (null: not on this system, SF Pro then)
+ImFont* g_game_bold = nullptr;
 
-const ImVec4 kAccent(0.04f, 0.52f, 1.00f, 1.0f);         // systemBlue (dark)
-const ImVec4 kAccentHover(0.20f, 0.60f, 1.00f, 1.0f);
-const ImVec4 kAccentDown(0.02f, 0.42f, 0.88f, 1.0f);
-const ImVec4 kLabel(1.0f, 1.0f, 1.0f, 0.92f);            // labelColor
-const ImVec4 kSecondary(0.92f, 0.92f, 0.96f, 0.58f);     // secondaryLabelColor
-const ImVec4 kOrange(1.0f, 0.62f, 0.04f, 1.0f);          // systemOrange
-const ImVec4 kRed(1.0f, 0.37f, 0.34f, 1.0f);             // close button
+// The menus' look (Settings > Display > Menu style): macOS Liquid Glass, or the game style (dark slate
+// panels with thin cream frames and a cyan highlight, as the game's own menus feel; no game files used).
+// The pause: Settings > Display > Pause the game while the menu is open (game_pause.h).
+enum Theme : int { kThemeGlass, kThemeGame };
+std::atomic<int> g_theme{kThemeGlass};
+std::atomic<bool> g_pause_on{true};
+bool game_theme() { return g_theme.load(std::memory_order_relaxed) == kThemeGame; }
+bool glass_on() { return g_glass.load(std::memory_order_relaxed) && !game_theme(); }
+
+// the theme's colours (apply_theme)
+ImVec4 kAccent(0.04f, 0.52f, 1.00f, 1.0f);         // systemBlue (dark)
+ImVec4 kAccentHover(0.20f, 0.60f, 1.00f, 1.0f);
+ImVec4 kAccentDown(0.02f, 0.42f, 0.88f, 1.0f);
+ImVec4 kLabel(1.0f, 1.0f, 1.0f, 0.92f);            // labelColor
+ImVec4 kSecondary(0.92f, 0.92f, 0.96f, 0.58f);     // secondaryLabelColor
+ImVec4 kOrange(1.0f, 0.62f, 0.04f, 1.0f);          // systemOrange
+ImVec4 kRed(1.0f, 0.37f, 0.34f, 1.0f);             // close button
+// game style only: the highlight's glow and the frames' cream
+const ImVec4 kGlow(0.42f, 0.86f, 1.00f, 1.0f);
+const ImVec4 kCream(0.95f, 0.91f, 0.76f, 1.0f);
 const float kTitleSize = 24.0f, kSectionSize = 13.0f, kSmallSize = 13.0f, kBodySize = 16.0f;
 
 ImU32 col32(const ImVec4& c) { return ImGui::GetColorU32(c); }  // with the style's (disabled) alpha
@@ -291,16 +309,123 @@ void setup_style() {
     c[ImGuiCol_TableBorderLight] = ImVec4(1, 1, 1, 0.07f);
     c[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_TableRowBgAlt] = ImVec4(1, 1, 1, 0.03f);
+    if (!game_theme()) return;
+    // game style: squarer shapes, thin cream frames, the cyan highlight
+    s.WindowRounding = 5;
+    s.ChildRounding = 3;
+    s.FrameRounding = 3;
+    s.PopupRounding = 3;
+    s.GrabRounding = 2;
+    s.TabRounding = 2;
+    s.ScrollbarRounding = 2;
+    s.ChildBorderSize = 1;
+    c[ImGuiCol_TextDisabled] = with_alpha(kCream, 0.40f);
+    c[ImGuiCol_ChildBg] = ImVec4(1, 1, 1, 0.03f);
+    c[ImGuiCol_Border] = with_alpha(kCream, 0.20f);
+    c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, 0.07f);
+    c[ImGuiCol_FrameBgHovered] = with_alpha(kGlow, 0.16f);
+    c[ImGuiCol_FrameBgActive] = with_alpha(kGlow, 0.26f);
+    c[ImGuiCol_Button] = ImVec4(1, 1, 1, 0.07f);
+    c[ImGuiCol_ButtonHovered] = with_alpha(kGlow, 0.20f);
+    c[ImGuiCol_ButtonActive] = with_alpha(kGlow, 0.32f);
+    c[ImGuiCol_Header] = with_alpha(kGlow, 0.14f);
+    c[ImGuiCol_HeaderHovered] = with_alpha(kGlow, 0.24f);
+    c[ImGuiCol_HeaderActive] = with_alpha(kGlow, 0.34f);
+    c[ImGuiCol_CheckMark] = kCream;
+    c[ImGuiCol_SliderGrab] = kCream;
+    c[ImGuiCol_SliderGrabActive] = kGlow;
+    c[ImGuiCol_Separator] = with_alpha(kCream, 0.20f);
+    c[ImGuiCol_SeparatorHovered] = with_alpha(kCream, 0.35f);
+    c[ImGuiCol_SeparatorActive] = kGlow;
+    c[ImGuiCol_ScrollbarGrab] = with_alpha(kCream, 0.22f);
+    c[ImGuiCol_ScrollbarGrabHovered] = with_alpha(kCream, 0.32f);
+    c[ImGuiCol_ScrollbarGrabActive] = with_alpha(kCream, 0.42f);
+    c[ImGuiCol_PlotLines] = c[ImGuiCol_PlotHistogram] = kGlow;
+    c[ImGuiCol_TextSelectedBg] = with_alpha(kGlow, 0.35f);
+    c[ImGuiCol_NavCursor] = kGlow;
+    c[ImGuiCol_TableHeaderBg] = ImVec4(1, 1, 1, 0.05f);
+    c[ImGuiCol_TableBorderStrong] = with_alpha(kCream, 0.18f);
+    c[ImGuiCol_TableBorderLight] = with_alpha(kCream, 0.10f);
+}
+
+// the colours, style and fonts of the chosen theme (render thread, between frames)
+void apply_theme() {
+    if (game_theme()) {
+        kAccent = ImVec4(0.12f, 0.52f, 0.66f, 1.0f);  // a deep Sheikah teal: fills under cream text
+        kAccentHover = ImVec4(0.17f, 0.60f, 0.75f, 1.0f);
+        kAccentDown = ImVec4(0.09f, 0.43f, 0.56f, 1.0f);
+        kLabel = ImVec4(0.97f, 0.95f, 0.88f, 0.96f);
+        kSecondary = ImVec4(0.86f, 0.82f, 0.70f, 0.66f);
+        kOrange = ImVec4(0.98f, 0.70f, 0.25f, 1.0f);
+        kRed = ImVec4(0.95f, 0.40f, 0.33f, 1.0f);
+    } else {
+        kAccent = ImVec4(0.04f, 0.52f, 1.00f, 1.0f);
+        kAccentHover = ImVec4(0.20f, 0.60f, 1.00f, 1.0f);
+        kAccentDown = ImVec4(0.02f, 0.42f, 0.88f, 1.0f);
+        kLabel = ImVec4(1.0f, 1.0f, 1.0f, 0.92f);
+        kSecondary = ImVec4(0.92f, 0.92f, 0.96f, 0.58f);
+        kOrange = ImVec4(1.0f, 0.62f, 0.04f, 1.0f);
+        kRed = ImVec4(1.0f, 0.37f, 0.34f, 1.0f);
+    }
+    setup_style();
+    const bool game_fonts = game_theme() && g_game_font;
+    g_font = game_fonts ? g_game_font : g_glass_font;
+    g_bold = game_fonts ? g_game_bold : g_glass_bold;
+    ImGui::GetIO().FontDefault = g_font;
+}
+
+// Settings > Display > Menu: the style (remembered as menuStyle = glass / game) and the pause (menuPause)
+void set_menu_style(int theme) {
+    if (g_theme.exchange(theme) == theme) return;
+    LOG("[overlay] menu style: %s", theme == kThemeGame ? "game style" : "Liquid Glass");
+    hostui::post([theme] { hostui::set("menuStyle", theme == kThemeGame ? "game" : "glass"); });
+}
+void set_menu_pause(bool on) {
+    if (g_pause_on.exchange(on) == on) return;
+    game_pause::wanted = on && g_open.load();
+    LOG("[overlay] pause while the menu is open: %s", on ? "on" : "off");
+    hostui::post([on] { hostui::set("menuPause", on ? "1" : "0"); });
+}
+
+// game style: a panel's frame: a second line inside the border, corner brackets and a small diamond at the
+// top (drawn under the window's content)
+void game_frame(ImDrawList* dl, ImVec2 a, ImVec2 b, bool ornament = true) {
+    const float in = 4;
+    dl->AddRect(ImVec2(a.x + in, a.y + in), ImVec2(b.x - in, b.y - in), col32(with_alpha(kCream, 0.12f)), 3);
+    const float L = 14, t = 1.6f;
+    const ImU32 c = col32(with_alpha(kCream, 0.70f));
+    auto corner = [&](ImVec2 p, float dx, float dy) {
+        dl->AddLine(p, ImVec2(p.x + dx * L, p.y), c, t);
+        dl->AddLine(p, ImVec2(p.x, p.y + dy * L), c, t);
+    };
+    corner(ImVec2(a.x + 1, a.y + 1), 1, 1);
+    corner(ImVec2(b.x - 1, a.y + 1), -1, 1);
+    corner(ImVec2(a.x + 1, b.y - 1), 1, -1);
+    corner(ImVec2(b.x - 1, b.y - 1), -1, -1);
+    if (!ornament) return;
+    const float cx = (a.x + b.x) * 0.5f, r = 4.5f;
+    const ImVec2 d[4] = {ImVec2(cx, a.y - r + 1), ImVec2(cx + r, a.y + 1), ImVec2(cx, a.y + r + 1), ImVec2(cx - r, a.y + 1)};
+    dl->AddConvexPolyFilled(d, 4, col32(ImVec4(0.03f, 0.04f, 0.05f, 1)));
+    dl->AddPolyline(d, 4, col32(kGlow), 1.4f, ImDrawFlags_Closed);
+}
+// game style: the highlight of the chosen item: a cyan frame with a soft glow around it
+void game_select(ImDrawList* dl, ImVec2 a, ImVec2 b, bool strong = true) {
+    for (int i = 3; i >= 1; i--)
+        dl->AddRect(ImVec2(a.x - i, a.y - i), ImVec2(b.x + i, b.y + i), col32(with_alpha(kGlow, strong ? 0.07f * (4 - i) : 0.03f * (4 - i))), 4 + i, 1.5f);
+    dl->AddRectFilled(a, b, col32(with_alpha(kGlow, strong ? 0.16f : 0.08f)), 3);
+    dl->AddRect(a, b, col32(with_alpha(kGlow, strong ? 0.95f : 0.45f)), 3, 1.5f);
 }
 
 // the window backgrounds: none on glass; dense dark ones where the renderer has no glass (Vulkan)
 void apply_backgrounds() {
     ImVec4* c = ImGui::GetStyle().Colors;
-    const bool glass = g_glass.load(std::memory_order_relaxed);
+    const bool glass = glass_on();
     // sRGB targets blend in linear light: the fallback stays dense
-    c[ImGuiCol_WindowBg] = glass ? ImVec4(0, 0, 0, 0) : ImVec4(0.11f, 0.11f, 0.13f, 0.97f);
-    c[ImGuiCol_PopupBg] = glass ? ImVec4(0, 0, 0, 0) : ImVec4(0.15f, 0.15f, 0.17f, 0.98f);
-    c[ImGuiCol_ModalWindowDimBg] = glass ? ImVec4(0, 0, 0, 0) : ImVec4(0, 0, 0, 0.35f);  // glass: the renderer dims
+    const bool game = game_theme();
+    c[ImGuiCol_WindowBg] = glass ? ImVec4(0, 0, 0, 0) : game ? ImVec4(0.016f, 0.024f, 0.032f, 0.90f) : ImVec4(0.11f, 0.11f, 0.13f, 0.97f);
+    c[ImGuiCol_PopupBg] = glass ? ImVec4(0, 0, 0, 0) : game ? ImVec4(0.02f, 0.03f, 0.04f, 0.96f) : ImVec4(0.15f, 0.15f, 0.17f, 0.98f);
+    c[ImGuiCol_ModalWindowDimBg] = glass ? ImVec4(0, 0, 0, 0) : ImVec4(0, 0, 0, game ? 0.45f : 0.35f);  // glass: the renderer dims
+    if (game) c[ImGuiCol_Border] = with_alpha(kCream, 0.30f);
     ImGui::GetStyle().WindowBorderSize = glass ? 0.0f : 1.0f;
     ImGui::GetStyle().PopupBorderSize = glass ? 0.0f : 1.0f;
 }
@@ -360,6 +485,29 @@ void setup_fonts() {
         g_font = io.Fonts->AddFontDefaultVector(&cfg);
     }
     if (!g_bold) g_bold = g_font;
+    g_glass_font = g_font;
+    g_glass_bold = g_bold;
+#if defined(__APPLE__)
+    // the game style's lettering: Avenir Next Medium and Demi Bold (faces 5 and 2 of the collection)
+    static const char* const avenir = "/System/Library/Fonts/Avenir Next.ttc";
+    if (exists(avenir)) {
+        auto face = [&](int index) -> ImFont* {
+            ImFontConfig cfg;
+            cfg.FontNo = index;
+            ImFont* f = io.Fonts->AddFontFromFileTTF(avenir, kBodySize, &cfg);
+            static const char* const fallback = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
+            if (f && exists(fallback)) {
+                ImFontConfig merge;
+                merge.MergeMode = true;
+                io.Fonts->AddFontFromFileTTF(fallback, kBodySize, &merge);
+            }
+            return f;
+        };
+        g_game_font = face(5);
+        g_game_bold = g_game_font ? face(2) : nullptr;
+        if (!g_game_bold) g_game_bold = g_game_font;
+    }
+#endif
     io.FontDefault = g_font;
 }
 
@@ -576,7 +724,7 @@ void sheet_title(const char* text) {
 // Returns true when it was chosen now.
 bool radio(const char* label, bool active, bool enabled = true) {
     ImGui::BeginDisabled(!enabled);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ImGui::GetFrameHeight() * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, game_theme() ? 3.0f : ImGui::GetFrameHeight() * 0.5f);
     if (active) {
         ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHover);
@@ -623,14 +771,17 @@ bool toggle(const char* label, bool* v) {
     ImVec4 on = hovered ? kAccentHover : kAccent;
     ImVec4 track(off.x + (on.x - off.x) * e, off.y + (on.y - off.y) * e, off.z + (on.z - off.z) * e, off.w + (on.w - off.w) * e);
     ImDrawList* dl = w->DrawList;
-    dl->AddRectFilled(a, b, col32(track), h * 0.5f);
+    const bool game = game_theme();
+    if (game) track = ImVec4(off.x + (on.x - off.x) * e, off.y + (on.y - off.y) * e, off.z + (on.z - off.z) * e, 0.10f + (1.0f - 0.10f) * e);
+    dl->AddRectFilled(a, b, col32(track), game ? 3.0f : h * 0.5f);
+    if (game) dl->AddRect(a, b, col32(with_alpha(e > 0.5f ? kGlow : kCream, e > 0.5f ? 0.80f : 0.30f)), 3.0f);
     const float kr = h * 0.5f - 2.0f;
     const float knob_w = held ? kr * 0.35f : 0.0f;  // the knob stretches while pressed
     const ImVec2 kc(a.x + h * 0.5f + e * (tw - h), a.y + h * 0.5f);
     dl->AddRectFilled(ImVec2(kc.x - kr - knob_w * (1 - e), kc.y - kr + 1), ImVec2(kc.x + kr + knob_w * e, kc.y + kr + 1),
                       col32(ImVec4(0, 0, 0, 0.22f)), kr);
     dl->AddRectFilled(ImVec2(kc.x - kr - knob_w * (1 - e), kc.y - kr), ImVec2(kc.x + kr + knob_w * e, kc.y + kr),
-                      col32(ImVec4(1, 1, 1, 1)), kr);
+                      col32(game ? kCream : ImVec4(1, 1, 1, 1)), game ? 2.0f : kr);
     if (label_size.x > 0) ImGui::RenderText(ImVec2(b.x + st.ItemInnerSpacing.x + 2, pos.y + st.FramePadding.y), label);
     ImGui::RenderNavCursor(ImRect(a, b), id, ImGuiNavRenderCursorFlags_None, h * 0.5f);
     return pressed;
@@ -878,6 +1029,21 @@ void tab_display() {
     help(!strcmp(hostui::name(), "AppKit") ? "The TV window (Cmd+F); remembered for the next start"
                                            : "The TV window (F11 or Alt+Enter); remembered for the next start");
 #endif
+    heading("Menu");
+    {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Style");
+        ImGui::SameLine();
+        if (radio("Liquid Glass", !game_theme())) set_menu_style(kThemeGlass);
+        ImGui::SameLine();
+        if (radio("Game style", game_theme())) set_menu_style(kThemeGame);
+        help("How the Home menu, these settings and the performance overlay look: macOS Liquid Glass, or dark "
+             "panels with thin frames and a cyan highlight in the manner of the game's own menus");
+        if (!g_glass && !game_theme()) note("This renderer has no Liquid Glass: the menus get dark panels instead.");
+        if (check("Pause the game while the menu is open", g_pause_on.load(), &v)) set_menu_pause(v);
+        help("The game stops at its next frame while the Home menu or these settings show, sound too, and goes on "
+             "from there when they close. Changes that need new frames (internal resolution, effects) show then.");
+    }
     heading("Picture scaling");
     static const char* const f[] = {"Smooth", "Sharp", "Integer scale (pixel exact)"};
     const bool fok = hostui::scale_filter_available();
@@ -1549,7 +1715,8 @@ void frame_graph(float w, float h) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::Dummy(ImVec2(w, h));
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(ImVec4(1, 1, 1, 0.06f)), 8);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(ImVec4(1, 1, 1, game_theme() ? 0.04f : 0.06f)), game_theme() ? 2.0f : 8.0f);
+    if (game_theme()) dl->AddRect(p, ImVec2(p.x + w, p.y + h), col32(with_alpha(kCream, 0.16f)), 2.0f);
     float top = 50.0f;
     for (float f : U.frame_ms) top = std::max(top, std::min(f * 1.15f, 120.0f));
     const float pad = 4;
@@ -1565,8 +1732,9 @@ void frame_graph(float w, float h) {
     for (int i = 0; i < n; i++) pts[i] = ImVec2(p.x + pad + i * dx, y_of(U.frame_ms[(U.frame_i + i) % n]));
     const float base = p.y + h - pad;
     for (int i = 0; i + 1 < n; i++)
-        dl->AddQuadFilled(pts[i], pts[i + 1], ImVec2(pts[i + 1].x, base), ImVec2(pts[i].x, base), col32(with_alpha(kAccent, 0.16f)));
-    dl->AddPolyline(pts, n, col32(kAccentHover), 1.5f);
+        dl->AddQuadFilled(pts[i], pts[i + 1], ImVec2(pts[i + 1].x, base), ImVec2(pts[i].x, base),
+                          col32(with_alpha(game_theme() ? kGlow : kAccent, game_theme() ? 0.12f : 0.16f)));
+    dl->AddPolyline(pts, n, col32(game_theme() ? kGlow : kAccentHover), 1.5f);
 }
 
 void perf_window(bool menu_open) {
@@ -1581,13 +1749,17 @@ void perf_window(bool menu_open) {
     float worst = 0, sum = 0;
     for (float f : U.frame_ms) { worst = std::max(worst, f); sum += f; }
     ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
-    if (!g_glass) ImGui::SetNextWindowBgAlpha(0.70f);
+    if (!glass_on()) ImGui::SetNextWindowBgAlpha(game_theme() ? 0.84f : 0.70f);
     ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 12));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 20.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, game_theme() ? 4.0f : 20.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 3));
     if (ImGui::Begin("##perf", nullptr, fl)) {
+        if (game_theme()) {
+            const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            game_frame(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y), false);
+        }
         // the frame rate large, frame time beside it
         const float y0 = ImGui::GetCursorPosY();
         ImGui::PushFont(g_bold, 34.0f);
@@ -1939,12 +2111,18 @@ void draw_icon(ImDrawList* dl, int tab, ImVec2 o, float sz) {
         ImVec4(0.00f, 0.66f, 0.68f, 1),  // Mods: teal
         ImVec4(0.37f, 0.36f, 0.90f, 1),  // Language & About: indigo
     };
-    const ImVec4 tile = tiles[tab];
-    const ImU32 white = col32(ImVec4(1, 1, 1, 1)), ink = col32(tile);
+    const bool game = game_theme();
+    const ImVec4 tile = game ? ImVec4(0.05f, 0.07f, 0.09f, 1) : tiles[tab];
+    const ImU32 white = col32(game ? kCream : ImVec4(1, 1, 1, 1)), ink = col32(tile);
     const float k = sz / 22.0f;  // glyphs drawn on a 22 pt grid
     auto P = [&](float x, float y) { return ImVec2(o.x + x * k, o.y + y * k); };
-    dl->AddRectFilled(o, P(22, 22), col32(ImVec4(tile.x * 1.12f, tile.y * 1.12f, tile.z * 1.12f, 1)), 6 * k);
-    dl->AddRectFilled(P(0, 11), P(22, 22), col32(tile), 6 * k, ImDrawFlags_RoundCornersBottom);  // a faint top-lit gradient
+    if (game) {  // a dark tile with a thin frame, cream glyph
+        dl->AddRectFilled(o, P(22, 22), ink, 3 * k);
+        dl->AddRect(o, P(22, 22), col32(with_alpha(kCream, 0.35f)), 3 * k);
+    } else {
+        dl->AddRectFilled(o, P(22, 22), col32(ImVec4(tile.x * 1.12f, tile.y * 1.12f, tile.z * 1.12f, 1)), 6 * k);
+        dl->AddRectFilled(P(0, 11), P(22, 22), col32(tile), 6 * k, ImDrawFlags_RoundCornersBottom);  // a faint top-lit gradient
+    }
     switch (tab) {
     case kGraphics: {  // sparkles
         const ImVec2 big[4] = {P(9, 3.5f), P(11, 9), P(9, 14.5f), P(7, 9)};
@@ -2018,7 +2196,11 @@ bool sidebar_item(int i, bool selected) {
     const bool hovered = ImGui::IsItemHovered();
     ImGui::PopID();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    if (selected) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(kAccent), 9);
+    const bool focused = ImGui::IsItemFocused();
+    if (game_theme()) {
+        if (selected || focused) game_select(dl, p, ImVec2(p.x + w, p.y + h), selected);
+        else if (hovered) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(with_alpha(kGlow, 0.08f)), 3);
+    } else if (selected) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(kAccent), 9);
     else if (hovered) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(ImVec4(1, 1, 1, 0.08f)), 9);
     draw_icon(dl, i, ImVec2(p.x + 7, p.y + 5), 22);
     dl->AddText(ImVec2(p.x + 38, p.y + (h - ImGui::GetFontSize()) * 0.5f), col32(selected ? ImVec4(1, 1, 1, 1) : kLabel), kTabNames[i]);
@@ -2034,6 +2216,14 @@ bool window_buttons() {
     if (hovered) ImGui::SetTooltip("Close (Esc)");
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 c(p.x + r, p.y + r);
+    if (game_theme()) {  // a framed cross
+        const ImU32 ink = col32(with_alpha(hovered ? kGlow : kCream, hovered ? 1.0f : 0.70f));
+        dl->AddRect(p, ImVec2(p.x + 2 * r, p.y + 2 * r), ink, 2, 1.2f);
+        const float x = r * 0.45f;
+        dl->AddLine(ImVec2(c.x - x, c.y - x), ImVec2(c.x + x, c.y + x), ink, 1.4f);
+        dl->AddLine(ImVec2(c.x - x, c.y + x), ImVec2(c.x + x, c.y - x), ink, 1.4f);
+        return clicked;
+    }
     dl->AddCircleFilled(c, r, col32(kRed), 20);
     if (hovered) {
         const float x = r * 0.42f;
@@ -2075,10 +2265,11 @@ void settings_window() {
         U.select_tab = -1;
         const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         const float inset = 10, sidebar = std::min(236.0f, ws.x * 0.28f);
+        if (game_theme()) game_frame(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
         // the sidebar: a floating pane of lighter glass inside the window
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(ImVec2(wp.x + inset, wp.y + inset), ImVec2(wp.x + sidebar, wp.y + ws.y - inset),
-                          col32(ImVec4(1, 1, 1, g_glass ? 0.07f : 0.05f)), ImGui::GetStyle().WindowRounding - inset);
+                          col32(ImVec4(1, 1, 1, glass_on() ? 0.07f : game_theme() ? 0.025f : 0.05f)), ImGui::GetStyle().WindowRounding - inset);
         dl->AddRect(ImVec2(wp.x + inset, wp.y + inset), ImVec2(wp.x + sidebar, wp.y + ws.y - inset),
                     col32(ImVec4(1, 1, 1, 0.08f)), ImGui::GetStyle().WindowRounding - inset);
         ImGui::SetCursorPos(ImVec2(inset, inset));
@@ -2165,6 +2356,21 @@ bool home_row(const char* label, bool danger = false) {
     const bool clicked = ImGui::InvisibleButton(label, ImVec2(w, h), ImGuiButtonFlags_EnableNav);
     const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused(), down = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (game_theme()) {  // a line of the list: the chosen one framed in cyan with a pointer before it
+        const char* end = ImGui::FindRenderedTextEnd(label);
+        if (hot) game_select(dl, p, ImVec2(p.x + w, p.y + h), !down);
+        ImGui::PushFont(g_bold, kBodySize + 2);
+        const ImVec2 ts = ImGui::CalcTextSize(label, end);
+        const float tx = p.x + 34, ty = p.y + (h - ts.y) * 0.5f;
+        if (hot) {
+            const float cy = p.y + h * 0.5f;
+            const ImVec2 tri[3] = {ImVec2(p.x + 14, cy - 5), ImVec2(p.x + 21, cy), ImVec2(p.x + 14, cy + 5)};
+            dl->AddTriangleFilled(tri[0], tri[1], tri[2], col32(kGlow));
+        }
+        dl->AddText(ImVec2(tx, ty), col32(danger ? with_alpha(kRed, hot ? 1.0f : 0.85f) : hot ? ImVec4(1, 1, 1, 1) : kLabel), label, end);
+        ImGui::PopFont();
+        return clicked;
+    }
     const ImVec4 fill = !hot ? ImVec4(1, 1, 1, 0.08f) : danger ? with_alpha(kRed, down ? 0.75f : 0.90f) : down ? kAccentDown : kAccent;
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col32(fill), h * 0.5f);
     const char* end = ImGui::FindRenderedTextEnd(label);
@@ -2195,13 +2401,29 @@ void home_window() {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 9));
     // one window per screen, so each one starts with its default button focused
     if (ImGui::Begin(quit ? "##home_quit" : "##home_menu", nullptr, fl)) {
+        const bool game = game_theme();
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        if (game) game_frame(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+        const char* title = quit ? "Quit Breath of the Wild?" : "Breath of the Wild";
         ImGui::PushFont(g_bold, kTitleSize);
-        ImGui::TextUnformatted(quit ? "Quit Breath of the Wild?" : "Breath of the Wild");
+        if (game) ImGui::SetCursorPosX((ws.x - ImGui::CalcTextSize(title).x) * 0.5f);  // centred, as the game's titles
+        ImGui::TextUnformatted(title);
         ImGui::PopFont();
+        const char* sub = quit ? "Progress since your last in-game save is lost."
+                        : game_pause::wanted.load() ? "The game is paused." : "The game keeps running behind this menu.";
         ImGui::PushStyleColor(ImGuiCol_Text, kSecondary);
-        if (quit) ImGui::TextWrapped("Progress since your last in-game save is lost.");
-        else ImGui::TextUnformatted("The game keeps running behind this menu.");
+        if (game) ImGui::SetCursorPosX(std::max(22.0f, (ws.x - ImGui::CalcTextSize(sub).x) * 0.5f));
+        ImGui::TextWrapped("%s", sub);
         ImGui::PopStyleColor();
+        if (game) {  // a rule with a diamond at its middle under the title
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float y = ImGui::GetCursorScreenPos().y + 6, x0 = wp.x + 30, x1 = wp.x + ws.x - 30, cx = wp.x + ws.x * 0.5f;
+            dl->AddLine(ImVec2(x0, y), ImVec2(cx - 8, y), col32(with_alpha(kCream, 0.35f)), 1);
+            dl->AddLine(ImVec2(cx + 8, y), ImVec2(x1, y), col32(with_alpha(kCream, 0.35f)), 1);
+            const ImVec2 d[4] = {ImVec2(cx, y - 4), ImVec2(cx + 4, y), ImVec2(cx, y + 4), ImVec2(cx - 4, y)};
+            dl->AddConvexPolyFilled(d, 4, col32(kGlow));
+            ImGui::Dummy(ImVec2(0, 12));
+        }
         ImGui::Dummy(ImVec2(0, 4));
         if (!quit) {
             if (home_row("Resume")) set_open(false);
@@ -2224,11 +2446,33 @@ void home_window() {
             ImGui::SetItemDefaultFocus();
         }
         ImGui::Dummy(ImVec2(0, 2));
-        ImGui::PushFont(nullptr, kSmallSize);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 0.40f));
-        ImGui::TextUnformatted(quit ? "A chooses  ·  B or Esc goes back" : "A chooses  ·  B, Esc or Home resumes");
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
+        if (game) {  // the controls, right-aligned: (A) Select  (B) Back, as button glyphs
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImGui::PushFont(nullptr, kSmallSize + 1);
+            const char* back_label = quit ? "Back" : "Resume";
+            auto width = [&](const char* t) { return 18 + 6 + ImGui::CalcTextSize(t).x; };
+            const float total = width("Select") + 18 + width(back_label);
+            ImVec2 p(wp.x + ws.x - 22 - total, ImGui::GetCursorScreenPos().y + 2);
+            auto glyph = [&](const char* letter, const char* text) {
+                const ImVec2 c(p.x + 9, p.y + 9);
+                dl->AddCircleFilled(c, 9, col32(with_alpha(kCream, 0.90f)), 20);
+                const ImVec2 ls = ImGui::CalcTextSize(letter);
+                dl->AddText(ImVec2(c.x - ls.x * 0.5f, c.y - ls.y * 0.5f), col32(ImVec4(0.03f, 0.04f, 0.05f, 1)), letter);
+                const ImVec2 ts = ImGui::CalcTextSize(text);
+                dl->AddText(ImVec2(p.x + 24, c.y - ts.y * 0.5f), col32(kLabel), text);
+                p.x += width(text) + 18;
+            };
+            glyph("A", "Select");
+            glyph("B", back_label);
+            ImGui::Dummy(ImVec2(0, 20));
+            ImGui::PopFont();
+        } else {
+            ImGui::PushFont(nullptr, kSmallSize);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 0.40f));
+            ImGui::TextUnformatted(quit ? "A chooses  ·  B or Esc goes back" : "A chooses  ·  B, Esc or Home resumes");
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
+        }
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -2239,7 +2483,7 @@ void home_window() {
 // the windows that sit on glass this frame, in target pixels (after Render: positions are final)
 void collect_glass(float scale) {
     g_panels.clear();
-    if (!g_glass.load(std::memory_order_relaxed)) return;
+    if (!glass_on()) return;  // the game style draws its own panels
     ImGuiContext& g = *ImGui::GetCurrentContext();
     for (ImGuiWindow* w : g.Windows) {
         if (!w->Active || w->Hidden || (w->Flags & ImGuiWindowFlags_ChildWindow) || !w->DrawList || w->DrawList->CmdBuffer.Size == 0)
@@ -2278,6 +2522,7 @@ void open_screen(bool open, int screen) {
         g_screen = screen;
         g_settings_from_home = false;
     }
+    game_pause::wanted = open && g_pause_on.load();  // the game parks at its next frame (gx2_core.cpp)
     if (g_open.exchange(open) == open) return;
     for (auto& k : g_held_keys) k = false;
     input::release_keys();  // keys held now belong to the menu (opening) or are not stuck in the game (closing)
@@ -2411,6 +2656,8 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         std::string v;
         if (hostui::get("perfOverlay", v)) g_perf = v == "1";
         if (hostui::get("metalHud", v)) g_metal_hud = v == "1";
+        if (hostui::get("menuStyle", v)) g_theme = v == "game" ? kThemeGame : kThemeGlass;
+        if (hostui::get("menuPause", v)) g_pause_on = v != "0";
         // the saved controller choice (WWHD_PRO_CONTROLLER wins); it also hides or shows the GamePad screen
         if (!getenv("WWHD_PRO_CONTROLLER") && hostui::get("proController", v))
             hostui::post([pro = v == "1"] { hostui::set_pro_controller(pro); });
@@ -2531,6 +2778,14 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         }
     }
     apply_capture();
+    {
+        static int applied = -1;  // the menu style takes effect between frames
+        const int theme = g_theme.load(std::memory_order_relaxed);
+        if (applied != theme) {
+            applied = theme;
+            apply_theme();
+        }
+    }
     const int face[4] = {input_map::face_input(input_map::kA), input_map::face_input(input_map::kB),
                           input_map::face_input(input_map::kX), input_map::face_input(input_map::kY)};
     U.gamepad_navigation.feed(io, U.values, U.prev, open && U.cap_action < 0, mouse_used, face);  // the text prompt reads the controller itself
@@ -2554,7 +2809,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
     if (perf) perf_window(open);
     if (!toast.empty()) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 28), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-        if (!g_glass) ImGui::SetNextWindowBgAlpha(0.8f);
+        if (!glass_on()) ImGui::SetNextWindowBgAlpha(game_theme() ? 0.9f : 0.8f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 11));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 22.0f);
         ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(io.DisplaySize.x * 0.8f, FLT_MAX));

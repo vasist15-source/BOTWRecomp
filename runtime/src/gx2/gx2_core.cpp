@@ -6,6 +6,7 @@
 #include "../perf_metrics.h"
 #include "../platform/host.h"
 #include "../savestate.h"
+#include "../game_pause.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
@@ -902,9 +903,14 @@ constexpr uint32_t kUiSpeedConst = 0x102C1DD4u;
 constexpr uint32_t kGyroPerFrameConst = 0x101B2D34u;
 void set_f32(uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); st32(a, u); }
 float get_f32(uint32_t a) { uint32_t u = ld32(a); float v; memcpy(&v, &u, 4); return v; }
+bool g_after_pause = false;  // the game thread was parked (game_pause.h): the next frame's time is one frame
 // game thread, once per frame (GX2SwapScanBuffers)
 void fps_frame() {
     static auto last = std::chrono::steady_clock::now();
+    if (g_after_pause) {  // the menu's pause is no time the game should step through
+        g_after_pause = false;
+        last = std::chrono::steady_clock::now() - std::chrono::microseconds(1000000 / std::max(gx2::fps_target(), 20));
+    }
     static double hist[4] = {1 / 30.0, 1 / 30.0, 1 / 30.0, 1 / 30.0};
     static int hi = 0;
     static bool wasActive = false;
@@ -1343,7 +1349,41 @@ static void freeze_watchdog() {
         threads::dump_threads(why);
     }
 }
+// The menu's pause (game_pause.h): the game's frame thread parks here, at the start of a swap, so the game
+// stops between two frames. Its last picture is shown again ~60 times a second, each time as a swap of
+// that same picture (counted like one, so the flips the game is told about stay matched with the frames
+// the renderer completed), and the overlay draws on those presents.
+static uint32_t g_last_aspect_bits = 0;
+static void pause_hold() {
+    if (!game_pause::wanted.load(std::memory_order_relaxed)) return;
+    LOG("[pause] game paused (menu open)");
+    game_pause::held = true;
+    {
+        BlockingScope b;  // the guest core is free while the game waits
+        auto next = std::chrono::steady_clock::now();
+        while (game_pause::wanted.load(std::memory_order_relaxed)) {
+            g_last_swap_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();  // not a freeze
+            emit_host(OP_SWAP, {g_last_aspect_bits, 1u});
+            {
+                std::lock_guard<std::mutex> lk(g_flip_mutex);
+                update_flips();
+                g_swap_count++;
+                g_pending_flips.push_back({g_swap_count, std::chrono::steady_clock::now()});
+            }
+            next += std::chrono::microseconds(16667);
+            const auto now = std::chrono::steady_clock::now();
+            if (next < now) next = now;
+            std::this_thread::sleep_until(next);
+        }
+    }
+    game_pause::held = false;
+    g_after_pause = true;
+    LOG("[pause] game resumed");
+}
+
 HLE(gx2, GX2SwapScanBuffers) {
+    pause_hold();
     {
         g_last_swap_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         static const bool watch = !getenv("WWHD_NO_FREEZE_WATCH");
@@ -1374,6 +1414,7 @@ HLE(gx2, GX2SwapScanBuffers) {
     float a = aspect::on_swap();  // aspect ratio of the next frame (game projections, render targets)
     uint32 ab;
     memcpy(&ab, &a, 4);
+    g_last_aspect_bits = ab;
     // the frame drew no new logic step (an interpolation hold pass): for the render-thread profiler
     static uint64_t lastSteps = ~0ull;
     const uint64_t steps = interp::logic_steps();
