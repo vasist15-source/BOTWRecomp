@@ -731,6 +731,8 @@ the kept installer copy have not been played yet. The release build is installed
   notes say so. ctest 125 of 135, the 10 known failures; rumble_test passes.
 - The player's path from the DMG, mounted read-only, in a scratch home with an empty environment: install with
   --keep-build, 307 files compiled, linked and bundled in 335 s; the binary has the pause, rumble and menu style code.
+- 2026-11-17: the menu pause play-tested by the user on the /Applications build (ba92ab4's code): works. Rumble still
+  unplayed (not in that build); the game menu style not reported on.
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
