@@ -1,4 +1,5 @@
 #include "../game_clock.h"
+#include "../game_pause.h"
 // snd_core (AX): voices, the 3 ms audio frame, mixing and output.
 //
 // Every frame (96 samples at 32 kHz) each playing voice is decoded (ADPCM/PCM16/PCM8),
@@ -570,6 +571,13 @@ void frame_thread() {
     threads::set_service_core(0);  // the game's audio threads live on core 0
     auto next = std::chrono::steady_clock::now();
     while (g_running) {
+        // the menu's pause (game_pause.h): no audio frames while the game is parked; the device plays
+        // silence and the voices go on from where they stopped
+        if (game_pause::held.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            next = std::chrono::steady_clock::now();
+            continue;
+        }
         // pace frames by the device: run slightly faster/slower to keep ~40 ms queued
         double level = (double)(audio::buffered_frames() - audio::target_frames()) / audio::target_frames();
         double stretch = 1.0 + std::clamp(level * 0.05, -0.05, 0.05);

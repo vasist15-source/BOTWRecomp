@@ -31,6 +31,7 @@ bool drc_window_shown();
 void show_drc_window(bool on);
 // quit_prompt.mm
 void request_restart();
+void quit_without_asking();
 }  // namespace gfx
 
 namespace hostui {
@@ -101,6 +102,7 @@ void set_clipboard(const std::string& text) {
 }
 bool can_restart() { return true; }
 void restart_game() { gfx::request_restart(); }
+void quit_game() { gfx::quit_without_asking(); }
 bool can_open_folder() { return true; }
 void open_folder(const std::string& path) {
     [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()] isDirectory:YES]];

@@ -54,7 +54,9 @@ bool can_restart();                // restart_game works on this host (macOS)
 // main thread: quit and start the game again with the same arguments (Settings > Mods > Restart now);
 // while a game is in progress it asks first, as Quit does
 void restart_game();
-bool can_open_folder();            // open_folder works on this host (not on Android)
+// main thread: quit now without asking (the game asked already: Quit Game in the pause menu, quit_game.cpp)
+void quit_game();
+bool can_open_folder();           // open_folder works on this host (not on Android)
 void open_folder(const std::string& path);    // main thread: show a folder in the file manager (Finder, Explorer, ...)
 
 // SDL host only (gfx/vulkan/overlay_sdl.cpp, called by its main loop)
