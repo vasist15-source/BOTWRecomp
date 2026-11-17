@@ -230,9 +230,9 @@ void install_menu(NSWindow* tv) {
         @"Saves the TV picture as a PNG (internal resolution, without the settings overlay) in the screenshots folder. "
         @"The key can be changed in Input > Controls (Screenshot).";
     add(g, @"    Open Screenshots Folder", @selector(openScreenshots:), @"");
-    add(g, @"Capture frame for debugging (P)", @selector(capture:), @"P").toolTip =
-        render::active() == render::Api::Vulkan ? @"Shortcut in game: P. Vulkan: the TV, GamePad and window pictures (the draw log is Metal only)"
-                                                 : @"Shortcut in game: P";
+    add(g, @"Capture frame for debugging (F12)", @selector(capture:), @"F12").toolTip =
+        render::active() == render::Api::Vulkan ? @"Shortcut in game: F12. Vulkan: the TV, GamePad and window pictures (the draw log is Metal only)"
+                                                 : @"Shortcut in game: F12. Saves every draw of one frame (about 1 GB; the game stops for a while)";
     add(g, @"Record 3 s of sound activity (9)", @selector(recordSound:), @"9");
     gfxItem.submenu = g;
 
@@ -304,7 +304,7 @@ bool menu_hotkey(uint16_t code) {
     case kVK_ANSI_7: gx2::set_fps_target(gx2::fps_target() == 0 ? 30 : 0); break;
     case kVK_ANSI_8: if (render::feature_available(render::kFeatureFXAA)) render::set_fxaa(!render::fxaa()); break;
     case kVK_ANSI_R: cycle_res(); break;
-    case kVK_ANSI_P: case kVK_F12: render::request_capture(); return true;
+    case kVK_F12: render::request_capture(); return true;  // not P: one letter too easily hit while playing (a 1 GB, 20 s capture)
     case kVK_ANSI_9: {
         // 3 s of sound activity (voice starts), without the frame capture's stall
         char path[96];
