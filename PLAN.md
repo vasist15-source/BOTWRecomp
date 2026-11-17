@@ -909,7 +909,7 @@ GameController claims and never shows: the 2015 Steam Controller, which macOS se
   what is pressed; sticks, triggers, D-pad and Start / Back do what they should in the game; rebind one input
   from the page; quit Steam while it runs (the pad should go, or fall back to GameController's).
 
-### 2026-11-17: the Controls page shows vector pictures of the controllers (not play-tested)
+### 2026-11-17: the Controls page shows vector pictures of the controllers (play-tested 2026-11-18: works)
 The page of ed99f2d was play-tested the same evening ("your session work works"), but the controllers drawn in
 code did not please: "can u get open source images from web for each controllers?". Public-domain photos from
 Wikimedia Commons were tried first and turned down ("i dont like this realistic style vector ones would look
@@ -935,6 +935,8 @@ better").
   was seen through the test's raster only.
   To play-test: Settings > Controls with each pad: the picture, the lines ending on the right buttons, a pressed
   button lighting up on it, a click on a button of the picture starting a rebind.
+- **Play-tested 2026-11-18** (the app built from f705f32): "works". The report does not say which pads were
+  connected, so the four pictures are not each confirmed on a real pad.
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
