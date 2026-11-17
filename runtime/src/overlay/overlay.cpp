@@ -7,6 +7,7 @@
 #include "../audio_out.h"
 #include "guest_hud.h"
 #include "gamepad_nav.h"
+#include "pane_focus.h"
 #include "../game_pause.h"
 #include "perf_average.h"
 #ifdef __ANDROID__
@@ -172,6 +173,7 @@ struct Ui {
     float values[input_map::kPadCount] = {};
     float prev[input_map::kPadCount] = {};
     GamepadNavigation gamepad_navigation;
+    PaneFocus pane;  // settings window: the controller's focus is in the sidebar or in the page
     ImVec2 mouse_position = {-FLT_MAX, -FLT_MAX};
     double options_since = -1;
     bool options_latched = false;
@@ -2263,17 +2265,29 @@ void settings_window() {
                           ImGuiWindowFlags_NoScrollWithMouse;
     bool open = true;
     if (U.just_opened) {
-        ImGui::SetNextWindowFocus();  // keyboard / controller navigation starts in the menu
+        ImGui::SetNextWindowFocus();  // keyboard / controller navigation starts in the menu,
+        U.pane.focus_sidebar();       // on the row of the page that is shown
         U.just_opened = false;
     }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     const bool shown = ImGui::Begin("Settings###settings", nullptr, fl);
     ImGui::PopStyleVar();
     if (shown) {
-        // L / R on a controller switch pages
-        if (U.cap_action < 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+        // the controller's (and the arrow keys') way between the sidebar and the page: pane_focus.h
+        const bool free = U.cap_action < 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+        const bool nav_right = free && (navigation_pressed(input_map::kPadDRight) || navigation_pressed(input_map::kPadLSRight) ||
+                                        ImGui::IsKeyPressed(ImGuiKey_RightArrow, false));
+        const bool nav_left = free && (navigation_pressed(input_map::kPadDLeft) || navigation_pressed(input_map::kPadLSLeft) ||
+                                       ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false));
+        U.pane.begin(free && U.gamepad_navigation.controller_active());
+        // L / R on a controller switch pages; the focus stays in its pane (the new page's row or first setting)
+        if (free) {
             if (navigation_pressed(input_map::kPadLB)) U.select_tab = (U.tab + kTabs - 1) % kTabs;
             if (navigation_pressed(input_map::kPadRB)) U.select_tab = (U.tab + 1) % kTabs;
+            if (U.select_tab >= 0 && U.select_tab != U.tab) {
+                if (U.pane.in_page()) U.pane.focus_page();
+                else U.pane.focus_sidebar();
+            }
         }
         int want = U.select_tab;
         U.select_tab = -1;
@@ -2289,8 +2303,9 @@ void settings_window() {
         ImGui::SetCursorPos(ImVec2(inset, inset));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 14));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 3));
-        ImGui::BeginChild("sidebar", ImVec2(sidebar - inset, ws.y - 2 * inset),
-                          ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_NavFlattened,
+        // the sidebar and the page are navigation scopes of their own (not NavFlattened): a move stays in
+        // its pane, and U.pane hands the focus from one to the other
+        ImGui::BeginChild("sidebar", ImVec2(sidebar - inset, ws.y - 2 * inset), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
         ImGui::SetCursorPos(ImVec2(16, 16));
         if (window_buttons()) open = false;
@@ -2302,15 +2317,23 @@ void settings_window() {
         ImGui::PopStyleColor();
         ImGui::PopFont();
         ImGui::Dummy(ImVec2(0, 2));
-        for (int i = 0; i < kTabs; i++)
-            if (sidebar_item(i, U.tab == i)) want = i;
+        for (int i = 0; i < kTabs; i++) {
+            // the row that is shown takes the focus when the page gives it back; `want` may be L / R's page
+            U.pane.before_row((want >= 0 ? want : U.tab) == i);
+            const bool clicked = sidebar_item(i, U.tab == i);
+            // A or Right on a row: its page, with the focus on the page's first setting
+            const bool opened = U.pane.after_row(clicked, nav_right);
+            if (clicked || opened) want = i;
+        }
         // keyboard / controller hint at the bottom
-        const float hint_h = kSmallSize * 3 + 12;
+        const float hint_h = kSmallSize * 4 + 16;
         ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + 8, ImGui::GetWindowHeight() - hint_h - 14));
         ImGui::PushFont(nullptr, kSmallSize);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 0.40f));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
-        ImGui::TextUnformatted(g_settings_from_home ? "Esc or B: back to the menu" : "Esc or B closes");
+        ImGui::TextUnformatted("A or \xE2\x96\xB6: into the page");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
+        ImGui::TextUnformatted(g_settings_from_home ? "B: back (Esc: to the menu)" : "B: back (Esc closes)");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
         ImGui::TextUnformatted("L / R switch pages");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
@@ -2332,10 +2355,11 @@ void settings_window() {
         const float py = ImGui::GetCursorPosY() + 6;
         ImGui::SetCursorPos(ImVec2(px, py));
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        ImGui::BeginChild("page", ImVec2(ws.x - px - 14, ws.y - py - 16), ImGuiChildFlags_NavFlattened);
+        ImGui::BeginChild("page", ImVec2(ws.x - px - 14, ws.y - py - 16));
         ImGui::PopStyleColor();
         g_page = ImGui::GetCurrentWindow();
         g_card = nullptr;
+        U.pane.begin_page(nav_left);  // before the page's items: the first one takes the focus when a row opened it
         ImGui::PushID(U.tab);
         switch (U.tab) {
         case kGraphics: tab_graphics(); break;
@@ -2354,10 +2378,12 @@ void settings_window() {
         g_page = nullptr;
     }
     ImGui::End();
-    // B (not while choosing an input or in a list), Esc or the close button: back to the Home menu when
-    // it opened these settings, else the menu closes
+    // B (not while choosing an input or in a list): in the page, back to the sidebar (or it only ends the
+    // edit of a slider); in the sidebar, as Esc or the close button: back to the Home menu when it opened
+    // these settings, else the menu closes
     if (!open) back();
-    else if (U.cap_action < 0 && navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+    else if (U.cap_action < 0 && navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used &&
+             !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !U.pane.back())
         back();
     g_pad_b_used = false;
 }
