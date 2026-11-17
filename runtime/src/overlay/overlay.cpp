@@ -1137,11 +1137,19 @@ void apply_capture() {
     }
 }
 
+// The controller the Controls page draws and names the host inputs after (input_map::host_pad).
+// WWHD_TEST_PAD_KIND=xbox|dualsense|dualshock4|switchpro|steam|generic shows that one without a controller.
+input_map::HostPad shown_pad() {
+    static const input_map::PadKind test = input_map::pad_kind_from_id(getenv("WWHD_TEST_PAD_KIND") ? getenv("WWHD_TEST_PAD_KIND") : "");
+    if (test != input_map::PadKind::kNone) return {test, std::string(input_map::pad_kind_label(test)) + " (test)"};
+    return input_map::host_pad();
+}
+
 std::string summary(const input_map::Mapping& m, int a) {
     std::string out;
     for (int k : m.keys[a])
         if (k != input_map::kNoKey) out += (out.empty() ? "" : "  -  ") + input_map::key_label(k);
-    if (m.pad[a] != input_map::kPadNone) out += (out.empty() ? "controller " : "  -  controller ") + std::string(input_map::pad_label(m.pad[a]));
+    if (m.pad[a] != input_map::kPadNone) out += (out.empty() ? "controller " : "  -  controller ") + std::string(input_map::pad_label(shown_pad().kind, m.pad[a]));
     for (int b : input_map::mouse_inputs(m, a)) out += (out.empty() ? "mouse " : "  -  mouse ") + std::string(input_map::mouse_label(b));
     return out.empty() ? "not bound" : out;
 }
@@ -1178,7 +1186,7 @@ void controls_list(input_map::Mapping& m, float h) {
                 std::string label;
                 if (U.cap_action == a && (U.cap_col == col || (U.cap_col == kColAny && col != kColKey1))) label = "...";
                 else if (col < 2) label = m.keys[a][col] == input_map::kNoKey ? "-" : input_map::key_label(m.keys[a][col]);
-                else label = m.pad[a] == input_map::kPadNone ? "-" : input_map::pad_label(m.pad[a]);
+                else label = m.pad[a] == input_map::kPadNone ? "-" : input_map::pad_label(shown_pad().kind, m.pad[a]);
                 label += "##c" + std::to_string(col);
                 if (ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0)) && U.cap_action < 0) start_capture(a, col);
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right) ||
@@ -1288,11 +1296,12 @@ void gyro_window(bool& open) {
         note("A Cemuhook (DSU) server: DS4Windows, BetterJoy, SteamDeckGyroDSU or a phone app; default 127.0.0.1, port 26760.");
     }
     // recalibrate: a controller input and/or a key
-    const char* pad_name = g.recenter_pad > 0 ? input_map::pad_label(g.recenter_pad) : "None";
+    const input_map::PadKind pad_kind = shown_pad().kind;
+    const char* pad_name = g.recenter_pad > 0 ? input_map::pad_label(pad_kind, g.recenter_pad) : "None";
     ImGui::SetNextItemWidth(220);
     if (ImGui::BeginCombo("Recalibrate: controller", pad_name)) {
         for (int p = 0; p < input_map::kPadCount; p++)
-            if (ImGui::Selectable(p ? input_map::pad_label(p) : "None", g.recenter_pad == p)) g.recenter_pad = p;
+            if (ImGui::Selectable(p ? input_map::pad_label(pad_kind, p) : "None", g.recenter_pad == p)) g.recenter_pad = p;
         ImGui::EndCombo();
     }
     std::string key_name = g.recenter_key >= 0 ? input_map::key_label(g.recenter_key) : "None";
@@ -1515,6 +1524,9 @@ void tab_controls() {
         status = std::to_string(n) + " input(s) are bound to more than one action (orange).";
     } else {
         status = "Select a button on the controller or a chip to rebind it. Changes are saved to controls.json.";
+        // which controller the drawing is; without one, why it is a Wii U controller
+        if (!U.list_view && shown_pad().kind == input_map::PadKind::kNone)
+            status += std::string("  No controller connected: the Wii U ") + (pro ? "Pro Controller" : "GamePad") + " is shown.";
     }
     const float bottom = ImGui::GetFrameHeightWithSpacing() * 2 + 4;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -1526,6 +1538,7 @@ void tab_controls() {
         ControlsView cv;
         cv.m = m;
         cv.pro = pro;
+        cv.host = shown_pad();
         cv.cap_action = U.cap_action;
         cv.cap_col = U.cap_col;
         static float live[input_map::kPadCount];

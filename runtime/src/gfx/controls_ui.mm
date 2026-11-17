@@ -40,6 +40,12 @@ static NSString* action_list(const std::vector<int>& v) {
     return [names componentsJoinedByString:@", "];
 }
 
+// what the connected controller calls a host input ("L2", "ZL"; input_map::host_pad, kept by input.mm):
+// the chips and the status line use its names. The drawing here stays the Wii U controller; the
+// settings overlay's Controls page (overlay/controls_view.cpp) draws the connected one.
+static const char* host_short(int p) { return pad_short_label(host_pad().kind, p); }
+static const char* host_long(int p) { return pad_label(host_pad().kind, p); }
+
 // capture modes: what a click is waiting for
 enum { kCapAny, kCapKey0, kCapKey1, kCapPad };
 // chip slots in a callout row
@@ -860,7 +866,7 @@ static NSRect x_rect(NSRect chip) { return NSMakeRect(NSMaxX(chip) - 7, chip.ori
     NSMutableArray* parts = [NSMutableArray array];
     for (int k : m.keys[a])
         if (k != kNoKey) [parts addObject:ns(key_label(k))];
-    if (m.pad[a] != kPadNone) [parts addObject:[NSString stringWithFormat:@"controller %@", ns(pad_label(m.pad[a]))]];
+    if (m.pad[a] != kPadNone) [parts addObject:[NSString stringWithFormat:@"controller %@", ns(host_long(m.pad[a]))]];
     return parts.count ? [parts componentsJoinedByString:@"  ·  "] : @"not bound";
 }
 
@@ -943,7 +949,7 @@ static NSRect x_rect(NSRect chip) { return NSMakeRect(NSMaxX(chip) - 7, chip.ori
     [stroke setStroke];
     b.lineWidth = capturing || hovered || twin || conflict ? 1.8 : 1;
     [b stroke];
-    NSString* text = capturing ? @"press…" : isPad ? ns(pad_short_label(code)) : ns(key_short_label(code));
+    NSString* text = capturing ? @"press…" : isPad ? ns(host_short(code)) : ns(key_short_label(code));
     if (conflict && !capturing) text = [@"⚠︎ " stringByAppendingString:text];
     NSColor* tc = held ? NSColor.whiteColor : capturing ? accent() : conflict ? warn() : NSColor.labelColor;
     draw_fit(text, NSInsetRect(r, 3, 0), 11, NSFontWeightMedium, tc);
@@ -1144,7 +1150,7 @@ static NSTextField* label(NSString* s) {
         if (pv.hoverSlot >= 0) {
             const char* slot = pv.hoverSlot == kSlotPad ? "controller" : pv.hoverSlot == kSlotKey1 ? "alternate key" : "key";
             bool bound = pv.hoverSlot == kSlotPad ? _st.m.pad[a] != kPadNone : _st.m.keys[a][pv.hoverSlot] != kNoKey;
-            NSString* cur = !bound ? @"none" : pv.hoverSlot == kSlotPad ? ns(pad_label(_st.m.pad[a])) : ns(key_label(_st.m.keys[a][pv.hoverSlot]));
+            NSString* cur = !bound ? @"none" : pv.hoverSlot == kSlotPad ? ns(host_long(_st.m.pad[a])) : ns(key_label(_st.m.keys[a][pv.hoverSlot]));
             s = [NSString stringWithFormat:@"%@ – %s: %@.  Click to change%@", ns(action_label(a)), slot, cur,
                                            bound ? @", right-click or × to clear." : @"."];
         } else {
@@ -1353,9 +1359,9 @@ static bool modifier_down(uint16_t code, NSEventModifierFlags f, bool* known) {
     [self commit];
     auto others = pad_users(_st.m, p, a);
     if (others.empty())
-        [self setStatus:[NSString stringWithFormat:@"%@ → %@", ns(action_label(a)), ns(pad_label(p))] level:0];
+        [self setStatus:[NSString stringWithFormat:@"%@ → %@", ns(action_label(a)), ns(host_long(p))] level:0];
     else
-        [self setStatus:[NSString stringWithFormat:@"“%@” is also bound to %@ — it now presses both.", ns(pad_label(p)),
+        [self setStatus:[NSString stringWithFormat:@"“%@” is also bound to %@ — it now presses both.", ns(host_long(p)),
                                                    action_list(others)]
                   level:1];
     LOG("[controls] %s pad = %s", action_id(a), pad_id(p));

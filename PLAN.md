@@ -834,6 +834,42 @@ when i press a or right dpad to get into sub menu it doesn't work".
   controller". The play report lock can only be confirmed by the crash staying away over more sessions.
 - Seen on the way, not touched: `pad_delivery_test` does not link (`hle_traced` undefined), one of the 10.
 
+### 2026-11-17: the Controls page draws the connected controller (not play-tested)
+Asked: "instead of emulating wiiu gamepad how bout we hook switch pro, xbox, playstation, steam controller directly
+removing a layer ... make this window show whatever controller we've connected".
+- **No layer to remove.** The game is the Wii U binary: it reads input only through `VPADRead` (GamePad) and
+  `KPADReadEx` (Pro Controller), and the Switch release's Pro Controller code is not in it. What sits between a
+  pad and those calls: GameController's values polled 240 times a second on the main thread (25 floats per pad),
+  the release gates, the mapping and dead zone (`input_map::controller_state`), a mutex-guarded copy, and the
+  HLE call writing the 0xAC-byte VPADStatus on each read. That is microseconds per frame; the only
+  latency is the poll interval (4.2 ms at most, about 2 ms on average, against a 33 ms game frame). Nothing is
+  lost that the game could use: triggers are digital on the Wii U (ZL / ZR are bits), the gyro and accelerometer
+  go through (`motion/`), rumble is one on/off motor in the game. A DualSense's touchpad is not read (the GamePad
+  touch screen is the mouse). Nothing built for this part.
+- **The page (Settings > Controls) shows the pad in the player's hands.** `input_map::pad_kind` takes
+  GameController's productCategory and vendorName for an Xbox, DualSense, DualShock 4, Switch Pro (and a Joy-Con
+  pair), Steam or generic pad; `gfx/input.mm` reports the controller used last (the first connected until one is
+  used; `[input] Controls page shows ...` in the log, with the names the system gave). `overlay/controls_view.cpp`
+  then draws that controller (schematics made in code: sticks, D-pad, face and small buttons where that pad has
+  them, PlayStation's shapes, the touchpad / trackpads as decoration) with its own names, and each Wii U input's
+  callout line goes to the button it is bound to; an unbound input keeps its row and loses its line. The chips,
+  the list view, the status line and the gyro recalibrate list use the pad's names ("L2", "ZL", "Create"). The
+  rows stay the Wii U inputs (the game's prompts name those) and controls.json is unchanged. With no controller
+  connected the page is as before: the Wii U GamePad or Pro Controller, whichever is chosen. The macOS Input >
+  Controls... window keeps its Wii U drawing and only takes the names.
+- **Found on the way:** a click on a part of the drawing never started a rebind in the overlay (the part under
+  the mouse was unknown while the button was down, so only chips worked). Fixed.
+- ctest `overlay_controls_view` (`controls_view_test`): every controller laid out and drawn without the game,
+  the mouse swept over it (every input keeps its three chips, every bound input can be picked on the drawing),
+  clicks, rebinding, the names real pads report; `--bmp <prefix>` writes a picture of each drawing. ctest 129 of
+  139 (the 10 known failures). `WWHD_TEST_PAD_KIND=xbox|dualsense|dualshock4|switchpro|steam|generic` shows a
+  drawing without a controller. The game was not run: the drawings were only seen through the test's own raster,
+  and no real controller's names were read (none was connected). Steam Input's virtual pad is not a
+  GCController on macOS (upstream 64025079, 24b08dbc), so a Steam Controller run through Steam is not seen at
+  all: not handled here.
+  To play-test: Settings > Controls with each pad; plug one in and pull it while the page is open; with two
+  connected, press a button on the other; rebind from a chip and by clicking a button on the drawing.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

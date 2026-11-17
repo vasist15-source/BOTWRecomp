@@ -1,7 +1,12 @@
-// The settings overlay's Controls drawing: the selected Wii U controller (GamePad or Pro Controller)
-// with a callout for every input and a chip for each binding (key, alternate key, controller), drawn
-// with Dear ImGui's draw list. Same layout as the macOS Controls window (gfx/controls_ui.mm), so it
-// works on every host.
+// The settings overlay's Controls drawing: a controller with a callout for every Wii U input and a chip
+// for each binding (key, alternate key, controller), drawn with Dear ImGui's draw list.
+//
+// Which controller: the one in the player's hands (ControlsView::host: Xbox, DualSense / DualShock 4,
+// Switch Pro, Steam, or a generic pad), with its own button names where they are on that pad; each
+// callout's line then goes to the button the Wii U input is bound to. With no controller connected it
+// is the selected Wii U controller (GamePad or Pro Controller), the layout of the macOS Controls
+// window (gfx/controls_ui.mm). The callouts and their rows are the same either way: the game only
+// knows Wii U inputs, and the bindings (controls.json) are per Wii U input.
 #pragma once
 #include "../input_map.h"
 
@@ -15,6 +20,7 @@ struct ControlsView {
     // in
     input_map::Mapping m;
     bool pro = false;
+    input_map::HostPad host;           // the connected controller to draw (kind kNone: the Wii U controller)
     int cap_action = -1, cap_col = 0;  // input being captured (-1 none)
     // live display, from the raw host state (not what the game sees: its input is blocked while the overlay is open)
     const float* pad = nullptr;        // host controller values (input_map::kPadCount): held controller chips

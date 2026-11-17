@@ -433,6 +433,118 @@ const char* pad_short_label(int p) {
     return p > 0 && p < kPadCount ? kShort[p] : "";
 }
 
+// ---- the controller in the player's hands
+
+PadKind pad_kind(const char* product_category, const char* vendor_name) {
+    auto words = [](const char* text) {
+        std::string out = " ";
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text ? text : ""); *p; ++p) {
+            if (std::isalnum(*p)) out += char(std::tolower(*p));
+            else if (out.back() != ' ') out += ' ';
+        }
+        return out + " ";
+    };
+    const std::string category = words(product_category), who = category + words(vendor_name);
+    auto in = [](const std::string& s, const char* word) { return s.find(word) != std::string::npos; };
+    auto has = [&](const char* word) { return in(who, word); };
+    // the profile GameController recognised wins over the name (a Nintendo-style pad in Xbox mode is
+    // an Xbox pad to the system: its elements, haptics and labels are the Xbox ones)
+    if (in(category, " dualsense ")) return PadKind::kDualSense;
+    if (in(category, " dualshock ")) return PadKind::kDualShock4;
+    if (in(category, " xbox ")) return PadKind::kXbox;
+    // Steam Input's own virtual pad stands for whatever is behind it: no drawing of its own
+    if (has(" steam ") && !has(" virtual ")) return PadKind::kSteam;
+    if (has(" dualsense ") || has(" ps5 ")) return PadKind::kDualSense;
+    if (has(" dualshock ") || has(" ps4 ") || has(" playstation ")) return PadKind::kDualShock4;
+    // Nintendo's retro pads and a single sideways Joy-Con are not the Pro Controller's shape
+    if (has(" n64 ") || has(" nes ") || has(" snes ") || has(" genesis ") || has(" gamecube ") || has(" super famicom "))
+        return PadKind::kGeneric;
+    const bool joycon = has(" joy con ") || has(" joycon ");
+    if (joycon) return has(" l r ") || has(" pair ") ? PadKind::kSwitchPro : PadKind::kGeneric;
+    if (has(" switch pro ") || has(" pro controller ") || has(" nintendo ")) return PadKind::kSwitchPro;
+    if (has(" xbox ") || has(" microsoft ")) return PadKind::kXbox;
+    return PadKind::kGeneric;
+}
+
+const char* pad_kind_label(PadKind k) {
+    switch (k) {
+    case PadKind::kNone: return "";
+    case PadKind::kGeneric: return "Controller";
+    case PadKind::kXbox: return "Xbox controller";
+    case PadKind::kDualSense: return "DualSense controller";
+    case PadKind::kDualShock4: return "DualShock 4 controller";
+    case PadKind::kSwitchPro: return "Switch Pro Controller";
+    case PadKind::kSteam: return "Steam Controller";
+    }
+    return "";
+}
+
+PadKind pad_kind_from_id(const std::string& id) {
+    static const std::pair<const char*, PadKind> kIds[] = {
+        {"generic", PadKind::kGeneric}, {"xbox", PadKind::kXbox}, {"dualsense", PadKind::kDualSense},
+        {"dualshock4", PadKind::kDualShock4}, {"switchpro", PadKind::kSwitchPro}, {"steam", PadKind::kSteam},
+    };
+    for (auto& [name, k] : kIds)
+        if (id == name) return k;
+    return PadKind::kNone;
+}
+
+namespace {
+// the inputs a controller names its own way, kPadA..kPadR3 (the D-pad and stick directions are the same on all)
+constexpr int kNamed = kPadR3 - kPadA + 1;
+struct KindNames { const char* brief[kNamed]; const char* full[kNamed]; };
+const KindNames* kind_names(PadKind k) {
+    static const KindNames xbox = {
+        {"A", "B", "X", "Y", "LB", "RB", "LT", "RT", "Menu", "View", "Xbox", "LS click", "RS click"},
+        {"A (bottom)", "B (right)", "X (left)", "Y (top)", "LB", "RB", "LT", "RT", "Menu", "View", "Xbox button",
+         "Left stick click", "Right stick click"}};
+    static const KindNames dualsense = {
+        {"×", "○", "□", "△", "L1", "R1", "L2", "R2", "Options", "Create", "PS", "L3", "R3"},
+        {"Cross (bottom)", "Circle (right)", "Square (left)", "Triangle (top)", "L1", "R1", "L2", "R2", "Options", "Create",
+         "PS button", "L3 (left stick click)", "R3 (right stick click)"}};
+    static const KindNames dualshock4 = {
+        {"×", "○", "□", "△", "L1", "R1", "L2", "R2", "Options", "Share", "PS", "L3", "R3"},
+        {"Cross (bottom)", "Circle (right)", "Square (left)", "Triangle (top)", "L1", "R1", "L2", "R2", "Options", "Share",
+         "PS button", "L3 (left stick click)", "R3 (right stick click)"}};
+    static const KindNames switchpro = {
+        {"B", "A", "Y", "X", "L", "R", "ZL", "ZR", "+", "−", "Home", "LS click", "RS click"},
+        {"B (bottom)", "A (right)", "Y (left)", "X (top)", "L", "R", "ZL", "ZR", "+ (Plus)", "− (Minus)", "Home",
+         "Left stick click", "Right stick click"}};
+    static const KindNames steam = {
+        {"A", "B", "X", "Y", "L1", "R1", "L2", "R2", "Menu", "View", "Steam", "L3", "R3"},
+        {"A (bottom)", "B (right)", "X (left)", "Y (top)", "L1", "R1", "L2", "R2", "Menu", "View", "Steam button",
+         "L3 (left stick click)", "R3 (right stick click)"}};
+    switch (k) {
+    case PadKind::kXbox: return &xbox;
+    case PadKind::kDualSense: return &dualsense;
+    case PadKind::kDualShock4: return &dualshock4;
+    case PadKind::kSwitchPro: return &switchpro;
+    case PadKind::kSteam: return &steam;
+    default: return nullptr;
+    }
+}
+}  // namespace
+
+const char* pad_short_label(PadKind k, int p) {
+    const KindNames* n = kind_names(k);
+    return n && p >= kPadA && p <= kPadR3 ? n->brief[p - kPadA] : pad_short_label(p);
+}
+const char* pad_label(PadKind k, int p) {
+    const KindNames* n = kind_names(k);
+    return n && p >= kPadA && p <= kPadR3 ? n->full[p - kPadA] : pad_label(p);
+}
+
+static std::mutex g_host_pad_mu;
+static HostPad g_host_pad;
+void note_host_pad(PadKind kind, const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_host_pad_mu);
+    g_host_pad = {kind, kind == PadKind::kNone ? std::string() : name};
+}
+HostPad host_pad() {
+    std::lock_guard<std::mutex> lk(g_host_pad_mu);
+    return g_host_pad;
+}
+
 input::PadState keyboard_state(const Mapping& m, const bool keys[256]) {
     float v[kActionCount];
     for (int a = 0; a < kActionCount; a++) {

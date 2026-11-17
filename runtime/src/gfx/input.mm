@@ -168,6 +168,46 @@ static void note_dominant_labels() {
     input_map::note_face_labels(labels);
 }
 
+// ---- the controller the Controls page draws (input_map::host_pad): the one used last, and the first
+// connected until one is used. Runs with the 240 Hz poll; the names are only read when the choice
+// changes (g_noted_pad), which a connect or disconnect forces.
+static uintptr_t g_shown_pad = 0;
+static uintptr_t g_noted_pad = ~(uintptr_t)0;
+static void update_shown_pad(const std::vector<std::pair<uintptr_t, overlay::PadValues>>& devs) {
+    bool present = false;
+    uintptr_t used = 0;
+    for (const auto& [id, d] : devs) {
+        present |= id == g_shown_pad;
+        if (id == g_shown_pad || used) continue;
+        for (int p = 1; p < input_map::kPadCount; p++)
+            if (d[p] > 0.6f) { used = id; break; }  // past any resting stick's drift
+    }
+    if (used) g_shown_pad = used;
+    else if (!present) {
+        g_shown_pad = devs.empty() ? 0 : devs.front().first;
+        for (GCController* c in [g_connect_order copy])
+            if (c.extendedGamepad) { g_shown_pad = (uintptr_t)(__bridge void*)c; break; }
+    }
+    if (g_shown_pad == g_noted_pad) return;
+    g_noted_pad = g_shown_pad;
+    GCController* shown = nil;
+    for (GCController* c in [GCController controllers])
+        if ((uintptr_t)(__bridge void*)c == g_shown_pad) shown = c;
+    if (!shown) {
+        g_shown_pad = g_noted_pad = 0;
+        if (input_map::host_pad().kind != input_map::PadKind::kNone) LOG("[input] Controls page: no controller connected");
+        input_map::note_host_pad(input_map::PadKind::kNone, "");
+        return;
+    }
+    const char* category = shown.productCategory.UTF8String ?: "";
+    const char* vendor = shown.vendorName.UTF8String ?: "";
+    const input_map::HostPad now = {input_map::pad_kind(category, vendor), *vendor ? vendor : category};
+    if (now == input_map::host_pad()) return;  // (another controller came or went)
+    // the names as the system gives them: what to look at when a controller is drawn as the wrong one
+    LOG("[input] Controls page shows \"%s\" (category \"%s\"): drawn as %s", vendor, category, input_map::pad_kind_label(now.kind));
+    input_map::note_host_pad(now.kind, now.name);
+}
+
 // the latest controller_values (the timer below), for the settings overlay's navigation
 static float g_host_values[input_map::kPadCount];
 void host_controller_values(float* v) {
@@ -414,10 +454,12 @@ void init() {
         if (c && ![g_connect_order containsObject:c]) [g_connect_order addObject:c];
         keep_home_button(c);
         note_dominant_labels();
+        g_noted_pad = ~(uintptr_t)0;
     }];
     [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification* n) {
         [g_connect_order removeObject:n.object];
         note_dominant_labels();
+        g_noted_pad = ~(uintptr_t)0;
     }];
     note_dominant_labels();
     init_rumble();
@@ -429,7 +471,9 @@ void init() {
         // polls the Home / Select shortcut on its frame, from v, after this poll saw the press as captured.
         float v[input_map::kPadCount], game[input_map::kPadCount];
         static overlay::DeviceGates<uintptr_t> gates;
-        gates.combine(devices_values(), overlay::captures(), v, game);
+        const auto devices = devices_values();
+        update_shown_pad(devices);
+        gates.combine(devices, overlay::captures(), v, game);
         PadState s = input_map::controller_state(input_map::current(), game);
         {
             std::lock_guard<std::mutex> lk(g_mu);

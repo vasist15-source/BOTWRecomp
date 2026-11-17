@@ -142,6 +142,29 @@ void set_face_auto(Mapping& m, bool on);
 // so a custom binding is not overwritten when the next pad connects.
 void set_pad_binding(Mapping& m, int action, int pad);
 
+// ---- the controller in the player's hands (the Controls drawing and the names on its chips)
+// The game only ever sees a Wii U GamePad or Pro Controller; this is what the Controls page draws and
+// how it names the host inputs. kNone: no controller connected (the Wii U controller is drawn).
+enum class PadKind { kNone, kGeneric, kXbox, kDualSense, kDualShock4, kSwitchPro, kSteam };
+// From what the host says a controller is (GameController's productCategory and vendorName). Pure, so
+// the names real pads report are covered by controls_view_test. Never kNone.
+PadKind pad_kind(const char* product_category, const char* vendor_name);
+const char* pad_kind_label(PadKind k);          // "Xbox controller"; "" for kNone
+PadKind pad_kind_from_id(const std::string& id);  // "xbox", "dualsense", "dualshock4", "switchpro", "steam", "generic"; else kNone
+// What that controller calls a host input: short for chips ("L2", "ZL", "△"), long for the list and
+// the status line ("Triangle (top)"). kNone / kGeneric: pad_short_label(p) / pad_label(p).
+const char* pad_short_label(PadKind k, int p);
+const char* pad_label(PadKind k, int p);
+// The controller the Controls page shows: the hosts report the one used last (the first connected
+// until one is used), or kNone when the last one went away. Any thread.
+struct HostPad {
+    PadKind kind = PadKind::kNone;
+    std::string name;  // as the host names it, e.g. "DualSense Wireless Controller"
+    bool operator==(const HostPad&) const = default;
+};
+void note_host_pad(PadKind kind, const std::string& name);
+HostPad host_pad();
+
 // actions (other than `except`) that use this key / controller input
 std::vector<int> key_users(const Mapping& m, int code, int except = -1);
 std::vector<int> pad_users(const Mapping& m, int pad, int except = -1);
