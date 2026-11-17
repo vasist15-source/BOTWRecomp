@@ -169,10 +169,6 @@ void f_0282167C_orig(Cpu*) { fatal("WWHD-only game function f_0282167C_orig call
 void f_0286E8B4_orig(Cpu*) { fatal("WWHD-only game function f_0286E8B4_orig called (no BotW equivalent)"); }
 void f_028709E0_orig(Cpu*) { fatal("WWHD-only game function f_028709E0_orig called (no BotW equivalent)"); }
 void f_02871328_orig(Cpu*) { fatal("WWHD-only game function f_02871328_orig called (no BotW equivalent)"); }
-void f_02874038_orig(Cpu*) { fatal("WWHD-only game function f_02874038_orig called (no BotW equivalent)"); }
-void f_028766CC_orig(Cpu*) { fatal("WWHD-only game function f_028766CC_orig called (no BotW equivalent)"); }
-void f_02877100_orig(Cpu*) { fatal("WWHD-only game function f_02877100_orig called (no BotW equivalent)"); }
 void f_028785C8_orig(Cpu*) { fatal("WWHD-only game function f_028785C8_orig called (no BotW equivalent)"); }
 void f_028E93CC_orig(Cpu*) { fatal("WWHD-only game function f_028E93CC_orig called (no BotW equivalent)"); }
-void f_028F8250_orig(Cpu*) { fatal("WWHD-only game function f_028F8250_orig called (no BotW equivalent)"); }
 }

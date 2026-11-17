@@ -113,6 +113,7 @@ struct Surface {
     float ax = 1.0f, ay = 1.0f;  // ... and the aspect-ratio factors (screen-shaped targets, metal_surfaces.mm)
     float sx = 1.0f, sy = 1.0f;
     float minScale = 0.0f;  // at least this factor: a depth buffer drawn with colour targets scaled more (match_depth_scale)
+    bool aspectMatched = false;  // takes the aspect ratio's factors: a depth buffer drawn with colour targets that do
     // what the target scale rules and the aspect ratio make of this surface (metal_surfaces.mm target_rules): they
     // read only its size, format, layers, levels and tile mode, which it keeps, and settings fixed at launch, so
     // they are worked out once instead of on every bind of a target (a linear walk of the rules and string
@@ -123,7 +124,7 @@ struct Surface {
         bool isDepth = false, compressed = false, valid = false;
         uint8_t kind = 0;          // metal_surfaces.mm kRule*
         bool extent = false;       // a Cemu pack's TextureRedefine gives its size (kx, ky)
-        bool screen = false;       // screen-shaped: takes the aspect ratio's factors
+        bool screen = false;       // follows the internal resolution, not the GamePad: takes the aspect ratio's factors
         float kx = 1.0f, ky = 1.0f;
     };
     mutable TargetRules rules;

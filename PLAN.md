@@ -734,6 +734,60 @@ the kept installer copy have not been played yet. The release build is installed
 - 2026-11-17: the menu pause play-tested by the user on the /Applications build (ba92ab4's code): works. Rumble still
   unplayed (not in that build); the game menu style not reported on.
 
+### 2026-11-17: aspect ratio in Settings > Display: 5:4 to 48:9, Match window, Cemu's HUD rules (HUD not yet play-tested)
+- A player on an ultrawide asked for 21:9; Cemu's Graphics pack copied into Mods was refused (its TextureRedefine
+  sizes; the refusal now says the settings are built in). The inherited `aspect.cpp` hooked Wind Waker's camera and
+  nw::lyt addresses, none of which exist in BotW, so the setting was hidden. Now, for BotW:
+  - Settings > Display > Aspect ratio is one plain list (the user asked for no more than that): 16:9, 16:10, 3:2,
+    4:3, 5:4, Match window, 21:9 (64:27), 24:10, 32:10, 32:9, 48:9; saved as `aspect` (the older `aspectMode` is
+    still read). The HUD always uses Cemu's default, Edge HUD. For a run only: `WWHD_ASPECT=21:9`/`window`/`2.4`
+    (any shape) and `WWHD_HUD=edges`/`centred`/`stretched`.
+  - The run's aspect and HUD placement are fixed the first time the game asks (`latch`): the HUD's panes are changed
+    as their layouts are built, so a changed setting applies at the next start (the Display page says so, with
+    Restart now). Match window is the TV window's shape at launch; in full screen the screen below the notch
+    (`display.mm` tells `aspect.cpp` before the first frame, and reads the saved setting on the main thread).
+  - Render targets (`metal_surfaces.mm`): every target the Graphics pack's rules scale with the internal resolution
+    (`kRuleRes`), not the GamePad's 854x480 / 864x480, is allocated A/(16/9) wider (or taller), as Cemu widens them
+    at 21:9. Depth buffers drawn with a widened colour target follow it (`Surface::aspectMatched`).
+  - 3D (`tools/botw_aspect_patches.py`, translation-time sites like the FPS ones; answered by `aspect.cpp`): the
+    camera projection's aspect from its viewport (0386D020) becomes A for 16:9 viewports (Hor+); for pictures
+    narrower than 16:9 its fovy (0386CFE8, radians, into setFovy) widens instead (Vert+); the inventory's 3D Link
+    (02E2C578) has its aspect scaled by A/(16/9); grass culling factor (035B0A38) (16/9)/A. Read-only data Cemu's
+    pack patches (101BF8E8, 1030A57C, 1036DD4C: 16:9; 1047BFB8: 120 -> 60) is written once at the latch.
+  - HUD and menus, wider than 16:9 (`aspect_hud.h`, `aspect_hud.cpp`): Cemu's way. The first build narrowed the
+    whole layout projection (everything in a centred 16:9 block); the user's play-test: works, but the HUD is not
+    scaled properly, do it as Cemu does. Cemu's Graphics pack changes panes one by one as a layout is built
+    (patch_GUIAspectRatio.asm, 2,900 lines of PowerPC: by screen, by the last parts pane, by pane name, to some forty
+    routines that scale a pane's x by (16/9)/A and move it to the edge or keep it around the centre; backgrounds and
+    fades stay stretched and cover the picture). `tools/botw_hud_rules.py` turns the pack's decision code into a
+    table (`aspect_hud_rules.inc`, 598 steps, 17 routines used; the pack is read from the developer's Cemu folder,
+    never shipped), `aspect_hud.h` walks it and has the routines, `aspect_hud.cpp` applies them at the pack's five
+    sites: pane built (03C496B8), screen created (03A3EDC4, name in the caller's r24 as the pack takes it),
+    animated x of the sensor gauges (03C46298), map open/close (02F60204), pane-based projection of the weather
+    pane (03C56CD0). HUD placement: Cemu's Edge HUD (Centered HUD and no fixes only through `WWHD_HUD`). Differences from the pack: its "Alt" padding uses the render width in pixels, here it is
+    the same as the normal padding (the 720-line size); the map routine tests the mode it meant to (the pack
+    compares r4); a layout's width is widened once per loaded layout, not again on every rebuild.
+  - Narrower than 16:9: the pack's rules would push menus off the sides (its Square HUD mode is "experimental"), so
+    the HUD is stretched to the taller picture as in Cemu, or with `WWHD_HUD=centred` keeps its shape in a 16:9 band: nw::lyt's
+    LoadProjectionMtx (03C479D4, upload at 03C479F8) and nw::font's text draw (0421A3A8, upload at 0421A784) tag
+    their projection upload and the render thread narrows it (OP_SET_PROJ_REGS) for the 16:9 TV picture.
+  - At 16:9 every site returns the game's values and nothing is changed or tagged.
+- Play-test 1 (user, MacBook Air, 16:10 screen; first build): 16:10, 21:9 and Match window (1.595) switch and draw;
+  HUD "not scaled properly" (that build: centred block).
+- Movies: play-test 3 (user, a Champions' Ballad memory at 21:9) showed them stretched a third too wide. The
+  bundled Graphics pack already has Cemu's movie shader (7cd338ce4c6ea935, replaced in every run); it pillarboxes
+  when `$ultrawideHUDMode` is non-zero, with `$width` the wide width. `graphic_packs.cpp` now gives the pack those
+  values when the run is wider than 16:9 (no other bundled shader reads `$width`/`$height`). Play-tested (e065e93,
+  21:9): works.
+- The P key started a debug frame capture (a 23.5 s stop and 1.1 GB the user took for a hang when opening the map,
+  in 0.3.0 too): capture is on F12 only now (6f53067).
+- Play-test 2 (d0f47bc, the plain list): works. Not checked in game yet: dialogs' choice cursor (the "Alt"
+  padding), the inventory's Link, and that 16:9 is unchanged. `WWHD_ASPECT_LOG=1` logs every
+  screen and every pane changed (`[hud] screen / parts / pane: x, scale`).
+- Builds clean on the worktree's own gen (re-translated: the 8 files with sites differ from main's); ctest 126 of
+  136, the 10 known failures, with the new `aspect_hud` test (the table's decisions and the routines' arithmetic at
+  21:9) and the translator package test's site check. In /Applications for the user's play-test.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

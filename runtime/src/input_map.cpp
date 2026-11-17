@@ -183,7 +183,7 @@ Mapping Mapping::defaults() {
     key(kStickLClick, kVK_ANSI_C); key(kStickRClick, kVK_ANSI_V);
     key(kLUp, kVK_ANSI_W); key(kLDown, kVK_ANSI_S); key(kLLeft, kVK_ANSI_A); key(kLRight, kVK_ANSI_D);
     key(kRUp, kVK_UpArrow); key(kRDown, kVK_DownArrow); key(kRLeft, kVK_LeftArrow); key(kRRight, kVK_RightArrow);
-    key(kScreenshot, kVK_F10);  // free on every host (F11: SDL full screen, F12/P: debug frame capture)
+    key(kScreenshot, kVK_F10);  // free on every host (F11: SDL full screen, F12: debug frame capture)
     key(kQuickPrev, kVK_ANSI_LeftBracket); key(kQuickNext, kVK_ANSI_RightBracket);
     // mouse: left attack, right draws the bow (left click shoots, mouse_look.h), middle look, side
     // buttons shield / lock on and throw, wheel quick select

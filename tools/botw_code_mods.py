@@ -313,6 +313,9 @@ class CodeMods:
             raise _Refuse("this graphic pack is for another game (its titleIds don't name Breath of the Wild)")
         if "ram" in rules.sections:
             raise _Refuse("it gives the game more memory ([RAM]), which this port can't")
+        if "patch_aspectratio.asm" in [n.lower() for n in os.listdir(mod.pack)]:
+            raise _Refuse("it is Cemu's Graphics pack: the port has its settings built in (internal resolution in "
+                          "Settings > Graphics, aspect ratio in Settings > Display)")
         sizes = {"overwritewidth", "overwriteheight", "overwriteformat"}
         if rules.texture_keys & sizes:
             raise _Refuse("it changes the game's render sizes ([TextureRedefine]), which only graphics packs can")

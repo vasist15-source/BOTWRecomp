@@ -3,6 +3,7 @@
 // resulting ImDrawData (gfx/overlay_metal.mm, gfx/vulkan/overlay.cpp); the hosts feed input and apply
 // changes on their main thread (hostui.h).
 #include "overlay.h"
+#include "../aspect.h"
 #include "../audio_out.h"
 #include "guest_hud.h"
 #include "gamepad_nav.h"
@@ -1029,6 +1030,19 @@ void tab_display() {
     help(!strcmp(hostui::name(), "AppKit") ? "The TV window (Cmd+F); remembered for the next start"
                                            : "The TV window (F11 or Alt+Enter); remembered for the next start");
 #endif
+    heading("Aspect ratio");
+    {
+        const int cur = aspect::saved();
+        for (int i = 0; i < aspect::choices(); i++) {
+            if (i % 6) ImGui::SameLine();
+            if (radio(aspect::choice(i).label, i == cur)) hostui::post([i] { aspect::set_saved(i); });
+        }
+        if (aspect::restart_needed()) {
+            warn("Restart the game to apply the aspect ratio.");
+            // asks first while a game is in progress, as Quit does (gfx/quit_prompt.mm)
+            if (hostui::can_restart() && primary_button("Restart now##aspect")) hostui::post([] { hostui::restart_game(); });
+        }
+    }
     heading("Menu");
     {
         ImGui::AlignTextToFramePadding();
@@ -2667,7 +2681,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         if (!dynres::min_from_env() && hostui::get("dynResMin", v)) dynres::set_min(strtof(v.c_str(), nullptr));
         mfx::load_saved();  // the saved MetalFX choices (WWHD_METALFX_* win)
         mods::cheats::load_saved();  // the saved cheat switches (WWHD_CHEATS wins)
-        // (no saved aspect ratio: the wider pictures need Wind Waker's camera hooks)
+        aspect::load_saved();  // the saved aspect ratio (read at launch on the Mac; applies at the next start)
         // the saved gyro settings (WWHD_GYRO overrides the source)
         hostui::post([] { load_gyro(); });
     }

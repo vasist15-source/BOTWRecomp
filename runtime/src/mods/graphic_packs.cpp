@@ -2,6 +2,8 @@
 #include "graphic_packs.h"
 #include "graphic_packs_data.h"
 #include "cemu_pack.h"
+#include "../aspect.h"
+#include "../aspect_hud.h"
 #include "../overlay/hostui.h"
 #include "../runtime.h"
 
@@ -204,6 +206,15 @@ const Active& active() {
             if (vars.count("$width") && vars.count("$gameWidth") && vars.count("$height") && vars.count("$gameHeight")) {
                 vars["$width"].expr = "(" + vars["$gameWidth"].expr + ") * " + std::to_string(a.resScale);
                 vars["$height"].expr = "(" + vars["$gameHeight"].expr + ") * " + std::to_string(a.resScale);
+                // ... and so is the aspect ratio (aspect.cpp). Wider than 16:9, the pack sees what its own 21:9
+                // presets give: a wider $width and its ultrawide HUD mode, which pillarboxes the movies
+                // (7cd338ce4c6ea935: the video at 16:9 in the middle, black at the sides)
+                const float wide = aspect::game() / (16.0f / 9.0f);
+                if (wide > 1.0f && vars.count("$ultrawideHUDMode")) {
+                    vars["$width"].expr += " * " + std::to_string(wide);
+                    const int mode = aspect::hud_mode();
+                    vars["$ultrawideHUDMode"].expr = mode == aspect::hud::kEdges ? "1" : mode == aspect::hud::kCentred ? "2" : "0";
+                }
             }
             // values may refer to each other: resolve in passes
             std::map<std::string, double> resolved;
