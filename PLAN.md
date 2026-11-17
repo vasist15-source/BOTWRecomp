@@ -870,6 +870,45 @@ removing a layer ... make this window show whatever controller we've connected".
   To play-test: Settings > Controls with each pad; plug one in and pull it while the page is open; with two
   connected, press a button on the other; rebind from a chip and by clicking a button on the drawing.
 
+### 2026-11-17: a controller run through Steam Input works (Steam's virtual pad read over IOKit; not play-tested)
+Follow-up to the entry above: the port read controllers only as `GCController`s (`gfx/input.mm`; IOKit was used
+for nothing but the DualShock 4's rumble reports). Started from Steam, or with Steam Input on for a pad, a
+controller reaches macOS as Steam's virtual HID pad (Xbox 360 IDs 045E:028E, named "GamePad-<n>"), which
+GameController claims and never shows: the 2015 Steam Controller, which macOS sees no other way, did nothing.
+- **The reader** (from upstream ZeldaWWHDRecomp 64025079, 24b08dbc, ddb12921, bd7a5743; only this part was
+  taken): an `IOHIDManager` on the main run loop matches gamepads and joysticks, and
+  `platform/hid_gamepad.h` admits exactly that one device (virtual, those IDs, that name). Every other device
+  is left to GameController or left alone, with one `[input] HID device ignored: ...` line naming it and why (the
+  line to read if Steam's pad is ever not recognised). Its values go into the same per-device list as a
+  GCController's (`devices_values`), so the mapping, dead zone, release gates, the settings overlay's navigation,
+  rebinding and the Input > Controls... window take it unchanged. Steam's own numbering is used (stick clicks on
+  7 / 8, Start / Back on 9 / 10, the D-pad as buttons 12 to 15). The Automatic face preset takes it as an Xbox pad
+  when GameController has no pad of its own.
+- **No double input from a Steam Controller GameController also shows:** with exactly one such controller and
+  one virtual pad, the virtual pad takes over once it has reported an input, and the GameController one comes
+  back when the virtual pad goes. Any other combination is not guessed at: every pad stays live. A pad of another
+  make with Steam Input on for it is still read both ways, as upstream does (the same press twice, merged by
+  maximum; a Steam remap of such a pad would add to the pad's own buttons, not replace them).
+- **Controls page:** the virtual pad is reported like any pad (`input_map::note_host_pad`), drawn as the
+  generic controller named "Steam Input controller". It is drawn as the Steam Controller only with one virtual
+  pad and either one Steam Controller among GameController's pads, or Steam Controller hardware in the I/O
+  registry (Valve 28DE: 1102, 1106, 1142, 1302, 1303, 1304; looked up, not opened) while GameController shows
+  no pad at all. The IDs are SDL's and Linux's, not checked against hardware here.
+- **Not covered:** rumble and gyro for a pad that exists only as the virtual pad (it has neither; they still
+  work when GameController shows the physical controller too, as before). Input in the background: HID values
+  keep arriving when the app is not in front, so the reader reports nothing then, as GameController does.
+- **Cost:** values arrive by callback when a button or axis changes; nothing is polled from the device. Per
+  240 Hz poll: nothing with no virtual pad (one empty-list test), 0.23 µs with one (timed outside the game,
+  the list's allocation included), about 0.006 % of a core. No waits of any kind.
+- ctest `hid_gamepad` (`hid_gamepad_test`, 122 checks: which device is admitted, the element table, the pairing
+  and drawing rules); ctest 130 of 140 (the 10 known failures). `WWHD_NO_HID_PAD=1` switches the reader off.
+  Not run with the game, and no Steam virtual pad was connected: the device's IDs, name and numbering are
+  upstream's, read from a 2015 Steam Controller.
+  To play-test: start the app from Steam (added as a non-Steam game) or with Steam Input on for the pad; the
+  log should say `[input] Steam Input's virtual pad connected`; Settings > Controls shows the pad and lights
+  what is pressed; sticks, triggers, D-pad and Start / Back do what they should in the game; rebind one input
+  from the page; quit Steam while it runs (the pad should go, or fall back to GameController's).
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
