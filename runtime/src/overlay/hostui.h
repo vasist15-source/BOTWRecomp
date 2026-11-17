@@ -5,6 +5,7 @@
 #pragma once
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace hostui {
 
@@ -47,6 +48,11 @@ bool drc_available();              // there is a GamePad screen to show or hide
 bool drc_shown();
 void show_drc(bool on);
 void set_pro_controller(bool on);  // Input: keyboard and controllers act as a Pro Controller (or the GamePad)
+
+// A controller's picture for the Controls page ("xbox", "dualsense", "dualshock4", "switchpro":
+// runtime/data/controllers, CC0 vector drawings, kept rendered in the AppKit host's executable): RGBA8, not
+// premultiplied, top row first. False where the host has none (the page then draws the controller).
+bool controller_picture(const char* name, int& width, int& height, std::vector<unsigned char>& rgba);
 
 const char* name();                // "AppKit" or "SDL"
 void set_clipboard(const std::string& text);  // main thread: put text on the system clipboard

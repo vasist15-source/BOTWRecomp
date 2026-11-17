@@ -130,6 +130,57 @@ ControllerDef host_def(PadKind kind) {
     return d;
 }
 
+// The controllers there is a picture of (runtime/data/controllers: CC0 vector drawings, rendered 1000
+// pixels wide): where each input is on it, in pixels of that picture (x, y, radius). The table is
+// printed by tools/controller_images.py, which makes the pictures from the drawings and knows where
+// their buttons are; with --marks it draws these positions on the pictures.
+struct Spot { float x, y, r; };
+struct PictureDef {
+    float height;  // of the 1000-wide picture
+    Spot south, east, west, north, lb, rb, lt, rt, menu, options, home, ls, rs, dup, ddown, dleft, dright;
+};
+const PictureDef* picture_def(PadKind kind) {
+    // picture: xbox
+    static const PictureDef xbox = {753,  // A, B, X, Y; LB, RB, LT, RT; Menu, View, Xbox
+        {757, 282, 34}, {827, 212, 34}, {687, 212, 34}, {757, 146, 34},
+        {239, 54, 26}, {756, 54, 26}, {193, 24, 16}, {802, 24, 16},
+        {574, 212, 25}, {430, 211, 25}, {498, 96, 31},
+        {248, 212, 71}, {623, 406, 71},
+        {370, 351, 23}, {370, 447, 23}, {322, 399, 23}, {418, 399, 23},
+    };
+    // picture: dualshock4
+    static const PictureDef dualshock4 = {637,  // cross, circle, square, triangle; L1, R1, L2, R2; Options, Share, PS
+        {811, 322, 29}, {884, 249, 29}, {738, 249, 29}, {810, 175, 29},
+        {198, 65, 20}, {802, 65, 20}, {198, 33, 15}, {802, 33, 15},
+        {697, 154, 20}, {304, 154, 20}, {497, 395, 23},
+        {342, 385, 63}, {658, 385, 63},
+        {190, 192, 27}, {190, 305, 27}, {134, 249, 27}, {246, 249, 27},
+    };
+    // picture: switchpro
+    static const PictureDef switchpro = {675,  // B, A, Y, X; L, R, ZL, ZR; +, −, Home
+        {750, 275, 32}, {808, 217, 32}, {691, 217, 32}, {750, 158, 32},
+        {258, 63, 23}, {742, 63, 23}, {233, 25, 15}, {767, 25, 15},
+        {591, 144, 20}, {409, 144, 20}, {559, 217, 22},
+        {258, 217, 67}, {621, 365, 67},
+        {381, 320, 21}, {381, 410, 21}, {336, 365, 21}, {425, 365, 21},
+    };
+    // picture: dualsense
+    static const PictureDef dualsense = {667,  // cross, circle, square, triangle; L1, R1, L2, R2; Options, Create, PS
+        {806, 313, 29}, {879, 240, 29}, {735, 240, 29}, {806, 168, 29},
+        {202, 59, 20}, {798, 59, 20}, {202, 28, 15}, {798, 28, 15},
+        {695, 147, 20}, {307, 147, 20}, {497, 385, 23},
+        {345, 375, 62}, {655, 375, 62},
+        {194, 185, 27}, {194, 296, 27}, {139, 240, 27}, {250, 240, 27},
+    };
+    switch (kind) {
+    case PadKind::kDualSense: return &dualsense;
+    case PadKind::kDualShock4: return &dualshock4;
+    case PadKind::kSwitchPro: return &switchpro;
+    case PadKind::kXbox: return &xbox;
+    default: return nullptr;
+    }
+}
+
 enum PartKind { kPartRound, kPartShoulder, kPartDpad, kPartStick };
 struct Part {
     int kind, action;      // action: the Wii U input it is (host drawing: the one bound to it, -1 none)
@@ -139,6 +190,8 @@ struct Part {
     int icon = kIconNone;  // drawn instead of the text
     bool small = false;    // +, −, Home and their likes: smaller lettering
     bool back = false;     // shoulder: the tab behind (ZL / ZR, a trigger)
+    bool anchored = false; // the callout's line ends at `anchor`, not at the part (a picture's D-pad: its middle)
+    ImVec2 anchor;
     int dirs[4] = {-1, -1, -1, -1};
     int pad = kPadNone;    // host drawing: the host input this part is (stick: its click)
     int padDirs[4] = {kPadNone, kPadNone, kPadNone, kPadNone};  // host drawing, stick: up, down, left, right
@@ -151,6 +204,7 @@ struct Group {
     std::vector<int> acts;
     std::vector<std::string> labels;
     ImVec2 anchor;
+    float anchorR = 0;             // a picture: the radius of the button at the anchor (the line ends on its rim)
     bool right = false;
     bool leader = true;            // a line to the anchor (app actions and unbound inputs have none)
     ImVec2 a, b;                   // box
@@ -168,6 +222,8 @@ struct Geo {
     ImVec2 org;                    // view origin (screen)
     float colLx = 0, colRx = 0;
     bool host = false;             // a host controller's drawing (parts are host inputs)
+    bool picture = false;          // ... as a picture: the parts are spots on it, drawn only while lit or picked
+    ImVec2 pictureA, pictureB;     // the picture's rectangle
     std::vector<ImVec2> body;      // two-grip outline (GamePad: rounded rectangle)
     ImVec2 bodyA, bodyB;
     bool hasScreen = false;
@@ -220,7 +276,12 @@ Geo layout(const ControlsView& v, ImVec2 org, float w, float h) {
     // the callouts need about 1060 x 520 points; smaller views shrink them, larger ones grow a little
     g.k = std::clamp(std::min(w / 1060.0f, h / 520.0f), 0.55f, 1.3f);
     const float k = g.k;
-    const ControllerDef d = host ? host_def(kind) : controller_def(pro);
+    const PictureDef* pic = host && v.picture ? picture_def(kind) : nullptr;
+    ControllerDef d = host ? host_def(kind) : controller_def(pro);
+    if (pic) {  // the picture is the controller: one unit is its width
+        d.minY = 0;
+        d.maxY = pic->height / 1000.0f;
+    }
     g.colLx = org.x + kMargin * k;
     g.colRx = org.x + w - (kMargin + kColW) * k;
     float drawL = g.colLx + (kColW + 30) * k, drawR = g.colRx - 30 * k;
@@ -235,7 +296,11 @@ Geo layout(const ControlsView& v, ImVec2 org, float w, float h) {
     auto mirror = [](URect r) { return URect{1 - r.x - r.w, r.y, r.w, r.h}; };
     g.caption = ImVec2(o.x + s / 2, P(0, d.maxY).y + kCaptionH * k / 2 + 2 * k);
 
-    if (d.grips) {
+    if (pic) {
+        g.picture = true;
+        g.pictureA = P(0, 0);
+        g.pictureB = P(1, d.maxY);
+    } else if (d.grips) {
         grip_body(g.body, d.body, P);
         if (d.leds)
             for (int i = 0; i < 4; i++) g.leds.push_back(P(0.455f + i * 0.03f, 0.44f));
@@ -243,12 +308,13 @@ Geo layout(const ControlsView& v, ImVec2 org, float w, float h) {
         g.bodyA = P(0, 0);
         g.bodyB = P(1, 0.5f);
     }
-    if (d.hasScreen) {
+    if (d.hasScreen && !pic) {
         g.hasScreen = true;
         g.screenA = P(d.screen.x, d.screen.y);
         g.screenB = P(d.screen.x + d.screen.w, d.screen.y + d.screen.h);
     }
-    for (const URect& r : d.pads) g.decor.push_back({P(r.x, r.y), P(r.x + r.w, r.y + r.h), std::min(r.w, r.h) * 0.18f * s});
+    if (!pic)
+        for (const URect& r : d.pads) g.decor.push_back({P(r.x, r.y), P(r.x + r.w, r.y + r.h), std::min(r.w, r.h) * 0.18f * s});
 
     // host drawing: a part is a host input, and stands for the Wii U input bound to it
     auto user = [&](int pad) {
@@ -269,112 +335,146 @@ Geo layout(const ControlsView& v, ImVec2 org, float w, float h) {
         p.icon = icon;
         g.parts.push_back(p);
     };
-    const UPt north = {d.face.x, d.face.y - d.faceSpread}, east = {d.face.x + d.faceSpread, d.face.y},
-              south = {d.face.x, d.face.y + d.faceSpread}, west = {d.face.x - d.faceSpread, d.face.y};
-    if (host) {
-        // the pad's own face buttons where they are: its letters, or PlayStation's shapes
-        const bool ps = kind == PadKind::kDualSense || kind == PadKind::kDualShock4;
-        const struct { int pad; UPt at; int icon; } face[4] = {
-            {kPadY, north, kIconTriangle}, {kPadB, east, kIconCircle}, {kPadA, south, kIconCross}, {kPadX, west, kIconSquare}};
-        for (auto& f : face) button(-1, f.pad, f.at, d.faceR, ps ? "" : pad_short_label(kind, f.pad), false, ps ? f.icon : kIconNone);
-        const bool nintendo = kind == PadKind::kSwitchPro;
-        button(-1, kPadMenu, d.plus, d.smallR, nintendo ? "+" : "", true, nintendo ? kIconNone : kIconMenu);
-        button(-1, kPadOptions, d.minus, d.smallR, nintendo ? "\xE2\x88\x92" : "", true, nintendo ? kIconNone : ps ? kIconCreate : kIconView);
-        button(-1, kPadHome, d.home, d.homeR, ps ? "PS" : "\xE2\x8C\x82", true);
-    } else {
-        // face buttons: Wii U positions (X top, A right, B bottom, Y left). With the by-label (Xbox)
-        // preset the letters follow the host pad instead (Y top, B right, A bottom, X left), so each
-        // letter sits where that host button is (issue #78).
-        if (fl == FaceLayout::kLabels) {
-            button(kY, kPadNone, north, d.faceR, "Y");
-            button(kB, kPadNone, east, d.faceR, "B");
-            button(kA, kPadNone, south, d.faceR, "A");
-            button(kX, kPadNone, west, d.faceR, "X");
-        } else {
-            button(kX, kPadNone, north, d.faceR, "X");
-            button(kA, kPadNone, east, d.faceR, "A");
-            button(kB, kPadNone, south, d.faceR, "B");
-            button(kY, kPadNone, west, d.faceR, "Y");
-        }
-        button(kPlus, kPadNone, d.plus, d.smallR, "+", true);
-        button(kMinus, kPadNone, d.minus, d.smallR, "\xE2\x88\x92", true);  // −
-        button(kHome, kPadNone, d.home, d.homeR, "\xE2\x8C\x82", true);     // ⌂
-    }
-    {
-        ImVec2 c = PU(d.dpad);
-        float L = d.dpadLen * s, W = d.dpadW * s;
-        ImVec2 arms[4][2] = {{{c.x - W / 2, c.y - L}, {c.x + W / 2, c.y - W / 2}},
-                             {{c.x - W / 2, c.y + W / 2}, {c.x + W / 2, c.y + L}},
-                             {{c.x - L, c.y - W / 2}, {c.x - W / 2, c.y + W / 2}},
-                             {{c.x + W / 2, c.y - W / 2}, {c.x + L, c.y + W / 2}}};
-        int acts[4] = {kDUp, kDDown, kDLeft, kDRight};
+    if (pic) {
+        // spots on the picture: every button a circle, the D-pad four of them, the sticks as on the drawings
+        auto spot = [&](int pad, const Spot& sp) { button(-1, pad, {sp.x / 1000.0f, sp.y / 1000.0f}, sp.r / 1000.0f, ""); };
+        spot(kPadY, pic->north); spot(kPadB, pic->east); spot(kPadA, pic->south); spot(kPadX, pic->west);
+        spot(kPadMenu, pic->menu); spot(kPadOptions, pic->options); spot(kPadHome, pic->home);
+        const Spot* arms[4] = {&pic->dup, &pic->ddown, &pic->dleft, &pic->dright};
+        ImVec2 mid(0, 0);
+        for (const Spot* sp : arms) mid.x += sp->x / 4000.0f, mid.y += sp->y / 4000.0f;
         for (int i = 0; i < 4; i++) {
-            Part p;
-            p.kind = kPartDpad;
-            p.pad = host ? kPadDUp + i : kPadNone;
-            p.action = host ? user(p.pad) : acts[i];
-            p.a = arms[i][0];
-            p.b = arms[i][1];
-            p.c = c;
-            p.dirs[0] = i;
-            p.R = W;
-            g.parts.push_back(p);
+            spot(kPadDUp + i, *arms[i]);
+            g.parts.back().anchored = true;
+            g.parts.back().anchor = P(mid.x, mid.y);
         }
-    }
-    for (int i = 0; i < 2; i++) {
-        Part p;
-        p.kind = kPartStick;
-        p.stick = i;
-        p.c = PU(i ? d.rstick : d.lstick);
-        p.R = d.stickR * s;
-        p.capR = p.R * 0.62f;
-        p.a = ImVec2(p.c.x - p.R, p.c.y - p.R);
-        p.b = ImVec2(p.c.x + p.R, p.c.y + p.R);
-        if (host) {
+        spot(kPadLB, pic->lb); spot(kPadRB, pic->rb); spot(kPadLT, pic->lt); spot(kPadRT, pic->rt);
+        for (int i = 0; i < 2; i++) {
+            const Spot& sp = i ? pic->rs : pic->ls;
+            Part p;
+            p.kind = kPartStick;
+            p.stick = i;
+            p.c = P(sp.x / 1000.0f, sp.y / 1000.0f);
+            p.R = sp.r / 1000.0f * s;
+            p.capR = p.R * 0.62f;
+            p.a = ImVec2(p.c.x - p.R, p.c.y - p.R);
+            p.b = ImVec2(p.c.x + p.R, p.c.y + p.R);
             p.pad = i ? kPadR3 : kPadL3;
             p.action = user(p.pad);
             for (int q = 0; q < 4; q++) {
-                p.padDirs[q] = (i ? kPadRSUp : kPadLSUp) + q;  // up, down, left, right (enum order)
+                p.padDirs[q] = (i ? kPadRSUp : kPadLSUp) + q;
                 p.dirs[q] = user(p.padDirs[q]);
             }
-        } else {
-            p.action = i ? kStickRClick : kStickLClick;
-            int base = i ? kRUp : kLUp;
-            for (int q = 0; q < 4; q++) p.dirs[q] = base + q;
+            g.parts.push_back(p);
         }
-        p.text = i ? "R" : "L";
-        g.parts.push_back(p);
-    }
-    auto shoulder = [&](int a, int pad, URect r, float coveredFrom, const char* t) {
-        Part p;
-        p.kind = kPartShoulder;
-        p.pad = pad;
-        p.action = host ? user(pad) : a;
-        p.a = P(r.x, r.y);
-        p.b = P(r.x + r.w, r.y + r.h);
-        p.va = p.a;
-        p.vb = P(r.x + r.w, coveredFrom);
-        p.back = coveredFrom != d.bodyTop;
-        p.c = ImVec2((p.va.x + p.vb.x) / 2, (p.va.y + p.vb.y) / 2);
-        p.text = t;
-        g.parts.push_back(p);
-    };
-    if (host) {
-        shoulder(-1, kPadLB, d.l, d.bodyTop, pad_short_label(kind, kPadLB));
-        shoulder(-1, kPadRB, mirror(d.l), d.bodyTop, pad_short_label(kind, kPadRB));
-        shoulder(-1, kPadLT, d.zl, d.l.y, pad_short_label(kind, kPadLT));
-        shoulder(-1, kPadRT, mirror(d.zl), d.l.y, pad_short_label(kind, kPadRT));
     } else {
-        shoulder(kL, kPadNone, d.l, d.bodyTop, "L");
-        shoulder(kR, kPadNone, mirror(d.l), d.bodyTop, "R");
-        shoulder(kZL, kPadNone, d.zl, d.l.y, "ZL");
-        shoulder(kZR, kPadNone, mirror(d.zl), d.l.y, "ZR");
+        const UPt north = {d.face.x, d.face.y - d.faceSpread}, east = {d.face.x + d.faceSpread, d.face.y},
+                  south = {d.face.x, d.face.y + d.faceSpread}, west = {d.face.x - d.faceSpread, d.face.y};
+        if (host) {
+            // the pad's own face buttons where they are: its letters, or PlayStation's shapes
+            const bool ps = kind == PadKind::kDualSense || kind == PadKind::kDualShock4;
+            const struct { int pad; UPt at; int icon; } face[4] = {
+                {kPadY, north, kIconTriangle}, {kPadB, east, kIconCircle}, {kPadA, south, kIconCross}, {kPadX, west, kIconSquare}};
+            for (auto& f : face) button(-1, f.pad, f.at, d.faceR, ps ? "" : pad_short_label(kind, f.pad), false, ps ? f.icon : kIconNone);
+            const bool nintendo = kind == PadKind::kSwitchPro;
+            button(-1, kPadMenu, d.plus, d.smallR, nintendo ? "+" : "", true, nintendo ? kIconNone : kIconMenu);
+            button(-1, kPadOptions, d.minus, d.smallR, nintendo ? "\xE2\x88\x92" : "", true, nintendo ? kIconNone : ps ? kIconCreate : kIconView);
+            button(-1, kPadHome, d.home, d.homeR, ps ? "PS" : "\xE2\x8C\x82", true);
+        } else {
+            // face buttons: Wii U positions (X top, A right, B bottom, Y left). With the by-label (Xbox)
+            // preset the letters follow the host pad instead (Y top, B right, A bottom, X left), so each
+            // letter sits where that host button is (issue #78).
+            if (fl == FaceLayout::kLabels) {
+                button(kY, kPadNone, north, d.faceR, "Y");
+                button(kB, kPadNone, east, d.faceR, "B");
+                button(kA, kPadNone, south, d.faceR, "A");
+                button(kX, kPadNone, west, d.faceR, "X");
+            } else {
+                button(kX, kPadNone, north, d.faceR, "X");
+                button(kA, kPadNone, east, d.faceR, "A");
+                button(kB, kPadNone, south, d.faceR, "B");
+                button(kY, kPadNone, west, d.faceR, "Y");
+            }
+            button(kPlus, kPadNone, d.plus, d.smallR, "+", true);
+            button(kMinus, kPadNone, d.minus, d.smallR, "\xE2\x88\x92", true);  // −
+            button(kHome, kPadNone, d.home, d.homeR, "\xE2\x8C\x82", true);     // ⌂
+        }
+        {
+            ImVec2 c = PU(d.dpad);
+            float L = d.dpadLen * s, W = d.dpadW * s;
+            ImVec2 arms[4][2] = {{{c.x - W / 2, c.y - L}, {c.x + W / 2, c.y - W / 2}},
+                                 {{c.x - W / 2, c.y + W / 2}, {c.x + W / 2, c.y + L}},
+                                 {{c.x - L, c.y - W / 2}, {c.x - W / 2, c.y + W / 2}},
+                                 {{c.x + W / 2, c.y - W / 2}, {c.x + L, c.y + W / 2}}};
+            int acts[4] = {kDUp, kDDown, kDLeft, kDRight};
+            for (int i = 0; i < 4; i++) {
+                Part p;
+                p.kind = kPartDpad;
+                p.pad = host ? kPadDUp + i : kPadNone;
+                p.action = host ? user(p.pad) : acts[i];
+                p.a = arms[i][0];
+                p.b = arms[i][1];
+                p.c = c;
+                p.dirs[0] = i;
+                p.R = W;
+                g.parts.push_back(p);
+            }
+        }
+        for (int i = 0; i < 2; i++) {
+            Part p;
+            p.kind = kPartStick;
+            p.stick = i;
+            p.c = PU(i ? d.rstick : d.lstick);
+            p.R = d.stickR * s;
+            p.capR = p.R * 0.62f;
+            p.a = ImVec2(p.c.x - p.R, p.c.y - p.R);
+            p.b = ImVec2(p.c.x + p.R, p.c.y + p.R);
+            if (host) {
+                p.pad = i ? kPadR3 : kPadL3;
+                p.action = user(p.pad);
+                for (int q = 0; q < 4; q++) {
+                    p.padDirs[q] = (i ? kPadRSUp : kPadLSUp) + q;  // up, down, left, right (enum order)
+                    p.dirs[q] = user(p.padDirs[q]);
+                }
+            } else {
+                p.action = i ? kStickRClick : kStickLClick;
+                int base = i ? kRUp : kLUp;
+                for (int q = 0; q < 4; q++) p.dirs[q] = base + q;
+            }
+            p.text = i ? "R" : "L";
+            g.parts.push_back(p);
+        }
+        auto shoulder = [&](int a, int pad, URect r, float coveredFrom, const char* t) {
+            Part p;
+            p.kind = kPartShoulder;
+            p.pad = pad;
+            p.action = host ? user(pad) : a;
+            p.a = P(r.x, r.y);
+            p.b = P(r.x + r.w, r.y + r.h);
+            p.va = p.a;
+            p.vb = P(r.x + r.w, coveredFrom);
+            p.back = coveredFrom != d.bodyTop;
+            p.c = ImVec2((p.va.x + p.vb.x) / 2, (p.va.y + p.vb.y) / 2);
+            p.text = t;
+            g.parts.push_back(p);
+        };
+        if (host) {
+            shoulder(-1, kPadLB, d.l, d.bodyTop, pad_short_label(kind, kPadLB));
+            shoulder(-1, kPadRB, mirror(d.l), d.bodyTop, pad_short_label(kind, kPadRB));
+            shoulder(-1, kPadLT, d.zl, d.l.y, pad_short_label(kind, kPadLT));
+            shoulder(-1, kPadRT, mirror(d.zl), d.l.y, pad_short_label(kind, kPadRT));
+        } else {
+            shoulder(kL, kPadNone, d.l, d.bodyTop, "L");
+            shoulder(kR, kPadNone, mirror(d.l), d.bodyTop, "R");
+            shoulder(kZL, kPadNone, d.zl, d.l.y, "ZL");
+            shoulder(kZR, kPadNone, mirror(d.zl), d.l.y, "ZR");
+        }
     }
 
     // where a callout's line ends on a part: a tab's outer end (its label stays clear), else the centre
     auto part_anchor = [&](const Part& p) {
         if (p.kind == kPartShoulder) return ImVec2(p.c.x < o.x + s / 2 ? p.va.x + 3 : p.vb.x - 3, (p.va.y + p.vb.y) / 2);
-        return p.c;
+        return p.anchored ? p.anchor : p.c;
     };
     auto part_of_action = [&](int a) -> const Part* {
         for (auto& p : g.parts)
@@ -405,6 +505,7 @@ Geo layout(const ControlsView& v, ImVec2 org, float w, float h) {
                 if (!at) at = part_of_pad(home.pad[a]);
         }
         gr.anchor = at ? part_anchor(*at) : ImVec2(org.x, org.y);
+        if (g.picture && at && !at->anchored) gr.anchorR = at->R;
         gr.acts = std::move(acts);
         gr.labels = std::move(labels);
         g.groups.push_back(gr);
@@ -653,7 +754,10 @@ void draw_controls(ControlsView& v, float w, float h) {
             dl->AddRect(p.a, p.b, rc, 0.02f * s, wd);
         }
     // ---- body (a soft shadow, then the shape)
-    if (!g.body.empty()) {
+    if (g.picture) {
+        // the picture is the body (no picture in a test, or where the host has none loaded: only the spots)
+        if (v.picture_tex) dl->AddImage(static_cast<ImTextureData*>(v.picture_tex)->GetTexRef(), g.pictureA, g.pictureB);
+    } else if (!g.body.empty()) {
         std::vector<ImVec2> sh = g.body;
         for (auto& q : sh) q.y += 4 * k;
         dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), col(0, 0, 0, 0.30f));
@@ -710,16 +814,67 @@ void draw_controls(ControlsView& v, float w, float h) {
         float y = gr.a.y + (2 + kRowH / 2) * k;
         float x0 = gr.right ? gr.a.x : gr.b.x;
         float x1 = gr.right ? g.colRx - 16 * k : g.colLx + (kColW + 16) * k;
-        ImVec2 pts[3] = {ImVec2(x0, y), ImVec2(x1, y), gr.anchor};
+        // (on a picture the line stops at the button's rim: what is printed on the button stays readable)
+        ImVec2 end = gr.anchor;
+        if (const float d = std::hypot(x1 - end.x, y - end.y); gr.anchorR > 0 && d > gr.anchorR)
+            end = ImVec2(end.x + (x1 - end.x) / d * gr.anchorR, end.y + (y - end.y) / d * gr.anchorR);
+        ImVec2 pts[3] = {ImVec2(x0, y), ImVec2(x1, y), end};
         dl->AddPolyline(pts, 3, h1 ? P.accent : warn ? alpha(P.warn, 0.7f) : P.leader, h1 ? 2.0f : 1.0f);
-        dl->AddCircleFilled(gr.anchor, 2.5f, h1 ? P.accent : P.leader);
+        if (g.picture) {  // on a picture the end of the line is all that marks the button: a dot that shows on it
+            dl->AddCircleFilled(end, 4.0f, col(0, 0, 0, 0.55f));
+            dl->AddCircleFilled(end, 3.0f, h1 ? P.accent : P.label);
+        } else {
+            dl->AddCircleFilled(gr.anchor, 2.5f, h1 ? P.accent : P.leader);
+        }
     }
 
     // ---- buttons and sticks
     const float bf = std::max(11.0f, 0.024f * s);
     for (auto& p : g.parts) {
         float wd;
-        if (p.kind == kPartRound) {
+        if (p.kind == kPartRound && g.picture) {
+            // on a picture the button is in the picture: only what is pressed or picked is drawn over it
+            const bool on = part_lit(p);
+            const ImU32 rc = ring(p.action, &wd);
+            if (on) dl->AddCircleFilled(p.c, p.R, alpha(P.accent, 0.55f));
+            if (on || rc != P.outline) dl->AddCircle(p.c, p.R + 1, on && rc == P.outline ? P.accent : rc, 0, std::max(wd, 2.0f));
+        } else if (p.kind == kPartStick && g.picture) {
+            bool dirHot = false, conflict = false;
+            for (int q = 0; q < 4; q++) {
+                dirHot |= hot(p.dirs[q]);
+                conflict |= conflict_at(p.dirs[q]);
+            }
+            const ImU32 rc = ring(p.action, &wd);
+            if (dirHot || conflict) dl->AddCircle(p.c, p.R, dirHot ? P.accent : P.warn, 0, 2.0f);
+            const float ang[4] = {-(float)M_PI_2, (float)M_PI_2, (float)M_PI, 0};
+            for (int q = 0; q < 4; q++) {
+                const int a = p.dirs[q];
+                const bool on = lit(a) || held_pad(p.padDirs[q]);
+                if (!on && !hot(a)) continue;
+                triangle(dl, ImVec2(p.c.x + std::cos(ang[q]) * p.R * 0.83f, p.c.y + std::sin(ang[q]) * p.R * 0.83f), ang[q], p.R * 0.17f,
+                         a >= 0 && a == v.cap_action && !on ? alpha(P.accent, pulse) : P.accent);
+            }
+            // the stick itself; at rest, the game stick it drives when keys move that one
+            float dx = 0, dy = 0;
+            if (v.pad) {
+                dx = v.pad[p.padDirs[3]] - v.pad[p.padDirs[2]];
+                dy = v.pad[p.padDirs[1]] - v.pad[p.padDirs[0]];
+            }
+            if (std::hypot(dx, dy) <= 0.02f)
+                for (int j = 0; j < 2; j++)
+                    if (m.pad[j ? kRUp : kLUp] == p.padDirs[0]) dx = v.stick[j][0], dy = -v.stick[j][1];
+            float len = std::hypot(dx, dy);
+            if (len > 1) dx /= len, dy /= len;
+            const ImVec2 cc(p.c.x + dx * p.R * 0.7f, p.c.y + dy * p.R * 0.7f);
+            const bool on = part_lit(p);
+            if (on) dl->AddCircleFilled(p.c, p.capR, alpha(P.accent, 0.55f));
+            if (on || rc != P.outline) dl->AddCircle(p.c, p.capR, on && rc == P.outline ? P.accent : rc, 0, std::max(wd, 2.0f));
+            if (len > 0.02f) {
+                dl->AddLine(p.c, cc, P.accent, 2.5f);
+                dl->AddCircleFilled(cc, std::max(4.0f, p.R * 0.16f), P.accent);
+                dl->AddCircle(cc, std::max(4.0f, p.R * 0.16f), P.white, 0, 1.2f);
+            }
+        } else if (p.kind == kPartRound) {
             const bool on = part_lit(p);
             dl->AddCircleFilled(p.c, p.R, on ? P.fill : P.button);
             dl->AddCircle(p.c, p.R, ring(p.action, &wd), 0, wd);
@@ -768,7 +923,7 @@ void draw_controls(ControlsView& v, float w, float h) {
         }
     }
     // d-pad cross
-    {
+    if (!g.picture) {
         float W = 0;
         ImVec2 c;
         for (auto& p : g.parts)

@@ -3,9 +3,10 @@
 //
 // Which controller: the one in the player's hands (ControlsView::host: Xbox, DualSense / DualShock 4,
 // Switch Pro, Steam, or a generic pad), with its own button names where they are on that pad; each
-// callout's line then goes to the button the Wii U input is bound to. With no controller connected it
-// is the selected Wii U controller (GamePad or Pro Controller), the layout of the macOS Controls
-// window (gfx/controls_ui.mm). The callouts and their rows are the same either way: the game only
+// callout's line then goes to the button the Wii U input is bound to. Xbox, DualSense, DualShock 4 and
+// Switch Pro are pictures (CC0 vector drawings, runtime/data/controllers; ControlsView::picture), the
+// others are drawn here. With no controller connected it is the selected Wii U controller (GamePad or
+// Pro Controller), the layout of the macOS Controls window (gfx/controls_ui.mm). The callouts and their rows are the same either way: the game only
 // knows Wii U inputs, and the bindings (controls.json) are per Wii U input.
 #pragma once
 #include "../input_map.h"
@@ -21,6 +22,8 @@ struct ControlsView {
     input_map::Mapping m;
     bool pro = false;
     input_map::HostPad host;           // the connected controller to draw (kind kNone: the Wii U controller)
+    bool picture = false;              // draw it as its picture where there is one (Xbox, DualSense, DualShock 4, Switch Pro)
+    void* picture_tex = nullptr;       // that picture, an ImTextureData* (null: only the spots on it, as in tests)
     int cap_action = -1, cap_col = 0;  // input being captured (-1 none)
     // live display, from the raw host state (not what the game sees: its input is blocked while the overlay is open)
     const float* pad = nullptr;        // host controller values (input_map::kPadCount): held controller chips

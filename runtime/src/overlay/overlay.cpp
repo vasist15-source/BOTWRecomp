@@ -28,6 +28,8 @@
 #include <string>
 #include <set>
 #include <thread>
+#include <map>
+#include <memory>
 #include <vector>
 
 #include "imgui.h"
@@ -1145,6 +1147,32 @@ input_map::HostPad shown_pad() {
     return input_map::host_pad();
 }
 
+// The picture of a controller as a texture, null where there is none (hostui::controller_picture: Xbox,
+// DualSense, DualShock 4 and Switch Pro on the AppKit host; WWHD_PAD_PICTURES=0 keeps the page's own
+// drawings). Decoded the first time that controller is shown and kept: under 3 MB each, four at most.
+ImTextureData* controller_picture(input_map::PadKind kind) {
+    static const bool off = getenv("WWHD_PAD_PICTURES") && !strcmp(getenv("WWHD_PAD_PICTURES"), "0");
+    const char* name = kind == input_map::PadKind::kXbox ? "xbox" : kind == input_map::PadKind::kDualSense ? "dualsense"
+                       : kind == input_map::PadKind::kDualShock4 ? "dualshock4" : kind == input_map::PadKind::kSwitchPro ? "switchpro" : nullptr;
+    if (off || !name) return nullptr;
+    static std::map<std::string, std::unique_ptr<ImTextureData>> pictures;  // an entry without a texture: tried, none
+    auto it = pictures.find(name);
+    if (it == pictures.end()) {
+        it = pictures.emplace(name, nullptr).first;
+        int w = 0, h = 0;
+        std::vector<unsigned char> rgba;
+        if (hostui::controller_picture(name, w, h, rgba)) {
+            auto t = std::make_unique<ImTextureData>();
+            t->Create(ImTextureFormat_RGBA32, w, h);
+            t->UseColors = true;
+            memcpy(t->GetPixels(), rgba.data(), rgba.size());
+            ImGui::RegisterUserTexture(t.get());
+            it->second = std::move(t);
+        }
+    }
+    return it->second.get();
+}
+
 std::string summary(const input_map::Mapping& m, int a) {
     std::string out;
     for (int k : m.keys[a])
@@ -1539,6 +1567,8 @@ void tab_controls() {
         cv.m = m;
         cv.pro = pro;
         cv.host = shown_pad();
+        cv.picture_tex = controller_picture(cv.host.kind);
+        cv.picture = cv.picture_tex != nullptr;
         cv.cap_action = U.cap_action;
         cv.cap_col = U.cap_col;
         static float live[input_map::kPadCount];

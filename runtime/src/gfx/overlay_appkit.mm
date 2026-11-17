@@ -4,6 +4,8 @@
 #import <AppKit/AppKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <vector>
+
 #include "../input.h"
 #include "../overlay/hostui.h"
 #include "../overlay/overlay.h"
@@ -33,6 +35,8 @@ void show_drc_window(bool on);
 void request_restart();
 void quit_without_asking();
 }  // namespace gfx
+
+namespace host { bool controller_picture(const char* name, int& width, int& height, std::vector<unsigned char>& rgba); }  // platform/controller_picture.mm
 
 namespace hostui {
 
@@ -94,6 +98,10 @@ void set_pro_controller(bool on) {
     input::set_pro_controller(on);
     gfx::show_drc_window(!on);
 }
+bool controller_picture(const char* name, int& width, int& height, std::vector<unsigned char>& rgba) {
+    return host::controller_picture(name, width, height, rgba);
+}
+
 const char* name() { return "AppKit"; }
 void set_clipboard(const std::string& text) {
     NSPasteboard* pb = [NSPasteboard generalPasteboard];

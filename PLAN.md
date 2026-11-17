@@ -909,6 +909,33 @@ GameController claims and never shows: the 2015 Steam Controller, which macOS se
   what is pressed; sticks, triggers, D-pad and Start / Back do what they should in the game; rebind one input
   from the page; quit Steam while it runs (the pad should go, or fall back to GameController's).
 
+### 2026-11-17: the Controls page shows vector pictures of the controllers (not play-tested)
+The page of ed99f2d was play-tested the same evening ("your session work works"), but the controllers drawn in
+code did not please: "can u get open source images from web for each controllers?". Public-domain photos from
+Wikimedia Commons were tried first and turned down ("i dont like this realistic style vector ones would look
+better").
+- **The pictures** (`runtime/data/controllers`, all CC0; README there): the Xbox One and DualShock 4 drawings of
+  TheHoodieGuy02's "8th Gen Console Vector Gamepad Collection" (opengameart.org) as they are. No open vector
+  drawing of a Switch Pro Controller or a DualSense was found (Commons, OpenGameArt, itch.io: only button
+  prompts), so `tools/controller_images.py` makes those two in the set's style from its parts (`switchpro.svg`:
+  a body drawn in the script, the Xbox drawing's sticks and D-pad, the Joy-Con drawing's letters and Home icon;
+  `dualsense.svg`: the DualShock 4 with a new body, a dark centre, plain symbols, no lettering or light bar).
+  A GitHub pack with all of them under an MIT label was left alone: its author says most of it is ripped from
+  the platform holders' own art. Steam and generic pads keep the page's own drawing, and so do the Wii U
+  GamePad and Pro Controller shown without a controller.
+- **How:** the script renders the drawings 1000 pixels wide (`tools/svg2png.swift`) into HEIC with alpha,
+  137 KB for the four; CMake puts each into the executable (`__PADS,<name>`), `platform/controller_picture.mm`
+  decodes it with ImageIO, the overlay keeps it as a texture. `controls_view.cpp` lays the inputs out as spots
+  on the picture (`picture_def`, printed by the script from the drawings' own coordinates) and draws over it
+  only what is pressed or picked; each callout's line ends on the rim of its button. `WWHD_PAD_PICTURES=0`
+  brings the drawings back.
+- ctest `controller_pictures` (the sections of a test executable, decoded: size, clear corners, solid
+  controller) and `overlay_controls_view` with the picture layouts (every input pickable; `--bmp ... --pictures`
+  renders the page with the pictures); ctest 131 of 141, the 10 known failures. The game was not run: the page
+  was seen through the test's raster only.
+  To play-test: Settings > Controls with each pad: the picture, the lines ending on the right buttons, a pressed
+  button lighting up on it, a click on a button of the picture starting a rebind.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

@@ -332,6 +332,7 @@ void set_pro_controller(bool on) {
     input::set_pro_controller(on);
     show_drc(!on);
 }
+bool controller_picture(const char*, int&, int&, std::vector<unsigned char>&) { return false; }  // drawn controllers on this host
 const char* name() { return "SDL"; }
 void set_clipboard(const std::string& text) { SDL_SetClipboardText(text.c_str()); }
 bool can_restart() { return false; }  // no prompt to ask first on this host yet

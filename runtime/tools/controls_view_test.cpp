@@ -7,6 +7,8 @@
 //   controls_view_test                 the checks
 //   controls_view_test --bmp <prefix>  also writes <prefix>_<controller>.bmp (a plain software raster
 //                                      of the draw lists, to look at the drawings)
+//   ... --pictures <dir>                 with --bmp: the picture controllers with their pictures, read from
+//                                      <dir>/<controller>.rgba (int32 width, int32 height, RGBA8 pixels)
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -50,10 +52,11 @@ void honor_textures() {
 void raster(ImDrawData* dd) {
     g_fb.assign((size_t)kW * kH * 3, 0);
     for (size_t i = 0; i < g_fb.size(); i += 3) g_fb[i] = 14, g_fb[i + 1] = 30, g_fb[i + 2] = 46;  // the overlay's blue-black
-    ImTextureData* atlas = ImGui::GetIO().Fonts->TexData;
+    ImTextureData* font_atlas = ImGui::GetIO().Fonts->TexData;
     for (ImDrawList* dl : dd->CmdLists) {
         for (const ImDrawCmd& cmd : dl->CmdBuffer) {
             if (cmd.UserCallback) continue;
+            ImTextureData* atlas = cmd.TexRef._TexData ? cmd.TexRef._TexData : font_atlas;  // the font atlas or a picture
             const int cx0 = std::max(0, (int)cmd.ClipRect.x), cy0 = std::max(0, (int)cmd.ClipRect.y);
             const int cx1 = std::min(kW, (int)cmd.ClipRect.z), cy1 = std::min(kH, (int)cmd.ClipRect.w);
             for (unsigned e = 0; e + 2 < cmd.ElemCount; e += 3) {
@@ -86,6 +89,8 @@ void raster(ImDrawData* dd) {
                             const int ty = std::clamp((int)(vv * atlas->Height), 0, atlas->Height - 1);
                             const uint8_t* tp = atlas->Pixels + (ty * atlas->Width + tx) * atlas->BytesPerPixel;
                             ta = (atlas->BytesPerPixel == 4 ? tp[3] : tp[0]) / 255.0f;
+                            if (atlas->BytesPerPixel == 4)
+                                for (int ch = 0; ch < 3; ch++) c[ch] *= tp[ch] / 255.0f;
                         }
                         const float a = c[3] / 255.0f * ta;
                         uint8_t* out = &g_fb[((size_t)y * kW + x) * 3];
@@ -122,6 +127,9 @@ bool g_keys[256];
 ImVec2 g_mouse(-1000, -1000);
 bool g_click = false;
 
+bool g_picture = false;             // the picture layout for the controllers that have one
+ImTextureData* g_picture_tex = nullptr;  // and its picture (--pictures)
+
 overlay::ControlsView frame(const Mapping& m, bool pro, HostPad host, bool raster_it = false) {
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)kW, (float)kH);
@@ -137,6 +145,8 @@ overlay::ControlsView frame(const Mapping& m, bool pro, HostPad host, bool raste
     cv.m = m;
     cv.pro = pro;
     cv.host = host;
+    cv.picture = g_picture;
+    cv.picture_tex = g_picture_tex;
     cv.pad = g_pad;
     cv.keys = g_keys;
     for (int a = 0; a < kActionCount; a++) {
@@ -180,8 +190,8 @@ struct Sweep {
 };
 Sweep sweep(const Mapping& m, bool pro, HostPad host) {
     Sweep s;
-    for (float y = kViewPos.y + 2; y < kViewPos.y + kViewH; y += 5)
-        for (float x = kViewPos.x + 2; x < kViewPos.x + kViewW; x += 5) {
+    for (float y = kViewPos.y + 2; y < kViewPos.y + kViewH; y += 7)
+        for (float x = kViewPos.x + 2; x < kViewPos.x + kViewW; x += 7) {
             g_mouse = ImVec2(x, y);
             const overlay::ControlsView cv = frame(m, pro, host);
             if (cv.hover_action < 0) continue;
@@ -193,17 +203,48 @@ Sweep sweep(const Mapping& m, bool pro, HostPad host) {
     return s;
 }
 
-void test_layouts(const char* bmp) {
+// <dir>/<name>.rgba as a registered texture (null when there is none)
+ImTextureData* load_picture(const char* dir, const std::string& name) {
+    FILE* f = fopen((std::string(dir) + "/" + name + ".rgba").c_str(), "rb");
+    if (!f) return nullptr;
+    int32_t size[2] = {};
+    ImTextureData* t = nullptr;
+    if (fread(size, 4, 2, f) == 2 && size[0] > 0 && size[1] > 0 && size[0] <= 4096 && size[1] <= 4096) {
+        t = new ImTextureData();
+        t->Create(ImTextureFormat_RGBA32, size[0], size[1]);
+        t->UseColors = true;
+        if (fread(t->GetPixels(), 4, (size_t)size[0] * size[1], f) != (size_t)size[0] * size[1]) fprintf(stderr, "%s.rgba: short\n", name.c_str());
+        ImGui::RegisterUserTexture(t);
+    }
+    fclose(f);
+    return t;
+}
+
+void test_layouts(const char* bmp, const char* pictures) {
     Mapping m = Mapping::defaults();
-    struct Case { std::string name; bool pro; HostPad host; };
-    std::vector<Case> cases = {{"gamepad", false, {}}, {"pro", true, {}}};
-    for (auto& h : kHosts) cases.push_back({h.id, false, {h.kind, h.name}});
+    struct Case { std::string name; bool pro; HostPad host; bool picture; };
+    std::vector<Case> cases = {{"gamepad", false, {}, false}, {"pro", true, {}, false}};
+    for (auto& h : kHosts) cases.push_back({h.id, false, {h.kind, h.name}, false});
+    // the controllers there is a picture of: the same checks on the picture's layout (the others: no change)
+    for (auto& h : kHosts)
+        if (h.kind == PadKind::kXbox || h.kind == PadKind::kDualSense || h.kind == PadKind::kDualShock4 || h.kind == PadKind::kSwitchPro)
+            cases.push_back({std::string(h.id) + "_picture", false, {h.kind, h.name}, true});
     for (const Case& c : cases) {
         g_case = c.name;
+        g_picture = c.picture;
+        g_picture_tex = c.picture && pictures ? load_picture(pictures, c.host.kind == PadKind::kXbox ? "xbox" : c.host.kind == PadKind::kDualSense ? "dualsense"
+                                                              : c.host.kind == PadKind::kDualShock4 ? "dualshock4" : "switchpro") : nullptr;
         std::fill(g_pad, g_pad + kPadCount, 0.0f);
+        if (c.picture && bmp) {  // the picture with something to see on it: A and the left trigger held, the right stick pushed
+            g_pad[kPadA] = g_pad[kPadLT] = 1;
+            g_pad[kPadRSRight] = 0.8f;
+            g_pad[kPadRSUp] = 0.5f;
+        }
         frame(m, c.pro, c.host);
         frame(m, c.pro, c.host, bmp != nullptr);
         if (bmp) write_bmp(std::string(bmp) + "_" + c.name + ".bmp");
+        std::fill(g_pad, g_pad + kPadCount, 0.0f);
+        frame(m, c.pro, c.host);
         CHECK(drawing_inside());
         const Sweep s = sweep(m, c.pro, c.host);
         // every Wii U input has its three chips, whatever is drawn
@@ -213,6 +254,8 @@ void test_layouts(const char* bmp) {
         for (int a = 0; a < kActionCount; a++)
             if (m.pad[a] != kPadNone) CHECK(s.part[a]);
     }
+    g_picture = false;
+    g_picture_tex = nullptr;
 }
 
 // where the mouse hovers `action` on the drawing itself (not a chip); x < 0 when nowhere
@@ -331,6 +374,7 @@ void test_names() {
 
 int main(int argc, char** argv) {
     const char* bmp = argc > 2 && !strcmp(argv[1], "--bmp") ? argv[2] : nullptr;
+    const char* pictures = bmp && argc > 4 && !strcmp(argv[3], "--pictures") ? argv[4] : nullptr;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -350,7 +394,7 @@ int main(int argc, char** argv) {
         }
     }
     test_names();
-    test_layouts(bmp);
+    test_layouts(bmp, pictures);
     test_click_wiiu();
     test_host_parts();
     ImGui::DestroyContext();
