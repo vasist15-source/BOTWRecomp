@@ -788,6 +788,13 @@ the kept installer copy have not been played yet. The release build is installed
   136, the 10 known failures, with the new `aspect_hud` test (the table's decisions and the routines' arithmetic at
   21:9) and the translator package test's site check. In /Applications for the user's play-test.
 
+### 2026-11-17: release 0.3.1: aspect ratio, P capture key gone, a shorter installer README
+- BOTWRecomp-0.3.1.dmg (6,325,997 bytes, tag v0.3.1): main at b748959 (aspect ratio in Settings > Display, movies
+  pillarboxed, capture on F12 only) plus the installer README rewritten player-first (the DMG's Read Me). ctest 126 of
+  136, the 10 known failures. The player's path from the DMG in a scratch home with an empty environment: installed in
+  370 s, the binary has the aspect ratio setting. The aspect HUD's dialog cursor, inventory Link and 16:9 unchanged are
+  still unchecked in game.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
