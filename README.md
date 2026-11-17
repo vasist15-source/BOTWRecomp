@@ -55,7 +55,9 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   recharge, infinite hearts and stamina, no Blood Moon, no random enemy spawns, a weather of your
   choice, Master Cycle Zero fuel and summoning anywhere, amiibo more than once a day).
 - Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`; `101c9500` for the European
-  release).
+  release). A Switch save (Ryujinx or a real console) can be converted to the Wii U format first with
+  the [BotW Save Converter](https://vasist15-source.github.io/botw-save-converter/), a web page that
+  runs in your browser and converts either way.
 - Content mods made for the Wii U version: put each one in `~/Library/Application Support/BotW/Mods`,
   as downloaded (a BCML `.bnp`, or a `.zip`, `.7z` or `.rar`) or as a folder (a Cemu graphic pack with
   `content`/`aoc` folders, an SDCafiine folder, or just `content`/`aoc`), and switch it on in Settings > Mods.
