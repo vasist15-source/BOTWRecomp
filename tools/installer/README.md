@@ -1,99 +1,80 @@
-# Installing BOTWRecomp (Breath of the Wild for Mac)
+# BOTWRecomp: Breath of the Wild for Mac
 
-BOTWRecomp contains no game files and no game code. The installer builds the game on your Mac from
-**your own** Wii U dump of *The Legend of Zelda: Breath of the Wild* (the USA or the European
-release): it translates the game's code to C, compiles it with Apple's compiler and puts the result
-in a normal Mac app, **Breath of the Wild.app**. Nothing is downloaded and nothing from your dump
-leaves your Mac.
+This DMG holds no game files. **BOTWRecomp Installer** builds *Breath of the Wild.app* on your Mac
+from your own Wii U dump. Nothing is downloaded, and nothing from your dump leaves your Mac.
 
-## What you need
+## You need
 
-- A Mac with Apple silicon and macOS 13 or newer, about 3 GB of free space (plus about 15 GB if
-  you let the installer copy the game files).
-- Apple's free **Command Line Tools**. The installer offers to install them (or run
-  `xcode-select --install`).
-- From a source checkout only (not with the release): **CMake**, `brew install cmake ninja` with
-  [Homebrew](https://brew.sh) or the CMake app from [cmake.org](https://cmake.org/download/).
-- Your dump, extracted (folders with `code`, `content` and `meta` in them), all of one release:
-  - the **base game**, title `00050000101C9400` (USA) or `00050000101C9500` (Europe)
-  - the **update v208** (game version 1.5.0), title `0005000E101C9400` or `0005000E101C9500`
-  - optionally the **DLC** (v80: The Master Trials and The Champions' Ballad), title
-    `0005000C101C9400` or `0005000C101C9500`
+- An Apple silicon Mac, macOS 13 or newer, about 3 GB free (about 15 GB more if you copy the game files).
+- Apple's **Command Line Tools**. The installer offers to install them (or run `xcode-select --install`).
+  Xcode is not needed.
+- Your dump of the **USA** release, extracted (folders with `code`, `content` and `meta`):
 
-  Dump them from your own console (for example with Dumpling). Games installed in Cemu work as
-  they are: they are in `mlc01/usr/title/00050000/101c9400`, `.../0005000e/101c9400` and
-  `.../0005000c/101c9400` (`101c9500` for the European release). Disc images (`.wud`, `.wux`) and
-  Cemu archives (`.wua`) have to be extracted first. The European release is new and not
-  play-tested yet (please report how it runs); the game starts in English, and its other languages
-  are in the game's Settings (Cmd+,) > Language & About. The Japanese release is not supported.
+  | | title ID |
+  |---|---|
+  | base game | `00050000101C9400` |
+  | update **v208** (1.5.0) | `0005000E101C9400` |
+  | DLC (optional) | `0005000C101C9400` |
 
-## Install
+  Games installed in Cemu work as they are (`mlc01/usr/title/…/101c9400`). Extract `.wud`, `.wux` and
+  `.wua` files first. The **European** release (`…101C9500`) installs too but hasn't been play-tested.
+  The Japanese release is not supported.
 
-1. Download `BOTWRecomp-<version>.dmg` from the releases page, open it and double-click
-   **BOTWRecomp Installer** (you can also drag it to Applications first). The installer is not
-   notarized by Apple, so the first time macOS refuses to open it: click Done, then open
-   System Settings > Privacy & Security and click **Open Anyway** next to "BOTWRecomp Installer"
-   (on macOS 14 and older: right-click the app > Open > Open).
-   From a source checkout: double-click **Install Breath of the Wild.command** instead; it builds
-   the installer app (a few seconds) and opens it.
-2. **Your game files**: click *Find in a Folder…* and choose the folder that holds your dump, or
-   choose (or drag in) the base game, update and DLC folders one by one. Each one is checked: a
-   green check means it is right; otherwise the row says what is wrong (the Japanese release, an
-   update or DLC of another release than the base game, an older update, encrypted files, a missing
-   folder, …).
-3. **Save** (optional): choose a save to bring along, for example Cemu's
-   `mlc01/usr/save/00050000/101c9400/user/80000001` (`101c9500` for the European release; the
-   saves of the two releases are the same files).
-4. **Where to put the game**: `~/Applications` by default; `/Applications` or any other folder if
-   you prefer. *Copy the game files to this Mac* makes the app independent of where your dump is
-   now (an external drive, say); otherwise the app reads them where they are.
-5. Click **Build Breath of the Wild**. It takes about 5–10 minutes; the window shows each step, the
-   time left and, under *Details*, the full log. When it is done, click **Open Game**.
+## Install or update
 
-Prefer Terminal? From a source checkout, `tools/installer/install-macos.command --terminal install --base … --update …
-[--dlc …] [--save …] [--dest …]` does the same (`--help` lists the options).
+1. Double-click **BOTWRecomp Installer**. The first time, macOS blocks it because it isn't notarized:
+   click Done, then go to System Settings > Privacy & Security and click **Open Anyway**.
+2. Click **Find in a Folder…** and choose the folder with your dump. A green check next to each part
+   means it's right; otherwise the row says what's wrong.
+3. Optionally pick a save to import, such as Cemu's
+   `mlc01/usr/save/00050000/101c9400/user/80000001`. Your current save is backed up first.
+4. Click **Build Breath of the Wild** (5–10 minutes), then **Open Game**.
+
+To update, run the new installer the same way. Your saves, settings and mods are kept.
+
+## In the game
+
+| | |
+|---|---|
+| Settings | Cmd+, |
+| Home menu (Resume, Settings, Quit; pauses the game) | H, or Home on a controller |
+| Full screen | Cmd+F |
+| Aspect ratio (16:10, 21:9, 32:9, …) | Settings > Display, then **Restart now** |
+| Mods | put them in `~/Library/Application Support/BotW/Mods`, switch them on in Settings > Mods |
+| Cheats | Settings > Cheats |
+
+Mods can be BCML `.bnp`, `.zip`, `.7z` or `.rar` files as downloaded, or folders (Cemu graphic
+packs, SDCafiine folders, `content`/`aoc` folders). Switch versions of mods don't work with the Wii U
+game.
 
 ## Where things are
 
-| what | where |
-|---|---|
-| the game | `Breath of the Wild.app` where you chose (`~/Applications` by default) |
-| which game files the app uses | `~/Library/Application Support/BotW/install.plist` |
-| saves | `~/Library/Application Support/BotW/save` (an imported save replaces it; the old one is kept as `save.backup-<date>`) |
-| copied game files (if chosen) | `~/Library/Application Support/BotW/game` |
-| settings, controls, screenshots | `~/Library/Application Support/BotW` |
-| shader cache | `~/Library/Caches/BotW` |
-| build files (if kept) | `~/Library/Caches/BotW/installer` (`gen`: translated code, `obj` or `rt`: the build) |
-| the installer's files, for rebuilding the game code from Settings > Mods (code mods) | `~/Library/Application Support/BotW/installer` |
-| mods | `~/Library/Application Support/BotW/Mods` (Settings > Mods > Show in Finder) |
-| game log, crash reports, installer log | `~/Library/Logs/BotW` (`wwhd.log`, `captures/`, `installer.log`) |
+All in `~/Library`:
 
-Moved your dump? Open the installer again and choose the new place; it builds again (faster with
-the build files kept). To uninstall, delete the app and the `BotW` folders above.
+| | |
+|---|---|
+| saves | `Application Support/BotW/save` |
+| settings, mods, screenshots | `Application Support/BotW` |
+| shader cache | `Caches/BotW` |
+| logs and crash reports | `Logs/BotW` |
+
+The app goes in `~/Applications` unless you choose another folder. To uninstall, delete the app
+and the `BotW` folders above.
 
 ## Problems
 
-- *"… can't be opened"* for the `.command`: right-click it and choose Open.
-- A step fails: the window shows the error and the last lines of the log; **Copy Log** puts the whole
-  log (`~/Library/Logs/BotW/installer.log`) on the clipboard for a bug report. It contains file
-  paths, but no game data.
-- The game doesn't start and says its files are missing: the folder or drive with the dump is not
-  there; connect it or run the installer again.
+- **A build step fails:** click **Copy Log** and paste it into a GitHub issue. The log has file
+  paths but no game data.
+- **"Game files missing" at launch:** the drive or folder with your dump moved. Reconnect it, or run
+  the installer again. Tick *Copy the game files to this Mac* if you want the app to work without it.
+- **Stutter the first time an effect appears:** its shaders are compiling. They're cached, so it
+  won't happen again.
 
-## For developers
+Bug reports: https://github.com/vasist15-source/BOTWRecomp/issues (include your Mac model).
 
-Releases: `tools/release/botw_dmg.py VERSION` builds `build/release/BOTWRecomp-VERSION.dmg`. The
-installer app carries the runtime prebuilt for macOS 13+ (`kit/`: the `wwhd` objects as
-`libbotw_runtime.a`, `libcemu_latte.a`, `libimgui.a`, `runtime/include`, and `kit.json` with the
-compile flags and link line), configured against a stub `GEN_DIR`; an allow list and a symbol check
-keep anything game-derived out. With a kit, `botw_setup.py` compiles the translated code with
-`/usr/bin/clang` and links it to the kit, so players need only the Command Line Tools.
+## From source
 
-`tools/installer/botw_setup.py` does all the work (standard library only, the Command Line Tools'
-Python 3.9): `scan`, `check`, `requirements`, `install` (`--json` for the installer app's event
-stream). It translates with the same code as `tools/probe_recomp.py` (identical output to the dev
-checkout's `build/gen`), configures CMake with `GEN_DIR` in the cache folder (Release, Metal) and
-builds only the `wwhd` target. `tools/installer/macos/BotWInstaller.swift` is the SwiftUI front end,
-built by `tools/installer/macos/build.sh [DEST]`. `tools/make_app.sh` stays the dev bundle (the dev
-checkout's build and dump, and the installed game's save folder when there is one, else `build/save`). Wind Waker HD's multi-platform setup and release
-packaging (Windows, Linux, Android) were removed; this port is macOS only.
+From a checkout, double-click **Install Breath of the Wild.command**, which also needs CMake
+(`brew install cmake ninja`). `tools/installer/botw_setup.py --help` lists the Terminal options.
+`tools/release/botw_dmg.py VERSION` builds a release DMG: a prebuilt runtime kit, allow-list and
+symbol checks so that nothing game-derived ships.
