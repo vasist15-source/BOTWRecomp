@@ -41,19 +41,17 @@ namespace {
 constexpr float kBase = 16.0f / 9.0f;
 
 const Choice kChoices[] = {
-    {"16:9", "16:9 (original)", kBase},
-    {"window", "Match window", 0},
+    {"16:9", "16:9", kBase},
+    {"16:10", "16:10", 16.0f / 10.0f},
+    {"3:2", "3:2", 3.0f / 2.0f},
     {"4:3", "4:3", 4.0f / 3.0f},
     {"5:4", "5:4", 5.0f / 4.0f},
-    {"3:2", "3:2", 3.0f / 2.0f},
-    {"16:10", "16:10", 16.0f / 10.0f},
-    {"21:9", "21:9 (2560x1080, 5120x2160)", 64.0f / 27.0f},
-    {"43:18", "21:9 (3440x1440)", 43.0f / 18.0f},
-    {"24:10", "24:10 (3840x1600)", 24.0f / 10.0f},
+    {"window", "Match window", 0},
+    {"21:9", "21:9", 64.0f / 27.0f},
+    {"24:10", "24:10", 24.0f / 10.0f},
     {"32:10", "32:10", 32.0f / 10.0f},
     {"32:9", "32:9", 32.0f / 9.0f},
-    {"48:9", "48:9 (three screens)", 48.0f / 9.0f},
-    {"custom", "Custom", -1},
+    {"48:9", "48:9", 48.0f / 9.0f},
 };
 constexpr int kChoiceCount = sizeof kChoices / sizeof kChoices[0];
 const char* const kHudIds[hud::kModes] = {"edges", "centred", "stretched"};
@@ -85,8 +83,7 @@ struct Env {
 const Env g_env;
 
 // the saved setting (Settings > Display)
-std::atomic<int> g_saved{0}, g_saved_hud{hud::kEdges};
-std::atomic<float> g_saved_custom{kBase};
+std::atomic<int> g_saved{0};
 std::atomic<float> g_window{kBase};
 // this run's, fixed at the first use (latch): read by the threads that compute and record frames
 std::atomic<float> g_game{kBase};
@@ -131,6 +128,7 @@ void load_saved() {
     std::call_once(once, [] {
         std::string v;
         if (hostui::get("aspect", v)) {
+            if (v == "43:18") v = "21:9";  // an earlier build listed 3440x1440 apart
             for (int i = 0; i < kChoiceCount; i++)
                 if (v == kChoices[i].id) g_saved = i;
         } else if (hostui::get("aspectMode", v)) {  // as saved before there were more choices
@@ -139,10 +137,6 @@ void load_saved() {
             for (int i = 0; m >= 0 && m < 5 && i < kChoiceCount; i++)
                 if (!strcmp(kOld[m], kChoices[i].id)) g_saved = i;
         }
-        if (hostui::get("aspectCustom", v)) g_saved_custom = clamp_aspect(strtof(v.c_str(), nullptr));
-        if (hostui::get("aspectHud", v))
-            for (int i = 0; i < hud::kModes; i++)
-                if (v == kHudIds[i]) g_saved_hud = i;
     });
 }
 int saved() { return g_saved; }
@@ -151,19 +145,6 @@ void set_saved(int i) {
     g_saved = i;
     hostui::set("aspect", kChoices[i].id);
     LOG("[aspect] saved: %s", kChoices[i].label);
-}
-float saved_custom() { return g_saved_custom; }
-void set_saved_custom(float a) {
-    g_saved_custom = clamp_aspect(a);
-    char text[32];
-    snprintf(text, sizeof text, "%.4f", g_saved_custom.load());
-    hostui::set("aspectCustom", text);
-}
-int saved_hud() { return g_saved_hud; }
-void set_saved_hud(int mode) {
-    if (mode < 0 || mode >= hud::kModes) return;
-    g_saved_hud = mode;
-    hostui::set("aspectHud", kHudIds[mode]);
 }
 
 void set_window_aspect(float a) {
@@ -176,7 +157,7 @@ void set_window_aspect(float a) {
 namespace {
 float value_of(int i) {
     const float v = kChoices[i].value;
-    float a = v > 0 ? v : v < 0 ? g_saved_custom.load() : g_window.load(std::memory_order_relaxed);
+    float a = v > 0 ? v : g_window.load(std::memory_order_relaxed);
     a = clamp_aspect(a);
     return same(a, kBase) ? kBase : a;
 }
@@ -193,7 +174,7 @@ void latch() {
         else a = value_of(chosen = g_saved);
         a = clamp_aspect(a);
         if (same(a, kBase)) a = kBase;
-        const int mode = g_env.hud >= 0 ? g_env.hud : g_saved_hud.load();
+        const int mode = g_env.hud >= 0 ? g_env.hud : hud::kEdges;  // Cemu's default, Edge HUD
         if (a != kBase) write_data(a);
         g_hud = mode;
         g_active_choice = chosen;
@@ -210,8 +191,7 @@ bool restart_needed() {
     const int s = g_saved, was = g_active_choice;
     const float now = value_of(s), run = g_game.load();
     const bool window = kChoices[s].value == 0 || (was >= 0 && kChoices[was].value == 0);
-    if (window ? std::fabs(now - run) > 0.012f * run : now != run) return true;
-    return run != kBase && g_env.hud < 0 && g_saved_hud != g_hud;  // the HUD's placement matters off 16:9
+    return window ? std::fabs(now - run) > 0.012f * run : now != run;
 }
 float game() {
     latch();

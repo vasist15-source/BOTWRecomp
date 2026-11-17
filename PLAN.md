@@ -738,9 +738,10 @@ the kept installer copy have not been played yet. The release build is installed
 - A player on an ultrawide asked for 21:9; Cemu's Graphics pack copied into Mods was refused (its TextureRedefine
   sizes; the refusal now says the settings are built in). The inherited `aspect.cpp` hooked Wind Waker's camera and
   nw::lyt addresses, none of which exist in BotW, so the setting was hidden. Now, for BotW:
-  - Choices (saved as `aspect`, the older `aspectMode` is still read): 16:9, Match window, 4:3, 5:4, 3:2, 16:10,
-    21:9 as 64:27 (2560x1080) and as 43:18 (3440x1440), 24:10, 32:10, 32:9, 48:9, Custom (a slider, 1.00 to 5.34;
-    `aspectCustom`). `WWHD_ASPECT=21:9`/`window`/`2.4` and `WWHD_HUD=edges`/`centred`/`stretched` for a run.
+  - Settings > Display > Aspect ratio is one plain list (the user asked for no more than that): 16:9, 16:10, 3:2,
+    4:3, 5:4, Match window, 21:9 (64:27), 24:10, 32:10, 32:9, 48:9; saved as `aspect` (the older `aspectMode` is
+    still read). The HUD always uses Cemu's default, Edge HUD. For a run only: `WWHD_ASPECT=21:9`/`window`/`2.4`
+    (any shape) and `WWHD_HUD=edges`/`centred`/`stretched`.
   - The run's aspect and HUD placement are fixed the first time the game asks (`latch`): the HUD's panes are changed
     as their layouts are built, so a changed setting applies at the next start (the Display page says so, with
     Restart now). Match window is the TV window's shape at launch; in full screen the screen below the notch
@@ -763,12 +764,11 @@ the kept installer copy have not been played yet. The release build is installed
     never shipped), `aspect_hud.h` walks it and has the routines, `aspect_hud.cpp` applies them at the pack's five
     sites: pane built (03C496B8), screen created (03A3EDC4, name in the caller's r24 as the pack takes it),
     animated x of the sensor gauges (03C46298), map open/close (02F60204), pane-based projection of the weather
-    pane (03C56CD0). HUD setting: At the screen's edges (Cemu's Edge HUD, default), Centred (Centered HUD),
-    Stretched (no fixes). Differences from the pack: its "Alt" padding uses the render width in pixels, here it is
+    pane (03C56CD0). HUD placement: Cemu's Edge HUD (Centered HUD and no fixes only through `WWHD_HUD`). Differences from the pack: its "Alt" padding uses the render width in pixels, here it is
     the same as the normal padding (the 720-line size); the map routine tests the mode it meant to (the pack
     compares r4); a layout's width is widened once per loaded layout, not again on every rebuild.
   - Narrower than 16:9: the pack's rules would push menus off the sides (its Square HUD mode is "experimental"), so
-    the HUD is stretched to the taller picture as in Cemu, or with Centred keeps its shape in a 16:9 band: nw::lyt's
+    the HUD is stretched to the taller picture as in Cemu, or with `WWHD_HUD=centred` keeps its shape in a 16:9 band: nw::lyt's
     LoadProjectionMtx (03C479D4, upload at 03C479F8) and nw::font's text draw (0421A3A8, upload at 0421A784) tag
     their projection upload and the render thread narrows it (OP_SET_PROJ_REGS) for the 16:9 TV picture.
   - At 16:9 every site returns the game's values and nothing is changed or tagged.

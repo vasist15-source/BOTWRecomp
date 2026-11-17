@@ -3,7 +3,7 @@
 #include <cstdint>
 
 namespace aspect {
-// The choices of Settings > Display. value: the aspect; 0: the TV window's shape; < 0: saved_custom().
+// The choices of Settings > Display. value: the aspect; 0: the TV window's shape.
 struct Choice {
     const char* id;     // as saved
     const char* label;
@@ -17,10 +17,6 @@ constexpr float kMin = 1.0f, kMax = 5.34f;  // 1:1 ... 48:9
 // their layouts are built (aspect_hud.cpp), so a run keeps the aspect it started with.
 int saved();                  // index of the choice
 void set_saved(int i);
-float saved_custom();
-void set_saved_custom(float a);
-int saved_hud();              // aspect::hud::Mode (aspect_hud.h): edges, centred, stretched
-void set_saved_hud(int mode);
 void load_saved();            // main thread, before the game runs (else on first use)
 bool restart_needed();        // the saved setting differs from what this run uses
 
@@ -28,7 +24,7 @@ void set_window_aspect(float a);   // shape of the TV window's drawable (at laun
 // main thread, GX2SwapScanBuffers: the aspect the render thread uses from this swap on
 float on_swap();
 float game();                         // this run's aspect (fixed at its first use)
-int hud_mode();                       // this run's HUD placement (aspect::hud::Mode)
+int hud_mode();                       // this run's HUD placement (aspect::hud::Mode; edges unless WWHD_HUD)
 uint64_t game_frame();                // swaps so far
 // Narrower than 16:9 with the HUD centred: the game thread tags the upload of a layout / text projection
 // (tools/botw_aspect_patches.py); the render thread narrows it for the TV picture (gx2_core.cpp)
