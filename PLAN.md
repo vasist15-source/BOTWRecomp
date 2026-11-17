@@ -795,7 +795,7 @@ the kept installer copy have not been played yet. The release build is installed
   370 s, the binary has the aspect ratio setting. The aspect HUD's dialog cursor, inventory Link and 16:9 unchanged are
   still unchecked in game.
 
-### 2026-11-17: two controller reports: Settings with the controller, and a crash taken for a quit (not yet play-tested)
+### 2026-11-17: two controller reports: Settings with the controller (play-tested, works), and a crash taken for a quit (lock not yet confirmed in play)
 Reported: "the game closed when i pressed select button on controller. and i cant navigate settings with controller.
 when i press a or right dpad to get into sub menu it doesn't work".
 - **Settings navigation (7479013).** The sidebar and the page were child windows flattened into one Dear ImGui
@@ -830,6 +830,8 @@ when i press a or right dpad to get into sub menu it doesn't work".
   To play-test: Settings with the D-pad and A (into a page, around it, B and Left back out, L / R), and Select
   in game (the map) over a few sessions; a crash log in `captures/` naming 0308E7E8 again would mean the lock
   missed a path.
+- Play-tested by the user the same evening (v0.3.1+4 in /Applications): "settings navigation works now with
+  controller". The play report lock can only be confirmed by the crash staying away over more sessions.
 - Seen on the way, not touched: `pad_delivery_test` does not link (`hle_traced` undefined), one of the 10.
 
 ## Audio investigation (parked 2026-10-11)
