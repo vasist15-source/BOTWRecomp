@@ -938,6 +938,28 @@ better").
 - **Play-tested 2026-11-18** (the app built from f705f32): "works". The report does not say which pads were
   connected, so the four pictures are not each confirmed on a real pad.
 
+### 2026-11-18: time played (Home menu, Settings > Language & About; play-tested: works)
+- `runtime/src/play_time.h` (header only): the seconds played, kept in `<config dir>/playtime.txt` as two lines,
+  `played` (this port) and `earlier` (carried over from other versions of the game: Cemu, a Switch emulator, a
+  console; written by hand, the port only reads it). Shown as "84 h 20 min played" under the Home menu's list and
+  as "Time played" with the split under About.
+- Nothing runs while playing: no thread, no timer, nothing per frame. The clock is read at the start
+  (`play_time::start`, main.cpp), when the game closes a `game_data.sav` it wrote (FSCloseFile, hle/fs.cpp: the
+  time goes to disk with the save, so a crash loses at most the time since the last in-game save), in
+  `render::shutdown` (Quit and Restart leave with _Exit / execv) and in an atexit handler (the game's own exit());
+  the menus read it only while they are drawn. CLOCK_UPTIME_RAW: sleep does not count; time in the menu or paused
+  does, as in Cemu and Ryujinx. Each note re-reads the file first, so two copies of the game do not lose time.
+- Scripted and headless runs do not count (WWHD_HIDDEN_WINDOWS, WWHD_EXIT_AT_FRAME, WWHD_NO_HOST_INPUT,
+  WWHD_KEYS, WWHD_CONTROLS_SELFTEST), nor WWHD_PLAY_TIME=0; WWHD_PLAY_TIME_FILE=path for tests.
+- Where other versions keep theirs (for seeding `earlier`): Ryujinx and its forks in
+  `~/Library/Application Support/Ryujinx/games/01007ef00011e000/gui/metadata.json` (`timespan_played`), Cemu in
+  `mlc01/usr/save/system/pdm/80000001/PlayStats.dat` (big-endian: count, then per title id high, id low, minutes,
+  launches u16, first and last day u16; settings.xml's `time_played` can be 0), and the game itself in every
+  `game_data.sav` as the s32 flag `PlayReport_PlayTime` (seconds of that save's play, counted by the game in
+  this port too).
+- **Play-tested 2026-11-18** on the /Applications build: "works"; the file went from 12747 to 12790 s over the
+  session.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

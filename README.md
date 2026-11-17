@@ -54,6 +54,9 @@ troubleshooting: [tools/installer/README.md](tools/installer/README.md).
   while playing (infinite arrows, unbreakable weapons and shields, champion abilities without
   recharge, infinite hearts and stamina, no Blood Moon, no random enemy spawns, a weather of your
   choice, Master Cycle Zero fuel and summoning anywhere, amiibo more than once a day).
+- Time played, in the Home menu and Settings > Language & About. It costs nothing while you play (the
+  time is written when the game saves and when you quit). To carry over hours from another version of the
+  game, set the `earlier` line (seconds) of `~/Library/Application Support/BotW/playtime.txt`.
 - Save import from Cemu (`mlc01/usr/save/00050000/101c9400/user/80000001`; `101c9500` for the European
   release). A Switch save (Ryujinx or a real console) can be converted to the Wii U format first with
   the [BotW Save Converter](https://vasist15-source.github.io/botw-save-converter/), a web page that

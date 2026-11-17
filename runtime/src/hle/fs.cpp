@@ -21,6 +21,7 @@
 #include "../mods/mod_loader.h"
 #include "../game_languages.h"
 #include "../rtl_text.h"
+#include "../play_time.h"
 
 namespace {
 
@@ -225,12 +226,20 @@ HLE(coreinit, FSOpenFile) {
 }
 
 HLE(coreinit, FSCloseFile) {
-    std::lock_guard<std::mutex> lk(g_fs_mutex);
-    auto it = g_files.find(arg(c, 2));
-    if (it != g_files.end()) {
-        fclose(it->second.f);
-        g_files.erase(it);
+    bool saved = false;  // the game finished writing a save slot
+    {
+        std::lock_guard<std::mutex> lk(g_fs_mutex);
+        auto it = g_files.find(arg(c, 2));
+        if (it != g_files.end()) {
+            static const std::string kSave = "/game_data.sav";
+            const std::string& g = it->second.path;
+            saved = it->second.mode.find_first_of("wa+") != std::string::npos && g.size() > kSave.size() &&
+                    g.compare(g.size() - kSave.size(), kSave.size(), kSave) == 0;
+            fclose(it->second.f);
+            g_files.erase(it);
+        }
     }
+    if (saved) play_time::note();  // the time played so far goes to disk with the save (play_time.h)
     ret(c, FS_OK);
 }
 

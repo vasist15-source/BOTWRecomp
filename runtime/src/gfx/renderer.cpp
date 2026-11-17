@@ -2,6 +2,7 @@
 #include "renderer.h"
 #include "../screenshot.h"
 #include "../audio_out.h"
+#include "../play_time.h"
 
 #include <atomic>
 #include <algorithm>
@@ -219,6 +220,7 @@ void init() {
 void run_main_loop() { g_backend->run_main_loop(); }
 
 void shutdown() {
+    play_time::note();  // Quit and Restart: the hosts leave with _Exit / execv, which run no atexit handlers
     if (g_shut.exchange(true) || !g_backend || !g_backend->shutdown) return;
     audio::finish_dump();  // hosts exit with _Exit, which bypasses atexit handlers
     screenshot::finish();  // the screenshots taken are written first (the render thread keeps going)

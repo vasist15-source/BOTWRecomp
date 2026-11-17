@@ -9,6 +9,7 @@
 #include "gamepad_nav.h"
 #include "pane_focus.h"
 #include "../game_pause.h"
+#include "../play_time.h"
 #include "perf_average.h"
 #ifdef __ANDROID__
 #include "android_telemetry.h"
@@ -1753,6 +1754,17 @@ void tab_about() {
     ImGui::Text("Native port  ·  %s host  ·  %s renderer", hostui::name(), render::api_name(render::active()));
     ImGui::PopStyleColor();
     ImGui::Spacing();
+    {  // time played (play_time.h): this port's own count plus what playtime.txt carries over
+        const play_time::Total t = play_time::total();
+        ImGui::Text("Time played: %s", play_time::text(t.played + t.earlier).c_str());
+        if (t.earlier > 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kSecondary);
+            ImGui::Text("%s in this port  ·  %s before it, in other versions of the game",
+                        play_time::text(t.played).c_str(), play_time::text(t.earlier).c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
+    }
 #ifdef __APPLE__
     note("Home menu (Resume, Settings, Quit): Home on a controller or H on the keyboard (the Home rows of Controls and "
          "Keyboard & Mouse change them). Settings directly: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in "
@@ -2529,6 +2541,8 @@ void home_window() {
             ImGui::SetItemDefaultFocus();
         }
         ImGui::Dummy(ImVec2(0, 2));
+        const play_time::Total pt = play_time::total();  // "84 h 46 min played", small, under the list
+        const std::string played = play_time::text(pt.played + pt.earlier) + " played";
         if (game) {  // the controls, right-aligned: (A) Select  (B) Back, as button glyphs
             ImDrawList* dl = ImGui::GetWindowDrawList();
             ImGui::PushFont(nullptr, kSmallSize + 1);
@@ -2536,6 +2550,7 @@ void home_window() {
             auto width = [&](const char* t) { return 18 + 6 + ImGui::CalcTextSize(t).x; };
             const float total = width("Select") + 18 + width(back_label);
             ImVec2 p(wp.x + ws.x - 22 - total, ImGui::GetCursorScreenPos().y + 2);
+            if (!quit) dl->AddText(ImVec2(wp.x + 22, p.y + 9 - ImGui::GetFontSize() * 0.5f), col32(kSecondary), played.c_str());
             auto glyph = [&](const char* letter, const char* text) {
                 const ImVec2 c(p.x + 9, p.y + 9);
                 dl->AddCircleFilled(c, 9, col32(with_alpha(kCream, 0.90f)), 20);
@@ -2552,6 +2567,7 @@ void home_window() {
         } else {
             ImGui::PushFont(nullptr, kSmallSize);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 0.40f));
+            if (!quit) ImGui::TextUnformatted(played.c_str());
             ImGui::TextUnformatted(quit ? "A chooses  ·  B or Esc goes back" : "A chooses  ·  B, Esc or Home resumes");
             ImGui::PopStyleColor();
             ImGui::PopFont();

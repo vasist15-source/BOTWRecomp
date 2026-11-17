@@ -44,6 +44,7 @@
 #include "crash_context.h"
 #include "game_release.h"
 #include "input.h"
+#include "play_time.h"
 #include "mods/manager.h"
 #include "mods/mod_loader.h"
 #include "mods/packages.h"
@@ -570,6 +571,7 @@ int main(int argc, char** argv) {
     }
     static LoadedModule mod = m;
     static uint32_t args = argv_arr;
+    play_time::start();
     std::thread([] {
         threads::run_main(mod, 1, args);
         LOG("[boot] game main thread returned");
