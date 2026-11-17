@@ -1134,6 +1134,12 @@ HLE(coreinit, __ghs_funlock_file) { mutex_unlock(0xC0FFEE10); }
 HLE(coreinit, __ghs_flock_ptr) { ret(c, mem::runtime_alloc(4)); }
 HLE(coreinit, __ghs_flock_destroy) {}
 
+// The game's play report recorder has no lock of its own (tools/probe_recomp.py REPORT_LOCKED): the
+// translated code takes this one around adding an entry and around sending them. A guest mutex without
+// a guest object, as the GHS locks above: a thread that waits for it gives its core up like any other.
+extern "C" void botw_report_lock() { mutex_lock(0xC0FFEE20); }
+extern "C" void botw_report_unlock() { mutex_unlock(0xC0FFEE20); }
+
 // OSEvent. Like Cafe OS, a signal wakes the threads waiting at that moment (a manual-reset event:
 // all of them; an auto-reset event: one, without becoming signaled); they return even if the event
 // is reset before they run (the game pulses events: signal, then reset at once).

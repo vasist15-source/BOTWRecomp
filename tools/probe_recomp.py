@@ -16,6 +16,27 @@ import botw_fps_patches
 game_builds.hook_files = lambda: []
 V208_SHA256 = "ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30"
 
+# The game's play report recorder (the object of its "ProductReportBackGround Thread") keeps a pool of
+# 1000 entries and a list of the used ones, with no lock: the actor creation threads of cores 0 and 2 add
+# entries (038DED98) while the report thread on core 1 sends and frees them (038DE8EC). Two adds at the
+# same moment take the same free entry, the free list then points into an entry's text, and a later add
+# gets no entry and writes through a null pointer (crash of 2026-11-17: signal 10 at guest address 44 in
+# 0308E7E8, both ActorCreate threads inside 038DED98). Each of the two functions runs under one lock of
+# the runtime (threads.cpp botw_report_lock): first instruction -> what the function does.
+REPORT_LOCKED = {0x038DED98: (0x9421FF88, "adds an entry"), 0x038DE8EC: (0x9421ED98, "sends the entries and frees them")}
+
+
+def lock_play_report(source, start):
+    """The function's code becomes f_X_report; f_X takes the play report lock around it."""
+    head = f"void f_{start:08X}(Cpu* __restrict c) {{"
+    if source.count(head) != 1:
+        raise ValueError(f"Missing play report function {start:08X}")
+    source = source.replace(head, f"static void f_{start:08X}_report(Cpu* __restrict c) {{")
+    return source + (f"\n/* play report: {REPORT_LOCKED[start][1]}; the game has no lock here (tools/probe_recomp.py) */\n"
+                     f"void f_{start:08X}(Cpu* __restrict c) {{\n"
+                     "    extern void botw_report_lock(void);\n    extern void botw_report_unlock(void);\n"
+                     f"    botw_report_lock();\n    f_{start:08X}_report(c);\n    botw_report_unlock();\n}}\n")
+
 class BotwRecompiler(recomp.Recompiler):
     """v208 frame-time fixes; the RPX on disk and its identity stay unchanged.
 
@@ -34,6 +55,9 @@ class BotwRecompiler(recomp.Recompiler):
         for address, instruction in expected.items():
             if self.p.word(address) != instruction:
                 raise ValueError(f"Unexpected v208 timing instruction at {address:08X}")
+        for address, (instruction, _) in REPORT_LOCKED.items():
+            if self.p.word(address) != instruction or self.func_of(address) != address:
+                raise ValueError(f"Unexpected v208 play report function at {address:08X}")
         self.fps_sites = {}
         for address, (instruction, _, _) in botw_fps_patches.SITES.items():
             if self.p.word(address) != instruction:
@@ -108,6 +132,8 @@ class BotwRecompiler(recomp.Recompiler):
                     raise ValueError('Missing menu countdown emission')
                 source = source.replace(old, new)
         source = self.code_mods.apply(source, start)
+        if start in REPORT_LOCKED:
+            source = lock_play_report(source, start)
         return source, count
 
     def run(self, outdir, per_file):

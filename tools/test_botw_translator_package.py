@@ -120,6 +120,24 @@ else:
         with self.assertRaises(ValueError):
             aspect.apply(source.replace('ED8B6024', 'ED8B6025'), [0x0386D020])
 
+    def test_play_report_functions_run_under_the_lock(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        self.addCleanup(sys.path.remove, str(ROOT / 'tools'))
+        probe = module('probe_recomp', ROOT / 'tools/probe_recomp.py')
+        self.assertEqual(set(probe.REPORT_LOCKED), {0x038DED98, 0x038DE8EC})  # add an entry; send and free them
+        source = '\n'.join(['void f_038DED98(Cpu* __restrict c) {', '    PPC_ENTER(0x038DED98u);',
+                            '    { c->r[3] = 0; return; } /* 038DF2D4: 4E800020 */',
+                            '    MUSTTAIL return f_038DF2D8(c);', '}', ''])
+        out = probe.lock_play_report(source, 0x038DED98)
+        # the game's code, unchanged, under another name; callers and the function table reach the wrapper
+        self.assertTrue(out.startswith('static void f_038DED98_report(Cpu* __restrict c) {\n    PPC_ENTER(0x038DED98u);'))
+        self.assertEqual(out.count('void f_038DED98(Cpu* __restrict c) {'), 1)
+        wrapper = out[out.index('void f_038DED98(Cpu* __restrict c) {'):]
+        calls = [wrapper.index(text) for text in ('botw_report_lock();', 'f_038DED98_report(c);', 'botw_report_unlock();')]
+        self.assertEqual(calls, sorted(calls))
+        with self.assertRaises(ValueError):
+            probe.lock_play_report(source.replace('f_038DED98', 'f_038DED9C'), 0x038DED98)
+
     def test_game_file_is_not_allowed_in_release(self):
         shutil.copyfile(self.rpx, self.root / 'U-King.rpx')
         with self.assertRaises(SystemExit):
