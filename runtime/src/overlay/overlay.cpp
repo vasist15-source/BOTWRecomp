@@ -3,6 +3,7 @@
 // resulting ImDrawData (gfx/overlay_metal.mm, gfx/vulkan/overlay.cpp); the hosts feed input and apply
 // changes on their main thread (hostui.h).
 #include "overlay.h"
+#include "../aspect.h"
 #include "../audio_out.h"
 #include "guest_hud.h"
 #include "gamepad_nav.h"
@@ -1029,6 +1030,20 @@ void tab_display() {
     help(!strcmp(hostui::name(), "AppKit") ? "The TV window (Cmd+F); remembered for the next start"
                                            : "The TV window (F11 or Alt+Enter); remembered for the next start");
 #endif
+    heading("Aspect ratio");
+    {
+        const int am = aspect::mode();
+        for (int i = aspect::kOriginal; i <= aspect::k32x9; i++) {
+            if (i) ImGui::SameLine();
+            if (radio(aspect::mode_name(i), am == i))
+                post_changed([i] { aspect::set_mode(i); hostui::set("aspectMode", std::to_string(i)); });
+        }
+        help("The shape of the picture. Wider than 16:9 shows more of the world to the sides (21:9 and 32:9 "
+             "ultrawide monitors); 16:10 shows more above and below. The HUD and menus keep their shape, centred. "
+             "Match window follows the TV window or the screen in full screen. Applies at once; Cemu's Graphics pack "
+             "is not needed for it.");
+        if (am == aspect::kCustom) note("Set for this run by WWHD_ASPECT.");
+    }
     heading("Menu");
     {
         ImGui::AlignTextToFramePadding();
@@ -2667,7 +2682,11 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         if (!dynres::min_from_env() && hostui::get("dynResMin", v)) dynres::set_min(strtof(v.c_str(), nullptr));
         mfx::load_saved();  // the saved MetalFX choices (WWHD_METALFX_* win)
         mods::cheats::load_saved();  // the saved cheat switches (WWHD_CHEATS wins)
-        // (no saved aspect ratio: the wider pictures need Wind Waker's camera hooks)
+        // the saved aspect ratio (WWHD_ASPECT wins)
+        if (!getenv("WWHD_ASPECT") && hostui::get("aspectMode", v)) {
+            const int m = atoi(v.c_str());
+            if (m >= aspect::kOriginal && m <= aspect::k32x9) aspect::set_mode(m);
+        }
         // the saved gyro settings (WWHD_GYRO overrides the source)
         hostui::post([] { load_gyro(); });
     }

@@ -300,12 +300,14 @@ HLE(gx2, GX2SetPixelUniformBlock) { uniform_block(mmSQ_PS_UNIFORM_BLOCK_START, a
 HLE(gx2, GX2SetGeometryUniformBlock) { uniform_block(mmSQ_GS_UNIFORM_BLOCK_START, arg(c, 0), arg(c, 2), arg(c, 1)); }
 
 static void uniform_regs(uint32 stageBase, uint32 offset, uint32 count, uint32 values) {
+    // a layout / text projection (aspect.cpp; the tag is for this upload only)
+    const bool projection = stageBase == 0x400 && aspect::take_projection_tag();
     if (offset & 0x8000) return;
     count &= ~3u;
     if (offset + count > 0x400) count = 0x400 - std::min<uint32>(offset, 0x400);
     uint32 tmp[0x400];  // on the stack: several cores record display lists at once
     for (uint32 i = 0; i < count; i++) tmp[i] = ld32(values + 4 * i);
-    if (stageBase == 0x400 && count == 16 && aspect::tagged_projection()) {  // a layout projection (aspect.cpp)
+    if (projection && count == 16) {
         uint32 w[17];
         w[0] = mmSQ_ALU_CONSTANT0_0 + stageBase + offset;
         memcpy(w + 1, tmp, 16 * 4);

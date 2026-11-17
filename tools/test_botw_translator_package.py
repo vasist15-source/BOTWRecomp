@@ -52,7 +52,7 @@ else:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_patch_module_invalidates_translation_cache(self):
-        for name in ('botw_fps_patches.py', 'botw_cheat_patches.py', 'botw_code_mods.py', 'cemu_patches.py'):
+        for name in ('botw_fps_patches.py', 'botw_cheat_patches.py', 'botw_aspect_patches.py', 'botw_code_mods.py', 'cemu_patches.py'):
             with self.subTest(name), mock.patch.object(setup, 'ROOT', str(self.root)):
                 before = setup.recomp_stamp(str(self.rpx))
                 patch = self.root / 'tools' / name
@@ -97,6 +97,28 @@ else:
                 self.assertEqual(out.count(f'/* {address:08X}: {word:08X} */'), 1)
             with self.assertRaises(ValueError):
                 cheats.apply(source.replace('7C180050', '7C180051'), [0x100], lambda a, w: '')
+
+    def test_aspect_sites_keep_the_original_instruction(self):
+        aspect = module('botw_aspect_patches', ROOT / 'tools/botw_aspect_patches.py')
+        source = '\n'.join(['void f_0386CF60(Cpu* __restrict c) {',
+                            '    { double v = ppc_to_single(c, c->f[11].ps0 / c->f[12].ps0); c->f[12].ps0 = v; c->f[12].ps1 = v; } /* 0386D020: ED8B6024 */',
+                            '    c->lr = 0x03C479FCu; imp_gx2_GX2SetVertexUniformReg(c); /* 03C479F8: 48700CE1 */',
+                            '    { uint32_t ea = c->r[5] + 0xFFFF94D8u; { double v = ldf32(ea); c->f[11].ps0 = v; c->f[11].ps1 = v; } } /* 035B0A38: C16594D8 */',
+                            '}'])
+        out = aspect.apply(source, [0x0386D020, 0x03C479F8, 0x035B0A38])
+        self.assertTrue(out.startswith('#include "botw_aspect.h"\n'))
+        lines = out.splitlines()
+        view = lines.index(next(l for l in lines if '/* 0386D020: ED8B6024 */' in l))
+        self.assertIn('botw_aspect_view(c->f[12].ps0)', lines[view + 1])          # after the division
+        call = lines.index(next(l for l in lines if '/* 03C479F8: 48700CE1 */' in l))
+        self.assertIn('botw_aspect_tag_projection();', lines[call - 1])           # before the upload
+        self.assertNotIn('ldf32(ea)', next(l for l in lines if '/* 035B0A38: C16594D8 */' in l))  # replaced
+        self.assertIn('botw_aspect_grass()', out)
+        for address, (word, _, _) in aspect.SITES.items():
+            if address in (0x0386D020, 0x03C479F8, 0x035B0A38):
+                self.assertEqual(out.count(f'/* {address:08X}: {word:08X} */'), 1)
+        with self.assertRaises(ValueError):
+            aspect.apply(source.replace('ED8B6024', 'ED8B6025'), [0x0386D020])
 
     def test_game_file_is_not_allowed_in_release(self):
         shutil.copyfile(self.rpx, self.root / 'U-King.rpx')

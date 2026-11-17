@@ -970,8 +970,8 @@ def build_env():
     return env
 
 
-TRANSLATOR_SCRIPTS = ("probe_recomp.py", "botw_fps_patches.py", "botw_cheat_patches.py", "botw_code_mods.py", "cemu_patches.py",
-                      "rpx.py")
+TRANSLATOR_SCRIPTS = ("probe_recomp.py", "botw_fps_patches.py", "botw_cheat_patches.py", "botw_aspect_patches.py",
+                      "botw_code_mods.py", "cemu_patches.py", "rpx.py")
 
 
 def recomp_stamp(rpx):

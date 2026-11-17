@@ -99,11 +99,13 @@ void latch_res_scale() {
 
 // ---------------------------------------------------------------- aspect ratio
 // The game renders a 16:9 screen (1280x720 guest pixels). At another aspect ratio (aspect.cpp) the
-// game's projections are widened (or made taller) and every screen-shaped render target is allocated
-// that much wider (taller) than its guest size: draws keep their guest viewports, which cover the
-// whole texture, so the picture comes out at the new shape without the game knowing. kx/ky: texture
-// pixels per guest pixel on top of the internal resolution, (A / (16/9), 1) for wider screens,
-// (1, (16/9) / A) for narrower ones. Latched at the frame boundary like the resolution.
+// game's projections are widened (or made taller) and every render target that follows the internal
+// resolution (the Graphics pack's sizes, as Cemu widens them at 21:9; not the GamePad's 854x480 and
+// 864x480, shown in their own window) is allocated that much wider (taller) than its guest size: draws
+// keep their guest viewports, which cover the whole texture, so the picture comes out at the new shape
+// without the game knowing. kx/ky: texture pixels per guest pixel on top of the internal resolution,
+// (A / (16/9), 1) for wider screens, (1, (16/9) / A) for narrower ones. Latched at the frame boundary
+// like the resolution.
 static std::atomic<float> g_aspect_requested{16.0f / 9.0f};
 static float g_aspect_kx = 1.0f, g_aspect_ky = 1.0f;  // render thread: factors for this frame
 void set_frame_aspect(float a) { g_aspect_requested.store(a, std::memory_order_relaxed); }
@@ -116,6 +118,7 @@ static void latch_aspect() {
 }
 static float g_aspect_kx_latched() { return g_aspect_kx; }
 static float g_aspect_ky_latched() { return g_aspect_ky; }
+static bool gamepad_sized(uint32_t w, uint32_t h) { return h == 480 && (w == 854 || w == 855 || w == 864); }
 // the game's screen-sized buffers and their reductions (1920x1080 ... 60x33); not the GamePad's
 // (854x480, shown in its own window), not shadow maps, mip chains or textures
 static bool screen_shaped(const Surface* s) {
@@ -268,13 +271,12 @@ static const Surface::TargetRules& target_rules(const Surface* s) {
     r.extent = !s->fmt.compressed && s->mips == 1 &&
                mods::cemu::texture_extent(s->width, s->height, s->format, s->slices, s->tileMode, width, height);
     if (r.extent) { r.kx = float(width) / s->width; r.ky = float(height) / s->height; }
-    r.screen = screen_shaped(s);
     // as target_scale_rules_old decides it
     static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
     r.kind = kRuleOne;
     if (r.extent || s->fmt.compressed) return r;
     if (s->isDepth && s->slices > 1) { r.kind = kRuleShadowArray; return r; }
-    if (all) { r.kind = kRuleRes; return r; }
+    if (all) { r.kind = kRuleRes; r.screen = screen_shaped(s); return r; }
     size_t nRules;
     const TargetRule* rules = target_rule_table(&nRules);
     for (size_t i = 0; i < nRules && r.kind == kRuleOne; i++) {
@@ -284,6 +286,7 @@ static const Surface::TargetRules& target_rules(const Surface* s) {
         for (uint16_t f : t.formats)
             if (f == s->format) { r.kind = t.shadow ? kRuleShadow : kRuleRes; break; }
     }
+    r.screen = r.kind == kRuleRes && !gamepad_sized(s->width, s->height);  // takes the aspect ratio's factors
     // the old path's answer for this surface, once: the same factor and the same follows
     bool fo = false, fn = r.kind == kRuleRes;
     const float vo = target_scale_rules_old(s, &fo);
@@ -316,11 +319,19 @@ static float target_scale_rules(const Surface* s, bool* follows) {
     default: return 1.0f;
     }
 }
+// a target of this size is the TV picture (16:9, made wider or taller): layout projections drawn to it are
+// narrowed (gx2_core.cpp OP_SET_PROJ_REGS). Not the off-screen targets of other shapes the game draws
+// layouts into and shows on panes (those keep the stretched contents the pane squeezes back).
 bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) {
     Surface s;
     s.width = w;
     s.height = h;
-    bool on = screen_shaped(&s) && (g_aspect_kx != 1.0f || g_aspect_ky != 1.0f);
+    bool rule = false;
+    size_t nRules;
+    const TargetRule* rules = target_rule_table(&nRules);
+    for (size_t i = 0; i < nRules && !rule; i++) rule = rules[i].w == w && rules[i].h == h && !rules[i].shadow;
+    static const bool all = getenv("WWHD_SCALE_ALL_TARGETS") != nullptr;
+    bool on = (rule || all) && screen_shaped(&s) && (g_aspect_kx != 1.0f || g_aspect_ky != 1.0f);
     kx = on ? g_aspect_kx : 1.0f;
     ky = on ? g_aspect_ky : 1.0f;
     return on;
@@ -330,15 +341,17 @@ static void target_aspect(const Surface* s, float& kx, float& ky) {
     if (rt_trim_on()) {
         const Surface::TargetRules& r = target_rules(s);
         if (r.extent) { kx = r.kx; ky = r.ky; return; }
-        kx = r.screen ? g_aspect_kx : 1.0f;
-        ky = r.screen ? g_aspect_ky : 1.0f;
+        kx = r.screen || s->aspectMatched ? g_aspect_kx : 1.0f;
+        ky = r.screen || s->aspectMatched ? g_aspect_ky : 1.0f;
         return;
     }
     uint32_t width,height;
     if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height)){
         kx=float(width)/s->width;ky=float(height)/s->height;return;
     }
-    bool on = screen_shaped(s);
+    bool follows = false;
+    target_scale_rules_old(s, &follows);
+    bool on = (follows && !gamepad_sized(s->width, s->height)) || s->aspectMatched;
     kx = on ? g_aspect_kx : 1.0f;
     ky = on ? g_aspect_ky : 1.0f;
 }
@@ -457,6 +470,7 @@ static Surface* rescale(Surface* s) {
 // target's factor from then on. Only when its guest size covers the colour target's.
 // Dynamic resolution: the factors compared are without it (scale / dyn), and a depth buffer matched to a
 // colour target that follows it follows it too (dynMatched), so the two keep the same size at every level.
+// The aspect ratio the same way: a depth buffer drawn with a colour target made wider (taller) is from then on.
 Surface* match_depth_scale(Surface* depth, const Surface* color) {
     if (!depth || !color || depth->width < color->width || depth->height < color->height) return depth;
     const float colorBase = color->scale / color->dyn;
@@ -464,9 +478,11 @@ Surface* match_depth_scale(Surface* depth, const Surface* color) {
     target_scale_rules(color, &follows);
     const bool raise = colorBase > depth->scale / depth->dyn && depth->minScale < colorBase;
     const bool join = (follows || color->dynMatched) && color->slices == 1 && !depth->dynMatched;
-    if (!raise && !join) return depth;
+    const bool widen = (color->ax > depth->ax || color->ay > depth->ay) && !depth->aspectMatched;
+    if (!raise && !join && !widen) return depth;
     if (raise) depth->minScale = colorBase;
     if (join) depth->dynMatched = true;
+    if (widen) depth->aspectMatched = true;
     static int logged = 0;
     if (logged++ < 20)
         LOG("[gfx] depth %08X %ux%u f%X scaled %gx to match colour %08X %ux%u f%X%s", depth->addr, depth->width, depth->height,
