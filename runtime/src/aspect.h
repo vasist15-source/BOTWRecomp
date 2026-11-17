@@ -3,20 +3,35 @@
 #include <cstdint>
 
 namespace aspect {
-enum Mode : int { kOriginal = 0, kWindow, k16x10, k21x9, k32x9, kCustom, kModes };
-int mode();
-void set_mode(int m);
-const char* mode_name(int m);
-float mode_value(int m);           // fixed aspect of a mode (0 for kWindow)
-void set_window_aspect(float a);   // shape of the TV window's drawable (render thread, every present)
-float requested();                 // what the setting asks for now
-// main thread, GX2SwapScanBuffers: latch the aspect for the next game frame, update the game's
-// data; returns the aspect the render thread should switch to at this swap
+// The choices of Settings > Display. value: the aspect; 0: the TV window's shape; < 0: saved_custom().
+struct Choice {
+    const char* id;     // as saved
+    const char* label;
+    float value;
+};
+int choices();
+const Choice& choice(int i);
+constexpr float kMin = 1.0f, kMax = 5.34f;  // 1:1 ... 48:9
+
+// The saved setting. It applies when the game starts: the HUD's panes are placed for the aspect when
+// their layouts are built (aspect_hud.cpp), so a run keeps the aspect it started with.
+int saved();                  // index of the choice
+void set_saved(int i);
+float saved_custom();
+void set_saved_custom(float a);
+int saved_hud();              // aspect::hud::Mode (aspect_hud.h): edges, centred, stretched
+void set_saved_hud(int mode);
+void load_saved();            // main thread, before the game runs (else on first use)
+bool restart_needed();        // the saved setting differs from what this run uses
+
+void set_window_aspect(float a);   // shape of the TV window's drawable (at launch; render thread, every present)
+// main thread, GX2SwapScanBuffers: the aspect the render thread uses from this swap on
 float on_swap();
-float game();                         // aspect the game draws with this frame
+float game();                         // this run's aspect (fixed at its first use)
+int hud_mode();                       // this run's HUD placement (aspect::hud::Mode)
 uint64_t game_frame();                // swaps so far
-// HUD: the game thread tags the upload of a layout / text projection (tools/botw_aspect_patches.py);
-// the render thread, which knows the target, narrows it for the TV picture (gx2_core.cpp)
+// Narrower than 16:9 with the HUD centred: the game thread tags the upload of a layout / text projection
+// (tools/botw_aspect_patches.py); the render thread narrows it for the TV picture (gx2_core.cpp)
 bool take_projection_tag();                        // gx2: is this vertex uniform upload one (clears the tag)
 void layout_root_target(uint32_t root, bool tv);   // render thread (OP_LAYOUT_ROOT; Wind Waker only)
 void set_content_clip(bool clip);                  // (OP_LAYOUT_CONTENT; Wind Waker only)

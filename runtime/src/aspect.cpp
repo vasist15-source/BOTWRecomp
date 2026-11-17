@@ -1,5 +1,6 @@
-// Aspect ratio of the TV picture: 16:9 (original), the window's shape, 16:10, 21:9 or 32:9
-// (Settings > Display; WWHD_ASPECT=21:9 / window / 2.4 for a run).
+// Aspect ratio of the TV picture: 16:9 (original), the window's shape, or one of the fixed shapes from
+// 5:4 to 48:9 (Settings > Display; WWHD_ASPECT=21:9 / window / 2.4 and WWHD_HUD=edges / centred /
+// stretched for a run).
 //
 // The game keeps drawing its 1280x720 guest screen. What changes:
 //  - Render targets (metal_surfaces.mm): the targets that follow the internal resolution (the BotW
@@ -10,22 +11,27 @@
 //    the same vertical field of view (Hor+: wider screens see more to the sides). Narrower screens keep
 //    the horizontal field of view and widen the vertical one (Vert+), so nothing of the 16:9 view is
 //    cut off. Grass culling reaches the new edges. Data the game reads for the TV's aspect (camera
-//    set-ups, a grass distance) is written here at the swap, as Cemu's Graphics pack patches it.
-//  - 2D: layout (nw::lyt) and text (nw::font) projections drawn to the TV picture are narrowed on the
-//    render thread (gx2_core.cpp OP_SET_PROJ_REGS): the HUD and menus keep their proportions, centred
-//    in the wider picture.
-// The aspect is latched once per frame on the main thread at GX2SwapScanBuffers; the render thread
-// switches its render-target factors at the matching swap (the value travels with the swap command),
-// so a change never lands in the middle of a frame. At 16:9 every site returns the game's own values.
+//    set-ups, a grass distance) is written here, as Cemu's Graphics pack patches it.
+//  - 2D, wider than 16:9 (aspect_hud.h, aspect_hud.cpp): Cemu's Graphics pack's HUD rules. The panes of
+//    the HUD and the menus get their proportions back when their layouts are built and sit at the
+//    screen's edges or around the centre; backgrounds and fades stay stretched over the picture.
+//  - 2D, narrower than 16:9: stretched to the taller picture as in Cemu (its pane rules would push menus
+//    off the sides), or with the HUD centred, layout (nw::lyt) and text (nw::font) projections drawn to
+//    the TV picture narrowed on the render thread (gx2_core.cpp OP_SET_PROJ_REGS): a 16:9 band.
+// The aspect and the HUD placement are fixed when the game first asks (latch): panes are changed as
+// their layouts are built, so a change of the setting applies at the next start (Restart now in the
+// settings). At 16:9 every site returns the game's own values.
 #include "aspect.h"
+#include "aspect_hud.h"
 #include "mods/cemu_pack.h"
+#include "overlay/hostui.h"
 
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <utility>
-#include <vector>
+#include <mutex>
+#include <string>
 
 #include "botw_aspect.h"
 #include "runtime.h"
@@ -34,34 +40,62 @@ namespace aspect {
 namespace {
 constexpr float kBase = 16.0f / 9.0f;
 
-int parse_env_mode(float& custom) {
-    const char* e = getenv("WWHD_ASPECT");
-    if (!e || !*e) return kOriginal;
-    if (!strcmp(e, "window") || !strcmp(e, "match")) return kWindow;
-    if (!strcmp(e, "16:9")) return kOriginal;
-    if (!strcmp(e, "16:10")) return k16x10;
-    if (!strcmp(e, "21:9")) return k21x9;
-    if (!strcmp(e, "32:9")) return k32x9;
-    float a = 0;
-    if (const char* c = strchr(e, ':')) a = (float)atof(e) / (float)atof(c + 1);
-    else a = (float)atof(e);
-    if (!(a > 0.5f && a < 8.0f)) return kOriginal;
-    custom = a;
-    return kCustom;
-}
-float g_custom = kBase;
-std::atomic<int> g_mode{parse_env_mode(g_custom)};
-std::atomic<float> g_window{kBase};
-// aspect of the frame being built: written by the main thread at the swap, read by the threads
-// that compute and record the frame
-std::atomic<float> g_game{kBase};
+const Choice kChoices[] = {
+    {"16:9", "16:9 (original)", kBase},
+    {"window", "Match window", 0},
+    {"4:3", "4:3", 4.0f / 3.0f},
+    {"5:4", "5:4", 5.0f / 4.0f},
+    {"3:2", "3:2", 3.0f / 2.0f},
+    {"16:10", "16:10", 16.0f / 10.0f},
+    {"21:9", "21:9 (2560x1080, 5120x2160)", 64.0f / 27.0f},
+    {"43:18", "21:9 (3440x1440)", 43.0f / 18.0f},
+    {"24:10", "24:10 (3840x1600)", 24.0f / 10.0f},
+    {"32:10", "32:10", 32.0f / 10.0f},
+    {"32:9", "32:9", 32.0f / 9.0f},
+    {"48:9", "48:9 (three screens)", 48.0f / 9.0f},
+    {"custom", "Custom", -1},
+};
+constexpr int kChoiceCount = sizeof kChoices / sizeof kChoices[0];
+const char* const kHudIds[hud::kModes] = {"edges", "centred", "stretched"};
 
-float clamp_aspect(float a) { return std::fmin(std::fmax(a, 1.0f), 4.0f); }
+float clamp_aspect(float a) { return std::fmin(std::fmax(a, kMin), kMax); }
 bool same(float a, float b) { return std::fabs(a - b) <= 1e-4f * std::fmax(1.0f, std::fabs(a)); }
 
+// WWHD_ASPECT=21:9 / 2.4 / window and WWHD_HUD=edges / centred / stretched: this run's, whatever is saved
+struct Env {
+    bool set = false, window = false;
+    float value = kBase;
+    int hud = -1;
+    Env() {
+        if (const char* e = getenv("WWHD_HUD"))
+            for (int i = 0; i < hud::kModes; i++)
+                if (!strcmp(e, kHudIds[i])) hud = i;
+        const char* e = getenv("WWHD_ASPECT");
+        if (!e || !*e) return;
+        set = true;
+        if (!strcmp(e, "window") || !strcmp(e, "match")) { window = true; return; }
+        float a = 0;
+        if (const char* c = strchr(e, ':')) a = (float)atof(e) / (float)atof(c + 1);
+        else a = (float)atof(e);
+        if (!strcmp(e, "21:9")) a = 64.0f / 27.0f;
+        if (a > 0.5f && a < 8.0f) value = a;
+        else set = false;
+    }
+};
+const Env g_env;
+
+// the saved setting (Settings > Display)
+std::atomic<int> g_saved{0}, g_saved_hud{hud::kEdges};
+std::atomic<float> g_saved_custom{kBase};
+std::atomic<float> g_window{kBase};
+// this run's, fixed at the first use (latch): read by the threads that compute and record frames
+std::atomic<float> g_game{kBase};
+std::atomic<int> g_hud{hud::kEdges}, g_active_choice{0};
+std::atomic<bool> g_latched{false};
+
 // ---- the game's read-only data that holds the TV's aspect (v208 addresses; Cemu's Graphics pack,
-// patch_AspectRatio.asm, writes the same). Written at the swap when the aspect changes; a value that is
-// neither the game's nor ours (another build, a code mod) is left alone.
+// patch_AspectRatio.asm, writes the same). Written once, when the run's aspect is fixed; a value that is
+// not the game's (another build, a code mod) is left alone.
 struct Datum { uint32_t addr, original; float (*value)(float a); };
 float tv_aspect(float a) { return a; }
 float grass_distance(float a) { return a > kBase ? 60.0f : 120.0f; }  // the pack: half for wider pictures
@@ -89,83 +123,120 @@ void write_data(float a) {
 }
 }  // namespace
 
-const char* mode_name(int m) {
-    static const char* n[kModes] = {"16:9 (original)", "Match window", "16:10", "21:9", "32:9", "custom"};
-    return m >= 0 && m < kModes ? n[m] : "?";
+int choices() { return kChoiceCount; }
+const Choice& choice(int i) { return kChoices[i >= 0 && i < kChoiceCount ? i : 0]; }
+
+void load_saved() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::string v;
+        if (hostui::get("aspect", v)) {
+            for (int i = 0; i < kChoiceCount; i++)
+                if (v == kChoices[i].id) g_saved = i;
+        } else if (hostui::get("aspectMode", v)) {  // as saved before there were more choices
+            static const char* const kOld[] = {"16:9", "window", "16:10", "21:9", "32:9"};
+            const int m = atoi(v.c_str());
+            for (int i = 0; m >= 0 && m < 5 && i < kChoiceCount; i++)
+                if (!strcmp(kOld[m], kChoices[i].id)) g_saved = i;
+        }
+        if (hostui::get("aspectCustom", v)) g_saved_custom = clamp_aspect(strtof(v.c_str(), nullptr));
+        if (hostui::get("aspectHud", v))
+            for (int i = 0; i < hud::kModes; i++)
+                if (v == kHudIds[i]) g_saved_hud = i;
+    });
 }
-float mode_value(int m) {
-    switch (m) {
-    case kOriginal: return kBase;
-    case k16x10: return 16.0f / 10.0f;
-    case k21x9: return 64.0f / 27.0f;  // 2560x1080 / 3440x1440-class monitors sold as 21:9
-    case k32x9: return 32.0f / 9.0f;
-    case kCustom: return g_custom;
-    default: return 0;
-    }
+int saved() { return g_saved; }
+void set_saved(int i) {
+    if (i < 0 || i >= kChoiceCount) return;
+    g_saved = i;
+    hostui::set("aspect", kChoices[i].id);
+    LOG("[aspect] saved: %s", kChoices[i].label);
 }
-int mode() { return g_mode.load(std::memory_order_relaxed); }
-void set_mode(int m) {
-    if (m < 0 || m >= kModes) return;
-    g_mode = m;
-    LOG("[aspect] %s", mode_name(m));
+float saved_custom() { return g_saved_custom; }
+void set_saved_custom(float a) {
+    g_saved_custom = clamp_aspect(a);
+    char text[32];
+    snprintf(text, sizeof text, "%.4f", g_saved_custom.load());
+    hostui::set("aspectCustom", text);
 }
+int saved_hud() { return g_saved_hud; }
+void set_saved_hud(int mode) {
+    if (mode < 0 || mode >= hud::kModes) return;
+    g_saved_hud = mode;
+    hostui::set("aspectHud", kHudIds[mode]);
+}
+
 void set_window_aspect(float a) {
     if (!(a > 0.1f && a < 20.0f)) return;
-    // window resizes are continuous; steps of 0.5% keep render targets from being remade every frame
+    // window resizes are continuous; steps of 0.5% keep Match window from asking for a restart at every pixel
     float q = std::round(a * 200.0f) / 200.0f;
     if (std::fabs(q - kBase) < 0.006f) q = kBase;  // a 16:9 window (rounded pixel sizes) is 16:9
     g_window.store(q, std::memory_order_relaxed);
 }
-float requested() {
-    if (float pack = mods::cemu::aspect_ratio()) return pack;
-    int m = mode();
-    return clamp_aspect(m == kWindow ? g_window.load(std::memory_order_relaxed) : mode_value(m));
+namespace {
+float value_of(int i) {
+    const float v = kChoices[i].value;
+    float a = v > 0 ? v : v < 0 ? g_saved_custom.load() : g_window.load(std::memory_order_relaxed);
+    a = clamp_aspect(a);
+    return same(a, kBase) ? kBase : a;
 }
-float game() { return g_game; }
+// The run's aspect and HUD placement, once: the first time the game asks (a layout being built, a
+// camera, the first swap). The windows exist by then, so Match window has the window's shape.
+void latch() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        load_saved();
+        float a;
+        int chosen = -1;
+        if (float pack = mods::cemu::aspect_ratio()) a = pack;
+        else if (g_env.set) a = g_env.window ? g_window.load() : g_env.value;
+        else a = value_of(chosen = g_saved);
+        a = clamp_aspect(a);
+        if (same(a, kBase)) a = kBase;
+        const int mode = g_env.hud >= 0 ? g_env.hud : g_saved_hud.load();
+        if (a != kBase) write_data(a);
+        g_hud = mode;
+        g_active_choice = chosen;
+        g_game = a;
+        g_latched = true;
+        LOG("[aspect] this run: %.4f (%s), HUD %s", a, chosen >= 0 ? kChoices[chosen].label : "set for the run", kHudIds[mode]);
+    });
+}
+}  // namespace
+bool restart_needed() {
+    if (!g_latched || g_env.set || mods::cemu::aspect_ratio()) return false;
+    // another shape than the run's: another choice, Custom's value changed, or the window's shape did (by
+    // more than a sliver of letterbox)
+    const int s = g_saved, was = g_active_choice;
+    const float now = value_of(s), run = g_game.load();
+    const bool window = kChoices[s].value == 0 || (was >= 0 && kChoices[was].value == 0);
+    if (window ? std::fabs(now - run) > 0.012f * run : now != run) return true;
+    return run != kBase && g_env.hud < 0 && g_saved_hud != g_hud;  // the HUD's placement matters off 16:9
+}
+float game() {
+    latch();
+    return g_game.load(std::memory_order_relaxed);
+}
+int hud_mode() {
+    latch();
+    return g_hud.load(std::memory_order_relaxed);
+}
 static uint64_t g_swaps = 0;
 uint64_t game_frame() { return g_swaps; }
-
 float on_swap() {
-    // test aid: WWHD_ASPECT_AT=frame:aspect,... switches the aspect at those swaps (aspect 0 = window)
-    static std::vector<std::pair<uint64_t, float>> at = [] {
-        std::vector<std::pair<uint64_t, float>> v;
-        if (const char* e = getenv("WWHD_ASPECT_AT"))
-            for (char* p = (char*)e; *p;) {
-                uint64_t f = strtoull(p, &p, 10);
-                if (*p++ != ':') break;
-                v.push_back({f, (float)strtod(p, &p)});
-                while (*p == ',') p++;
-            }
-        return v;
-    }();
     g_swaps++;
-    for (auto& [f, v] : at)
-        if (f == g_swaps) {
-            if (v == 0) set_mode(kWindow);
-            else if (same(v, kBase)) set_mode(kOriginal);
-            else { g_custom = v; set_mode(kCustom); }
-        }
-    float a = requested();
-    if (same(a, kBase)) a = kBase;
-    // the GPU work of the frame being submitted now was built with the camera of the previous
-    // frame: render targets follow one swap later
-    float render = g_game.load();
-    if (!same(a, render)) {
-        LOG("[aspect] game aspect %.4f from swap %llu", a, (unsigned long long)g_swaps);
-        write_data(a);
-    }
-    g_game = a;
-    return render;
+    return game();
 }
 
-// ---- HUD: the next vertex uniform upload of this thread is a layout / text projection
+// ---- narrower than 16:9, HUD centred: the next vertex uniform upload of this thread is a layout / text
+// projection, which the render thread narrows: the HUD and menus keep their shape in a 16:9 band
 static thread_local bool t_tag = false;
 bool take_projection_tag() {
     bool t = t_tag;
     t_tag = false;
     return t;
 }
-// Wind Waker's layout hooks reported layout roots and menu content; BotW's centred HUD needs neither
+// Wind Waker's layout hooks reported layout roots and menu content; BotW needs neither
 void layout_root_target(uint32_t, bool) {}
 static bool g_content_clip = false;  // render thread
 void set_content_clip(bool clip) { g_content_clip = clip; }
@@ -174,8 +245,8 @@ void ss_reset() {}
 }  // namespace aspect
 
 // ---- the sites of tools/botw_aspect_patches.py (game threads)
-using aspect::kBase;
 namespace {
+constexpr float kBase = 16.0f / 9.0f;
 // a viewport of 16:9 guest pixels (1280x720 and its scaled copies), not the GamePad's 854x480
 bool tv_shaped(double a) { return std::fabs(a - (double)kBase) < 5e-4; }
 }  // namespace
@@ -193,11 +264,16 @@ extern "C" double botw_aspect_fovy(double fovy, uint32_t viewport) {
     return 2.0 * std::atan(std::tan(fovy * 0.5) * (double)kBase / g);
 }
 
+extern "C" double botw_aspect_scaled(double a) {
+    const float g = aspect::game();
+    return g == kBase ? a : a * (double)g / (double)kBase;
+}
+
 extern "C" double botw_aspect_grass() {
     const float g = aspect::game();
     return g > kBase ? (double)kBase / g : 1.0;
 }
 
 extern "C" void botw_aspect_tag_projection() {
-    if (aspect::game() != kBase) aspect::t_tag = true;
+    if (aspect::game() < kBase && aspect::hud_mode() == aspect::hud::kCentred) aspect::t_tag = true;
 }

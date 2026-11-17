@@ -472,8 +472,21 @@ static void create_windows() {
         [NSApp activateIgnoringOtherApps:YES];
     }
     // full screen as last time (display_modes.cpp: never in test runs unless asked for, never with hidden windows)
-    if (display_start_fullscreen([g_settings[@"tvFullScreen"] boolValue], hidden_windows()))
+    const bool start_full = display_start_fullscreen([g_settings[@"tvFullScreen"] boolValue], hidden_windows());
+    if (start_full)
         dispatch_async(dispatch_get_main_queue(), ^{ if (!is_fullscreen(tv)) [tv toggleFullScreen:nil]; });
+    // Match window (aspect.cpp) fixes the run's aspect ratio when the game first draws, before any picture
+    // is presented: tell it the shape the TV picture will have. Full screen: the screen, below the notch.
+    {
+        NSSize shape = tv.contentView.bounds.size;
+        if (start_full) {
+            NSScreen* sc = tv.screen ?: NSScreen.mainScreen;
+            shape = sc.frame.size;
+            if (@available(macOS 12.0, *)) shape.height -= sc.safeAreaInsets.top;
+        }
+        if (shape.width >= 1 && shape.height >= 1) aspect::set_window_aspect(float(shape.width / shape.height));
+        aspect::load_saved();  // the saved setting, read on the main thread
+    }
     if (!test && g_drc_window && drc_window_wanted() && [g_settings[@"drcFullScreen"] boolValue] &&
         screen_named(g_settings[@"drcScreen"]) && screen_named(g_settings[@"drcScreen"]) != tv.screen)
         dispatch_async(dispatch_get_main_queue(), ^{ if (!is_fullscreen(g_drc_window)) [g_drc_window toggleFullScreen:nil]; });

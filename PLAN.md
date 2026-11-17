@@ -734,29 +734,53 @@ the kept installer copy have not been played yet. The release build is installed
 - 2026-11-17: the menu pause play-tested by the user on the /Applications build (ba92ab4's code): works. Rumble still
   unplayed (not in that build); the game menu style not reported on.
 
-### 2026-11-17: aspect ratio in Settings > Display: 16:10, 21:9, 32:9, Match window (not yet play-tested)
+### 2026-11-17: aspect ratio in Settings > Display: 5:4 to 48:9, Match window, Cemu's HUD rules (HUD not yet play-tested)
 - A player on an ultrawide asked for 21:9; Cemu's Graphics pack copied into Mods was refused (its TextureRedefine
   sizes; the refusal now says the settings are built in). The inherited `aspect.cpp` hooked Wind Waker's camera and
-  nw::lyt addresses, none of which exist in BotW, so the setting was hidden. Now, for BotW (saved as `aspectMode`;
-  `WWHD_ASPECT=21:9`/`window`/`2.4` for a run, `WWHD_ASPECT_AT=frame:aspect` switches during a run):
+  nw::lyt addresses, none of which exist in BotW, so the setting was hidden. Now, for BotW:
+  - Choices (saved as `aspect`, the older `aspectMode` is still read): 16:9, Match window, 4:3, 5:4, 3:2, 16:10,
+    21:9 as 64:27 (2560x1080) and as 43:18 (3440x1440), 24:10, 32:10, 32:9, 48:9, Custom (a slider, 1.00 to 5.34;
+    `aspectCustom`). `WWHD_ASPECT=21:9`/`window`/`2.4` and `WWHD_HUD=edges`/`centred`/`stretched` for a run.
+  - The run's aspect and HUD placement are fixed the first time the game asks (`latch`): the HUD's panes are changed
+    as their layouts are built, so a changed setting applies at the next start (the Display page says so, with
+    Restart now). Match window is the TV window's shape at launch; in full screen the screen below the notch
+    (`display.mm` tells `aspect.cpp` before the first frame, and reads the saved setting on the main thread).
   - Render targets (`metal_surfaces.mm`): every target the Graphics pack's rules scale with the internal resolution
     (`kRuleRes`), not the GamePad's 854x480 / 864x480, is allocated A/(16/9) wider (or taller), as Cemu widens them
     at 21:9. Depth buffers drawn with a widened colour target follow it (`Surface::aspectMatched`).
   - 3D (`tools/botw_aspect_patches.py`, translation-time sites like the FPS ones; answered by `aspect.cpp`): the
     camera projection's aspect from its viewport (0386D020) becomes A for 16:9 viewports (Hor+); for pictures
-    narrower than 16:9 its fovy (0386CFE8, radians, into setFovy) widens instead (Vert+); grass culling factor
-    (035B0A38) (16/9)/A. Read-only data Cemu's pack patches (101BF8E8, 1030A57C, 1036DD4C: 16:9; 1047BFB8: 120 ->
-    60) is written at the swap, and put back at 16:9. The inventory's 3D site (02E2C578) is left alone: its target is
-    shown on a centred pane, which squeezes the widened texture back.
-  - HUD: nw::lyt's LoadProjectionMtx (03C479D4, upload at 03C479F8) and nw::font's text draw (0421A3A8, upload at
-    0421A784) tag their projection upload; the render thread narrows it (OP_SET_PROJ_REGS) when the bound target is
-    the 16:9 TV picture: HUD, menus and text keep their shape, centred. Not Cemu's 2,900 lines of per-pane edge rules.
-  - At 16:9 every site returns the game's values and nothing is tagged.
-- Not checked in game (the user play-tests): whether full-screen layout fills (fades, menu backgrounds) leave the
-  sides uncovered, movies and the loading screen, off-screen 1280x720 layout captures (would be narrowed twice), the
-  map / inventory, and that 16:9 is unchanged. Builds clean (worktree gen re-translated: only the 4 files with
-  sites differ from main's); ctest 125 of 135, the 10 known failures; the translator package test covers the sites.
-  In /Applications for the user's play-test (previous app in the worktree's build/app-prev).
+    narrower than 16:9 its fovy (0386CFE8, radians, into setFovy) widens instead (Vert+); the inventory's 3D Link
+    (02E2C578) has its aspect scaled by A/(16/9); grass culling factor (035B0A38) (16/9)/A. Read-only data Cemu's
+    pack patches (101BF8E8, 1030A57C, 1036DD4C: 16:9; 1047BFB8: 120 -> 60) is written once at the latch.
+  - HUD and menus, wider than 16:9 (`aspect_hud.h`, `aspect_hud.cpp`): Cemu's way. The first build narrowed the
+    whole layout projection (everything in a centred 16:9 block); the user's play-test: works, but the HUD is not
+    scaled properly, do it as Cemu does. Cemu's Graphics pack changes panes one by one as a layout is built
+    (patch_GUIAspectRatio.asm, 2,900 lines of PowerPC: by screen, by the last parts pane, by pane name, to some forty
+    routines that scale a pane's x by (16/9)/A and move it to the edge or keep it around the centre; backgrounds and
+    fades stay stretched and cover the picture). `tools/botw_hud_rules.py` turns the pack's decision code into a
+    table (`aspect_hud_rules.inc`, 598 steps, 17 routines used; the pack is read from the developer's Cemu folder,
+    never shipped), `aspect_hud.h` walks it and has the routines, `aspect_hud.cpp` applies them at the pack's five
+    sites: pane built (03C496B8), screen created (03A3EDC4, name in the caller's r24 as the pack takes it),
+    animated x of the sensor gauges (03C46298), map open/close (02F60204), pane-based projection of the weather
+    pane (03C56CD0). HUD setting: At the screen's edges (Cemu's Edge HUD, default), Centred (Centered HUD),
+    Stretched (no fixes). Differences from the pack: its "Alt" padding uses the render width in pixels, here it is
+    the same as the normal padding (the 720-line size); the map routine tests the mode it meant to (the pack
+    compares r4); a layout's width is widened once per loaded layout, not again on every rebuild.
+  - Narrower than 16:9: the pack's rules would push menus off the sides (its Square HUD mode is "experimental"), so
+    the HUD is stretched to the taller picture as in Cemu, or with Centred keeps its shape in a 16:9 band: nw::lyt's
+    LoadProjectionMtx (03C479D4, upload at 03C479F8) and nw::font's text draw (0421A3A8, upload at 0421A784) tag
+    their projection upload and the render thread narrows it (OP_SET_PROJ_REGS) for the 16:9 TV picture.
+  - At 16:9 every site returns the game's values and nothing is changed or tagged.
+- Play-test 1 (user, MacBook Air, 16:10 screen; first build): 16:10, 21:9 and Match window (1.595) switch and draw;
+  HUD "not scaled properly" (that build: centred block).
+- Not checked in game yet: the pane rules (HUD at the edges at 21:9, menus, map, dialogs' choice cursor, which the
+  "Alt" padding moves), the inventory's Link, movies (Cemu pillarboxes them with a replaced pixel shader,
+  7cd338ce4c6ea935; here they are stretched: follow-up), and that 16:9 is unchanged. `WWHD_ASPECT_LOG=1` logs every
+  screen and every pane changed (`[hud] screen / parts / pane: x, scale`).
+- Builds clean on the worktree's own gen (re-translated: the 8 files with sites differ from main's); ctest 126 of
+  136, the 10 known failures, with the new `aspect_hud` test (the table's decisions and the routines' arithmetic at
+  21:9) and the translator package test's site check. In /Applications for the user's play-test.
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.

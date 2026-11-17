@@ -1032,17 +1032,44 @@ void tab_display() {
 #endif
     heading("Aspect ratio");
     {
-        const int am = aspect::mode();
-        for (int i = aspect::kOriginal; i <= aspect::k32x9; i++) {
-            if (i) ImGui::SameLine();
-            if (radio(aspect::mode_name(i), am == i))
-                post_changed([i] { aspect::set_mode(i); hostui::set("aspectMode", std::to_string(i)); });
+        const int cur = aspect::saved();
+        ImGui::SetNextItemWidth(320);
+        if (ImGui::BeginCombo("Picture shape", aspect::choice(cur).label)) {
+            for (int i = 0; i < aspect::choices(); i++)
+                if (ImGui::Selectable(aspect::choice(i).label, i == cur)) hostui::post([i] { aspect::set_saved(i); });
+            ImGui::EndCombo();
         }
-        help("The shape of the picture. Wider than 16:9 shows more of the world to the sides (21:9 and 32:9 "
-             "ultrawide monitors); 16:10 shows more above and below. The HUD and menus keep their shape, centred. "
-             "Match window follows the TV window or the screen in full screen. Applies at once; Cemu's Graphics pack "
-             "is not needed for it.");
-        if (am == aspect::kCustom) note("Set for this run by WWHD_ASPECT.");
+        if (aspect::choice(cur).value < 0) {
+            static float drag = 0;  // while the slider is held: saved (and written to disk) on release
+            static bool dragging = false;
+            float a = dragging ? drag : aspect::saved_custom();
+            ImGui::SetNextItemWidth(320);
+            ImGui::SliderFloat("Width : height", &a, aspect::kMin, aspect::kMax, "%.2f : 1", ImGuiSliderFlags_AlwaysClamp);
+            dragging = ImGui::IsItemActive();
+            drag = a;
+            if (ImGui::IsItemDeactivatedAfterEdit()) hostui::post([a] { aspect::set_saved_custom(a); });
+        }
+        help("Wider than 16:9 shows more of the world to the sides (21:9, 32:9 and three-screen set-ups); narrower "
+             "(16:10, 3:2, 4:3, 5:4) shows more above and below. Match window takes the shape of the TV window "
+             "when the game starts, or of the screen when it starts in full screen. Cemu's Graphics pack is not "
+             "needed for it.");
+        static const char* const kHud[] = {"At the screen's edges", "Centred", "Stretched"};
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("HUD and menus");
+        const int hm = aspect::saved_hud();
+        for (int i = 0; i < 3; i++) {
+            ImGui::SameLine();
+            if (radio(kHud[i], hm == i)) hostui::post([i] { aspect::set_saved_hud(i); });
+        }
+        help("On pictures wider than 16:9: hearts, map, prompts and menus keep their shape, at the edges of the "
+             "screen or around its centre as in Cemu's Edge HUD and Centered HUD, or everything is stretched with "
+             "the picture. On narrower pictures the HUD is stretched to the screen; Centred keeps its shape in a "
+             "16:9 band instead.");
+        if (aspect::restart_needed()) {
+            warn("Restart the game to apply the aspect ratio.");
+            // asks first while a game is in progress, as Quit does (gfx/quit_prompt.mm)
+            if (hostui::can_restart() && primary_button("Restart now##aspect")) hostui::post([] { hostui::restart_game(); });
+        }
     }
     heading("Menu");
     {
@@ -2682,11 +2709,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         if (!dynres::min_from_env() && hostui::get("dynResMin", v)) dynres::set_min(strtof(v.c_str(), nullptr));
         mfx::load_saved();  // the saved MetalFX choices (WWHD_METALFX_* win)
         mods::cheats::load_saved();  // the saved cheat switches (WWHD_CHEATS wins)
-        // the saved aspect ratio (WWHD_ASPECT wins)
-        if (!getenv("WWHD_ASPECT") && hostui::get("aspectMode", v)) {
-            const int m = atoi(v.c_str());
-            if (m >= aspect::kOriginal && m <= aspect::k32x9) aspect::set_mode(m);
-        }
+        aspect::load_saved();  // the saved aspect ratio (read at launch on the Mac; applies at the next start)
         // the saved gyro settings (WWHD_GYRO overrides the source)
         hostui::post([] { load_gyro(); });
     }
