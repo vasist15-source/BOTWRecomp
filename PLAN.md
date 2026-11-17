@@ -774,9 +774,12 @@ the kept installer copy have not been played yet. The release build is installed
   - At 16:9 every site returns the game's values and nothing is changed or tagged.
 - Play-test 1 (user, MacBook Air, 16:10 screen; first build): 16:10, 21:9 and Match window (1.595) switch and draw;
   HUD "not scaled properly" (that build: centred block).
-- Not checked in game yet: the pane rules (HUD at the edges at 21:9, menus, map, dialogs' choice cursor, which the
-  "Alt" padding moves), the inventory's Link, movies (Cemu pillarboxes them with a replaced pixel shader,
-  7cd338ce4c6ea935; here they are stretched: follow-up), and that 16:9 is unchanged. `WWHD_ASPECT_LOG=1` logs every
+- Movies: play-test 3 (user, a Champions' Ballad memory at 21:9) showed them stretched a third too wide. The
+  bundled Graphics pack already has Cemu's movie shader (7cd338ce4c6ea935, replaced in every run); it pillarboxes
+  when `$ultrawideHUDMode` is non-zero, with `$width` the wide width. `graphic_packs.cpp` now gives the pack those
+  values when the run is wider than 16:9 (no other bundled shader reads `$width`/`$height`). Not play-tested.
+- Play-test 2 (d0f47bc, the plain list): works. Not checked in game yet: dialogs' choice cursor (the "Alt"
+  padding), the inventory's Link, and that 16:9 is unchanged. `WWHD_ASPECT_LOG=1` logs every
   screen and every pane changed (`[hud] screen / parts / pane: x, scale`).
 - Builds clean on the worktree's own gen (re-translated: the 8 files with sites differ from main's); ctest 126 of
   136, the 10 known failures, with the new `aspect_hud` test (the table's decisions and the routines' arithmetic at
