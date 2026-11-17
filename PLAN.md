@@ -795,6 +795,43 @@ the kept installer copy have not been played yet. The release build is installed
   370 s, the binary has the aspect ratio setting. The aspect HUD's dialog cursor, inventory Link and 16:9 unchanged are
   still unchecked in game.
 
+### 2026-11-17: two controller reports: Settings with the controller, and a crash taken for a quit (not yet play-tested)
+Reported: "the game closed when i pressed select button on controller. and i cant navigate settings with controller.
+when i press a or right dpad to get into sub menu it doesn't work".
+- **Settings navigation (7479013).** The sidebar and the page were child windows flattened into one Dear ImGui
+  navigation scope. ImGui only moves sideways to an item that overlaps the focused one vertically, and counts an
+  item off to the side as above or below: Right on a sidebar row stayed there unless a widget sat at the row's
+  height, A chose the page and left the focus on the row, and Up / Down inside a page went to the nearest sidebar
+  row. Each pane is now a scope of its own and `overlay/pane_focus.h` hands the focus over: A or Right on a row
+  opens the page with the focus on its first setting; B, or Left with nothing left of the focused setting, goes
+  back to the row; B on the sidebar goes back / closes as before, Esc as before from anywhere; B while a slider is
+  being edited only ends the edit (it also closed the menu). ctest `overlay_pane_focus` drives a window laid out
+  like the settings window through `gamepad_nav.h` (22 presses); `overlay_pane_focus_before` is the old layout.
+- **"Closed on Select": a crash in the game's play report recorder, not a quit.** The run ended 18:40:08 with
+  `captures/crash-20261117-184008.log`: signal 10 at guest address 44 in 0308E7E8 (a list push), on both
+  "ActorCreate" threads (cores 0 and 2) at once, inside 038DED98 with `this` = the object of the game's
+  "ProductReportBackGround Thread". That object keeps a pool of 1000 entries (free list +0xC0, used list +0xB4) that
+  038DED98 fills and 038DE8EC (report thread, core 1) sends through nn::boss and frees, and the game takes no lock
+  anywhere on those paths. Two adds at once pop the same free entry, the free list then points into an entry's
+  text (r28 = 656D6768), and the next add gets no entry and writes through null + 0x40. It is the game's own race
+  (three real cores on a Wii U too) and rare: first crash of this kind in six weeks of crash logs. Select / Minus
+  is the controller's Options button: a press is the game's map, held 0.5 s it opens Settings; nothing quits on
+  it, and whether the map set the race off or only coincided is not known. Not the freeze watchdog (it only logs;
+  no `[freeze]` line). The 16:05 run's `[quit] answer: Quit` was an ordinary Cmd+Q: the quit prompt is an NSAlert
+  no controller code answers.
+  Fix (e57cf34): `tools/probe_recomp.py` (REPORT_LOCKED) emits the two functions as `f_X_report` behind a wrapper that takes
+  `botw_report_lock` (threads.cpp: a guest mutex at the fake address C0FFEE20, so a waiting thread gives its core
+  up). The recorder only runs for the first 1000 entries of a session here (nn::boss Task::Initialize fails, the
+  entries are never freed, later adds return at once), so the lock costs two uncontended mutex calls per add for
+  those and per call after. Only code_213.c changes; installs re-translate (the stamp covers probe_recomp.py).
+- Built (`build/rt/wwhd`, with the regenerated code_213.c); ctest 128 of 138, the 10 known failures, with the two
+  new `overlay_pane_focus` tests; the translator package test's new wrapper check passes. The game was not run:
+  no frame time or CPU % measured, and the app in /Applications is still the build before these two commits.
+  To play-test: Settings with the D-pad and A (into a page, around it, B and Left back out, L / R), and Select
+  in game (the map) over a few sessions; a crash log in `captures/` naming 0308E7E8 again would mean the lock
+  missed a path.
+- Seen on the way, not touched: `pad_delivery_test` does not link (`hle_traced` undefined), one of the 10.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
