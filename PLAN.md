@@ -777,7 +777,10 @@ the kept installer copy have not been played yet. The release build is installed
 - Movies: play-test 3 (user, a Champions' Ballad memory at 21:9) showed them stretched a third too wide. The
   bundled Graphics pack already has Cemu's movie shader (7cd338ce4c6ea935, replaced in every run); it pillarboxes
   when `$ultrawideHUDMode` is non-zero, with `$width` the wide width. `graphic_packs.cpp` now gives the pack those
-  values when the run is wider than 16:9 (no other bundled shader reads `$width`/`$height`). Not play-tested.
+  values when the run is wider than 16:9 (no other bundled shader reads `$width`/`$height`). Play-tested (e065e93,
+  21:9): works.
+- The P key started a debug frame capture (a 23.5 s stop and 1.1 GB the user took for a hang when opening the map,
+  in 0.3.0 too): capture is on F12 only now (6f53067).
 - Play-test 2 (d0f47bc, the plain list): works. Not checked in game yet: dialogs' choice cursor (the "Alt"
   padding), the inventory's Link, and that 16:9 is unchanged. `WWHD_ASPECT_LOG=1` logs every
   screen and every pane changed (`[hud] screen / parts / pane: x, scale`).
