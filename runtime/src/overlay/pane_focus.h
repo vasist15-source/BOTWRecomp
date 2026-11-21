@@ -80,6 +80,8 @@ public:
             left_frame_ = g.FrameCount;
         }
     }
+    // the focused setting used this frame's Left itself (a slider stepped down): the page keeps the focus
+    void keep_left() { left_frame_ = -1; }
     // B: true when it was used here (the page gave the focus back to the sidebar, or B ended the edit of
     // a slider or text field), false when the window should close
     bool back() {

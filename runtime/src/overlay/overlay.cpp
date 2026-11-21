@@ -51,6 +51,7 @@ namespace gfxvk { bool buffer_cache_enabled(); }  // gfx/vulkan/buffer_cache.h
 #include "../input_map.h"
 #include "../mods/mods.h"
 #include "../mods/cheats.h"
+#include "../mods/distance.h"
 #include "../mods/manager.h"
 #include "../mods/mod_loader.h"
 #include "../mods/code_patches.h"
@@ -801,6 +802,44 @@ bool check(const char* label, bool value, bool* out, bool enabled = true) {
     return changed;
 }
 
+// Sliders a controller (or the arrow keys) moves as soon as one has the focus: Left/Right step it, as
+// in game menus. Dear ImGui's own way (A, then Left/Right) still works; Left no longer leaves the page
+// from a slider, and Right no longer jumps to a setting beside it. 0: unchanged, 1: dragged (save when
+// ImGui::IsItemDeactivatedAfterEdit), 2: stepped (a finished change: save it)
+int slider_step_dir() {
+    if (!ImGui::IsItemFocused() || ImGui::IsItemActive() || (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled)) return 0;
+    const bool pad = U.gamepad_navigation.controller_active();
+    const bool left = ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true) ||
+                      (pad && (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, true) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft, true)));
+    const bool right = ImGui::IsKeyPressed(ImGuiKey_RightArrow, true) ||
+                       (pad && (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, true) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight, true)));
+    if (left == right) return 0;
+    ImGui::NavMoveRequestCancel();  // the press moves the value, not the focus
+    if (left) U.pane.keep_left();
+    return left ? -1 : 1;
+}
+// step: how much one press moves it (0: a twentieth of the range; logarithmic sliders by a factor)
+int slider_float(const char* label, float* v, float lo, float hi, const char* fmt = "%.3f", ImGuiSliderFlags flags = 0,
+                 float step = 0) {
+    if (ImGui::SliderFloat(label, v, lo, hi, fmt, flags)) return 1;
+    const int dir = slider_step_dir();
+    if (!dir) return 0;
+    const float before = *v;
+    if (step > 0) *v += dir * step;
+    else if ((flags & ImGuiSliderFlags_Logarithmic) && lo > 0) *v *= std::pow(hi / lo, dir / 20.0f);
+    else *v += dir * (hi - lo) / 20.0f;
+    *v = std::clamp(*v, lo, hi);
+    return *v != before ? 2 : 0;
+}
+int slider_int(const char* label, int* v, int lo, int hi, const char* fmt = "%d", ImGuiSliderFlags flags = 0) {
+    if (ImGui::SliderInt(label, v, lo, hi, fmt, flags)) return 1;
+    const int dir = slider_step_dir();
+    if (!dir) return 0;
+    const int before = *v;
+    *v = std::clamp(*v + dir, lo, hi);
+    return *v != before ? 2 : 0;
+}
+
 // ---------------------------------------------------------------- tabs
 // the Screenshot binding (Controls tab) and the folder (Display page)
 void screenshots_section() {
@@ -964,6 +1003,60 @@ void tab_graphics() {
         if (mfx::from_env()) note("Set by WWHD_METALFX_UPSCALE / WWHD_METALFX_FRAMEGEN.");
         const std::string st = mfx::status();
         if (!st.empty()) note("%s", st.c_str());
+    }
+
+    // Cemu's Draw Distance mod as live sliders (mods/distance.h): each applies at once
+    heading("View distance");
+    {
+        namespace dist = mods::distance;
+        const bool en = !dist::disabled();
+        ImGui::BeginDisabled(!en);
+        float a = dist::actors();
+        ImGui::SetNextItemWidth(320);
+        if (const int r = slider_float("People, enemies and animals", &a, dist::kActorMin, dist::kActorMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp, 0.05f))
+            dist::set_actors(std::round(a * 20.0f) / 20.0f, r == 2);
+        if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_actors(dist::actors(), true);
+        help("How far away characters, enemies, animals and other things that move are drawn and run.\n"
+             "1.00x is the game's own: it also pulls them in when the scene is busy. Any other value is\n"
+             "used all the time. Higher costs processor time and memory (the game's memory is that of a\n"
+             "Wii U, so 1.5x is the most offered).");
+        float o = dist::objects();
+        ImGui::SetNextItemWidth(320);
+        if (const int r = slider_float("Buildings, rocks and bushes", &o, dist::kObjectMin, dist::kObjectMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp, 0.05f))
+            dist::set_objects(std::round(o * 20.0f) / 20.0f, r == 2);
+        if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_objects(dist::objects(), true);
+        help("How far away buildings, rocks, bushes and other placed objects are drawn. 1.00x is the\n"
+             "game's own. Below 0.75x some events stop starting, above 1.25x the game can run out of memory.");
+        int t = dist::trees();
+        ImGui::SetNextItemWidth(320);
+        if (const int r = slider_int("Trees", &t, 0, dist::kTreeLevels - 1, dist::kTreeNames[t], ImGuiSliderFlags_AlwaysClamp))
+            dist::set_trees(t, r == 2);
+        if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_trees(dist::trees(), true);
+        help("How far away trees keep their full 3D model before they turn into flat pictures (billboards).\n"
+             "Higher draws more full trees: more graphics chip time.");
+        int gr = dist::grass();
+        ImGui::SetNextItemWidth(320);
+        if (const int r = slider_int("Grass", &gr, 0, dist::kGrassLevels - 1, dist::kGrassNames[gr], ImGuiSliderFlags_AlwaysClamp))
+            dist::set_grass(gr, r == 2);
+        if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_grass(dist::grass(), true);
+        help("How many grass blades are drawn. Higher is denser grass reaching farther, and costs graphics chip\n"
+             "time; Ultra and Extreme are experimental in the original mod.");
+        if (!render::vulkan()) {
+            int d = dist::texture_detail();
+            static const char* const kDetail[] = {"Sharpest (-3)", "Sharper (-2)", "Sharp (-1)", "Game's own",
+                                                   "Softer (+1)", "Softest (+2)"};
+            ImGui::SetNextItemWidth(320);
+            if (const int r = slider_int("Texture detail in the distance", &d, dist::kTextureMin, dist::kTextureMax,
+                                 kDetail[d - dist::kTextureMin], ImGuiSliderFlags_AlwaysClamp))
+                dist::set_texture_detail(d, r == 2);
+            if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_texture_detail(dist::texture_detail(), true);
+            help("Picks sharper (or softer) texture levels for surfaces farther away. Sharper can shimmer on\n"
+                 "fine patterns while moving, and uses a little more graphics chip time.");
+        }
+        ImGui::EndDisabled();
+        if (ImGui::Button("Game's own view distances")) dist::reset();
+        help("All of the above back to the game's own.");
+        if (!en) note("WWHD_DISTANCE=off: the game's own view distances this run.");
     }
 
     heading("Effects");
@@ -1289,11 +1382,11 @@ void gyro_window(bool& open) {
     }
     const float lo = motion::Tuning::kMinSensitivity, hi = motion::Tuning::kMaxSensitivity;
     ImGui::SetNextItemWidth(220);
-    ImGui::SliderFloat("Sensitivity left/right", &g.tuning.sensitivity_x, lo, hi, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    slider_float("Sensitivity left/right", &g.tuning.sensitivity_x, lo, hi, "%.2fx", ImGuiSliderFlags_Logarithmic);
     ImGui::SameLine(0, 16);
     if (check("Invert##x", g.tuning.invert_x, &v)) g.tuning.invert_x = v;
     ImGui::SetNextItemWidth(220);
-    ImGui::SliderFloat("Sensitivity up/down", &g.tuning.sensitivity_y, lo, hi, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    slider_float("Sensitivity up/down", &g.tuning.sensitivity_y, lo, hi, "%.2fx", ImGuiSliderFlags_Logarithmic);
     ImGui::SameLine(0, 16);
     if (check("Invert##y", g.tuning.invert_y, &v)) g.tuning.invert_y = v;
     if (ImGui::Button("Default sensitivity"))
@@ -1302,7 +1395,7 @@ void gyro_window(bool& open) {
          "affects roll aiming; up/down sensitivity affects pitch. Native orientation is not scaled.");
     if (g.source == motion::kMouse) {
         ImGui::SetNextItemWidth(220);
-        ImGui::SliderFloat("Mouse: degrees per point", &g.mouse_degrees, 0.01f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+        slider_float("Mouse: degrees per point", &g.mouse_degrees, 0.01f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
         help("How far one point of mouse movement turns the GamePad (before the sensitivity above). With Steam "
              "Input's gyro to mouse, tune this and Steam's own sensitivity together.");
         note("While the game aims, the pointer is captured and the mouse turns the GamePad (the mouse camera mod "
@@ -1321,7 +1414,7 @@ void gyro_window(bool& open) {
             g.dsu_port = std::clamp(port, 1, 65535);
         ImGui::SetNextItemWidth(120);
         int slot = g.dsu_slot + 1;
-        if (ImGui::SliderInt("Controller slot", &slot, 1, 4)) g.dsu_slot = slot - 1;
+        if (slider_int("Controller slot", &slot, 1, 4)) g.dsu_slot = slot - 1;
         note("A Cemuhook (DSU) server: DS4Windows, BetterJoy, SteamDeckGyroDSU or a phone app; default 127.0.0.1, port 26760.");
     }
     // recalibrate: a controller input and/or a key
@@ -1365,13 +1458,13 @@ void mouse_camera_settings(input_map::Mapping& m) {
          "menu, dialogs and switching to another app. Click the game again to capture it.");
     ImGui::BeginDisabled(!m.mouse_look);
     ImGui::SetNextItemWidth(220);
-    ImGui::SliderFloat("Camera sensitivity", &m.mouse_sensitivity, 0.1f, 10.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    slider_float("Camera sensitivity", &m.mouse_sensitivity, 0.1f, 10.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
     help("How fast moving the mouse turns the camera. The game's camera has a top speed (a fully pushed "
          "stick); past that, faster movement turns no faster.");
     if (check("Invert up/down", m.mouse_invert_y, &v)) m.mouse_invert_y = v;
     float floor = m.mouse_floor * 100.0f;
     ImGui::SetNextItemWidth(220);
-    if (ImGui::SliderFloat("Smallest camera push", &floor, 0.0f, 50.0f, "%.0f%%")) m.mouse_floor = std::clamp(floor / 100.0f, 0.0f, 0.5f);
+    if (slider_float("Smallest camera push", &floor, 0.0f, 50.0f, "%.0f%%")) m.mouse_floor = std::clamp(floor / 100.0f, 0.0f, 0.5f);
     help("The game ignores a slightly pushed stick. Even slow mouse movement pushes the camera stick at "
          "least this far; raise it if small movements do nothing, lower it if the camera jumps.");
     if (check("Mouse moves the highlight in the game's menus", m.mouse_menu_nav, &v)) m.mouse_menu_nav = v;
@@ -1607,7 +1700,7 @@ void tab_controls() {
     ImGui::PopStyleColor();
     float dz = m.deadzone * 100.0f;
     ImGui::SetNextItemWidth(200);
-    if (ImGui::SliderFloat("Stick dead zone", &dz, 0.0f, 90.0f, "%.0f%%")) {
+    if (slider_float("Stick dead zone", &dz, 0.0f, 90.0f, "%.0f%%")) {
         m.deadzone = std::clamp(dz / 100.0f, 0.0f, 0.9f);
         input_map::set_current(m);
     }
@@ -1893,7 +1986,7 @@ void tab_audio() {
     heading("Volume");
     float volume = audio::master_volume() * 100.0f;
     ImGui::SetNextItemWidth(260);
-    if (ImGui::SliderFloat("Master volume", &volume, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp))
+    if (slider_float("Master volume", &volume, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp))
         hostui::post([volume] { audio::set_master_volume(volume / 100.0f); });
     ImGui::SameLine();
     if (ImGui::Button("Mute##volume")) hostui::post([] { audio::set_master_volume(0.0f); });

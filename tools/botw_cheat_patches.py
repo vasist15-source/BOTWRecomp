@@ -67,6 +67,39 @@ SITES = {
                  ('instead', 'st8(c->r[30] + 0x18u, (uint8_t)(botw_cheat(BOTW_CHEAT_WEATHER) - 1));')),
 }
 
+# View distances of Settings > Graphics (runtime/include/botw_distance.h, runtime/src/mods/distance.cpp),
+# the sites of the Draw Distance mod in Cemu's graphic packs (src/BreathOfTheWild/Mods/DrawDistance,
+# BotW_DrawDistance_V208, by Crementif, CC0-1.0). Where this differs from the pack:
+# - Actors: the pack nops the "load balancing lowered the distance" branch and stores its multiplier,
+#   so even its default (1x) turns load balancing off. Here the game's own code runs unless the value
+#   differs from 1; then the compare reports "lower" and the stored value is the chosen one.
+# - Objects: the pack nops a null check and loads its multiplier in place of the game's (+0x2BC of a
+#   global, else a constant); here the product both paths end in (f1 = f11 * f0) takes the chosen one.
+#   The culling distance compares are scaled by 2 - multiplier as the pack does, without its f1
+#   clobber (f1 is not read again before the next call).
+# - Trees: the billboard distance constant (0x102BC4A0, 0.5) is replaced at its load only.
+# - Grass: the pack's data word (0x1030A774, 1000) is written by the runtime, not here.
+DISTANCE_SITES = {
+    # fcmpu cr0, f8, f9 (f9: the load-balanced multiplier); then `ble` skips `stfs f9, 0x13BC(r28)`
+    0x03857F54: (0xFC084800, 'botw_dist_on(BOTW_DIST_ACTOR)',
+                 ('after', '{ double v = botw_dist(BOTW_DIST_ACTOR); c->f[9].ps0 = v; c->f[9].ps1 = v; } c->cr[1] = 1;')),
+    # fmuls f1, f11, f0: the object distance times its multiplier
+    0x03137F00: (0xEC2B0032, 'botw_dist_on(BOTW_DIST_OBJECT)',
+                 ('instead', '{ double v = ppc_to_single(c, c->f[11].ps0 * (double)botw_dist(BOTW_DIST_OBJECT)); '
+                             'c->f[1].ps0 = v; c->f[1].ps1 = v; }')),
+    # fmuls f13, f1, f1: the squared culling distance (two map unit loops)
+    0x0313A60C: (0xEDA10072, 'botw_dist_on(BOTW_DIST_OBJECT_CULL)',
+                 ('after', '{ double v = ppc_to_single(c, c->f[13].ps0 * (double)botw_dist(BOTW_DIST_OBJECT_CULL)); '
+                           'c->f[13].ps0 = v; c->f[13].ps1 = v; }')),
+    0x0313A678: (0xEDA10072, 'botw_dist_on(BOTW_DIST_OBJECT_CULL)',
+                 ('after', '{ double v = ppc_to_single(c, c->f[13].ps0 * (double)botw_dist(BOTW_DIST_OBJECT_CULL)); '
+                           'c->f[13].ps0 = v; c->f[13].ps1 = v; }')),
+    # lfs f12, -0x3B60(r7): the tree billboard distance factor
+    0x033CB550: (0xC187C4A0, 'botw_dist_on(BOTW_DIST_TREE)',
+                 ('instead', '{ double v = botw_dist(BOTW_DIST_TREE); c->f[12].ps0 = v; c->f[12].ps1 = v; }')),
+}
+SITES.update(DISTANCE_SITES)
+
 
 def apply(source, sites, translate):
     """Wrap the given sites of one function's C text. translate(address, word) is the C of one
@@ -95,4 +128,4 @@ def apply(source, sites, translate):
             body = f'if ({on}) {{ {translate(address, change)} }} else {{ {original} }}'
         lines[index] = (f'    /* BOTW_CHEAT_BEGIN {address:08X} */\n    {body} {marker}'
                         f'\n    /* BOTW_CHEAT_END {address:08X} */')
-    return '#include "botw_cheats.h"\n' + '\n'.join(lines)
+    return '#include "botw_cheats.h"\n#include "botw_distance.h"\n' + '\n'.join(lines)

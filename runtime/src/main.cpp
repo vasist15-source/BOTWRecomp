@@ -18,6 +18,7 @@
 #include "mods/guest_mods.h"
 #include "mods/code_mods.h"
 #include "mods/code_patches.h"
+#include "mods/distance.h"
 #include "platform/host.h"
 #include "platform/app_launch.h"
 #ifdef _WIN32
@@ -539,6 +540,7 @@ int main(int argc, char** argv) {
             if (m.id == id) return m.enabled;
         return false;
     });
+    mods::distance::startup();  // Settings > Graphics > View distance: the saved choices (mods/distance.h)
     guestmods::init();  // trusted manager packages, before guest threads start
     init_data_imports();
     mem_setup_heaps(m.data_end);

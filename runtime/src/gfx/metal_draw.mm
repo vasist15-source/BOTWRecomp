@@ -21,6 +21,7 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "gfx/shader_linkage.h"
 #include "mods/graphic_packs.h"
 #include "gfx/sampler_lod_bias.h"
+#include "mods/distance.h"
 #include "gx2/gx2.h"
 #include "render_prof.h"
 #include "gx2/gx2_cmd.h"
@@ -2403,14 +2404,22 @@ static void bind_stage_t(id<MTLRenderCommandEncoder> enc, const uint32_t* regs, 
             at(e.uniformLocation)[0] = ok ? texScale[e.texUnit][0] : 1.0f;
             at(e.uniformLocation)[1] = ok ? texScale[e.texUnit][1] : 1.0f;
         }
-        // the sampler's LOD bias, which Metal samplers can't apply (gfx/sampler_lod_bias.h)
+        // the sampler's LOD bias, which Metal samplers can't apply (gfx/sampler_lod_bias.h), plus the texture
+        // detail of Settings > Graphics > View distance on block-compressed textures (BC1-BC5: the game's
+        // own textures, not render targets), as the Draw Distance pack's overwriteRelativeLodBias
+        const float detail = mods::distance::texture_bias();
         for (int t = 0, on = -1; t < 18; t++) {
             if (dec->uniform.loc_texLodBias[t] < 0) continue;
             if (on < 0) on = lod_bias_on();
             const uint32_t samplerIdx = dec->textureUnitSamplerAssignment[t];
             const bool add = on && samplerIdx < 18;
-            *at(dec->uniform.loc_texLodBias[t]) =
-                add ? gfx::sampler_lod_bias::host(regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 1]) : 0.0f;
+            float b = add ? gfx::sampler_lod_bias::host(regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerIdx + samplerBase) * 3 + 1]) : 0.0f;
+            if (detail != 0.0f && on) {
+                const uint32_t fmt = regs[texBase + t * 7 + 1] >> 26;  // SQ_TEX_RESOURCE_WORD1 DATA_FORMAT
+                if (fmt >= 0x31 && fmt <= 0x35)
+                    b = std::clamp(b + detail, gfx::sampler_lod_bias::kHostMin, gfx::sampler_lod_bias::kHostMax);
+            }
+            *at(dec->uniform.loc_texLodBias[t]) = b;
         }
         for (int t = 0; t < 18; t++) {
             if (dec->uniform.loc_framebufferFetchSize[t] < 0) continue;

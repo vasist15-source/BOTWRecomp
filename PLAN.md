@@ -960,6 +960,20 @@ better").
 - **Play-tested 2026-11-18** on the /Applications build: "works"; the file went from 12747 to 12790 s over the
   session.
 
+### 2026-11-22: view distance sliders (Settings > Graphics > View distance; play-tested: works)
+- Cemu's Draw Distance pack (Mods/DrawDistance, Crementif, CC0) as live sliders: people/enemies/animals 0.5-1.5x,
+  buildings/rocks/bushes 0.75-1.25x, trees and grass in the pack's six levels, distant texture detail -3..+2.
+  Upper ends are the pack's maxima without its Extended Memory pack (the port keeps the Wii U memory layout and
+  the game's fixed heap sizes).
+- Game code: `DISTANCE_SITES` in `tools/botw_cheat_patches.py` (5 sites, the cheats' mechanism: the game's own
+  instruction unless a value is set), read from `botw_distance[]` (`runtime/include/botw_distance.h`). Grass is
+  the pack's data word 1030A774, written by `mods/distance.cpp`; tree and grass are checked against the v208
+  values (0.5, 1000) before anything changes. Texture detail adds to the shader LOD bias of BC1-BC5 textures
+  (metal_draw.mm; Metal only). Defaults run the game's code unchanged. WWHD_DISTANCE=off for a run.
+- Settings sliders now step with Left/Right (d-pad, left stick, arrow keys) while focused, without A first, and
+  Left on a slider no longer leaves the page (`PaneFocus::keep_left`). Not play-tested with a controller yet.
+- Frame time and CPU % at the higher settings not measured.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
