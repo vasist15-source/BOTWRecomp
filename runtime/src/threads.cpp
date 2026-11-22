@@ -1254,7 +1254,7 @@ HLE(coreinit, OSSendMessage) {
     static const uint32_t dumpQ = getenv("WWHD_MSG_DUMP") ? (uint32_t)strtoul(getenv("WWHD_MSG_DUMP"), nullptr, 16) : 0;
     static std::atomic<int> dumped{0};
     static std::atomic<uint32_t> sends{0}, trivial{0};
-    const bool isQ = dumpQ && arg(c, 0) == dumpQ && msg[0] >= mem::kMem2Start && msg[0] < mem::kMem2End - 0x80;
+    const bool isQ = dumpQ && arg(c, 0) == dumpQ && msg[0] >= mem::kMem2Start && msg[0] < mem::mem2_end() - 0x80;
     // a lone placeholder (no next command, id -1) is counted, not dumped
     const bool lone = isQ && ld32(msg[0]) == 0 && ld32(msg[0] + 4) == 0xFFFFFFFFu;
     if (isQ && (++sends % 1000) == 0) LOG("[msgdump] %u batches, %u only the placeholder", sends.load(), trivial.load());

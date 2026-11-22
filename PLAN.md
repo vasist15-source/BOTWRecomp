@@ -974,6 +974,20 @@ better").
   Left on a slider no longer leaves the page (`PaneFocus::keep_left`). Not play-tested with a controller yet.
 - Frame time and CPU % at the higher settings not measured.
 
+### 2026-11-22: More memory (Settings > Graphics > View distance; not play-tested)
+- Cemu's Extended Memory pack (Mods/ExtendedMemory, CC0) as a boot-time switch (host setting moreMemory,
+  WWHD_MORE_MEMORY=0/1 for a run). On: MEM2 0x10000000-0xA0000000 (OSGetMemBound, the default heap and the GPU
+  mapping follow), overlay arena 0xA0000000 + 0x40000000, and the pack's 27 heap sizes (main game heap +1.25 GiB,
+  resource heaps, Havok, terrain, ForestRenderer, overlay FixedHeap/MoveableMemory, PlacementMgr) at
+  `MEMORY_SITES` in `tools/botw_cheat_patches.py`, asked through `botw_more_memory()` (`runtime/include/botw_memory.h`).
+  The sliders then go to 2x actors and 1.5x objects. Off: the Wii U layout and the game's own heap code.
+- Layout (`runtime.h mem::Layout`): the runtime's own region (stacks, OS structs, host scratch, fixed slots) sat
+  inside the larger MEM2 at 0x60000000; with More memory it is at 0xE4000000-0xF4000000 (after the foreground
+  bucket's GPU mapping). Data-import storage moved from 0xC1000000 (inside the larger overlay arena) to 0xF6000000
+  for both layouts (`DATA_IMPORT_BASE`, recomp.py). Import and host-function numbers (0xC0000000, 0xC2000000) are
+  call targets only, never memory. The Mod SDK region 0x7F000000 is inside MEM2, so no SDK module loads with it on.
+- Host footprint, frame time and CPU % with it on: not measured yet.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.

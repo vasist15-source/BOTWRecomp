@@ -76,7 +76,7 @@ const uint32_t kSaveInfoPtr = GD(0x101F84DC);  // dComIfGs save info (dSv_info_c
 constexpr uint32_t kSaveInfoSize = 0x12A0;
 void dump_saveinfo(const std::string& path) {
     uint32_t p = ld32(kSaveInfoPtr);
-    if (p < mem::kMem2Start || p >= mem::kMem2End) return;
+    if (p < mem::kMem2Start || p >= mem::mem2_end()) return;
     if (FILE* f = fopen(path.c_str(), "wb")) {
         fwrite(mem::ptr(p), 1, kSaveInfoSize, f);
         fclose(f);
@@ -458,7 +458,7 @@ void logic_step(uint64_t step) {
         if (previous_event && !event) {
             const auto path = std::string(event_path) + ".end" + std::to_string(++completed);
             dump_saveinfo(path);
-            if (link >= mem::kMem2Start && link < mem::kMem2End) {
+            if (link >= mem::kMem2Start && link < mem::mem2_end()) {
                 if (FILE* f = fopen((path + ".link").c_str(), "wb")) {
                     fwrite(mem::ptr(link + 0x314), 1, 0x20, f);
                     fclose(f);

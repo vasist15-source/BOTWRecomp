@@ -27,7 +27,7 @@ static bool plausible_mtx(uint32_t a) {
     return std::fabs(len[1] - len[0]) < 0.05 * len[0] && std::fabs(len[2] - len[0]) < 0.05 * len[0];
 }
 
-static bool guest_ptr(uint32_t p) { return p >= 0x10000000 && p < 0x50000000 && (p & 3) == 0; }
+static bool guest_ptr(uint32_t p) { return p >= 0x10000000 && p < mem::mem2_end() && (p & 3) == 0; }
 
 extern "C" void hook_027F4D5C(Cpu* c) {
     uint32_t model = c->r[3];

@@ -93,6 +93,7 @@ class BotwRecompiler(recomp.Recompiler):
         reserved.update({a: "the port's built-in FPS++" for a in botw_fps_patches.SITES})
         reserved.update({a: "a cheat of Settings > Cheats" for a in botw_cheat_patches.SITES})
         reserved.update({a: "the view distances of Settings > Graphics" for a in botw_cheat_patches.DISTANCE_SITES})
+        reserved.update({a: "More memory of Settings > Graphics" for a in botw_cheat_patches.MEMORY_SITES})
         reserved.update({a: "the aspect ratio of Settings > Display" for a in botw_aspect_patches.SITES})
         # the Cemu Durability pack's site: Settings > Cheats has it without the pack's lost call target
         reserved[0x024ACBF0] = "the durability cheat of Settings > Cheats (without the pack's bug)"

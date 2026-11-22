@@ -104,8 +104,9 @@ def branch_target(addr, w):
     return None
 
 
-# imported data objects get runtime-owned storage at fixed addresses
-DATA_IMPORT_BASE = 0xC1000000
+# imported data objects get runtime-owned storage at fixed addresses: after MEM1, where neither guest
+# layout of runtime/src/runtime.h has anything (0xC1000000 before: inside the More memory overlay arena)
+DATA_IMPORT_BASE = 0xF6000000
 DATA_IMPORT_STRIDE = 0x1000
 
 

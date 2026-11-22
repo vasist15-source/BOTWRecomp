@@ -119,15 +119,16 @@ using Region=MemoryRegion;
 
 std::vector<Region> regions() {
     uint32_t top = (mem::runtime_top() + kChunk - 1) & ~(kChunk - 1);
-    std::vector<Region> r = {{mem::kMem2Start, mem::kMem2End - mem::kMem2Start},
-                             {mem::kRuntimeStart, top - mem::kRuntimeStart},
-                             {mem::kFixedStart, mem::kFixedSize},
+    std::vector<Region> r = {{mem::kMem2Start, mem::mem2_end() - mem::kMem2Start},
+                             {mem::runtime_start(), top - mem::runtime_start()},
+                             {mem::fixed_start(), mem::kFixedSize},
                              {mem::kFgBucket, mem::kFgBucketSize},
-                             {mem::kMem1, mem::kMem1Size},
-                             {guestmods::kRegionStart,guestmods::kRegionSize}};
+                             {mem::kMem1, mem::kMem1Size}};
+    // the Mod SDK region (inside MEM2 with More memory, where no module loads)
+    if (!mem::more_memory()) r.push_back({guestmods::kRegionStart, guestmods::kRegionSize});
     // the overlay arena BotW enables (OSEnableOverlayArena): game data lives there too (left out, a loaded
     // state kept the arena's current contents: rocks and other physics objects fell and settled again)
-    if (::mem::overlay_arena_enabled()) r.push_back({0xA0000000u, 0x1C000000u});
+    if (::mem::overlay_arena_enabled()) r.push_back({mem::kOverlayStart, mem::overlay_size()});
     return r;
 }
 
@@ -656,7 +657,7 @@ const HdSection kHdSections[] = {
 };
 const uint32_t fn_name_obj = GC(0x02720154);  // per-file player name (SafeString: +0 UTF-16 text)
 
-bool in_mem2(uint32_t a) { return a >= mem::kMem2Start && a < mem::kMem2End; }
+bool in_mem2(uint32_t a) { return a >= mem::kMem2Start && a < mem::mem2_end(); }
 
 uint32_t scratch() {  // host-only guest buffer for the game's card functions (not part of full states)
     static const uint32_t s = mem::host_alloc(0x2000, 64);

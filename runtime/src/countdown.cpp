@@ -20,7 +20,7 @@ void display(Cpu* c, const char* surface) {
     // Only layouts actually formatted during this game step are eligible for refresh.
     // Their destructors and state-load reset remove the pointers before reuse.
     const uint32_t object = c->r[31];
-    if (object >= mem::kMem2Start && object < mem::kMem2End - 0x68) {
+    if (object >= mem::kMem2Start && object < mem::mem2_end() - 0x68) {
         for (auto& layout : layouts) {
             if (layout.object == object || !layout.object || layout.step != interp::logic_steps()) {
                 layout = {object, interp::logic_steps(), surface[0] == 'r'};
@@ -30,7 +30,7 @@ void display(Cpu* c, const char* surface) {
     }
     const uint32_t play = GD(0x1046F0B0);
     const uint32_t timer = ld32(play + 0x5CF0);
-    if (timer < mem::kMem2Start || timer >= mem::kMem2End - 0x136) return;
+    if (timer < mem::kMem2Start || timer >= mem::mem2_end() - 0x136) return;
     const bool running = ld8(timer + kStatus) == 2 && ld8(timer + kStopped) == 0;
     const uint32_t native = c->r[7];
     c->r[7] = tick.display_ms(int32_t(native), timer, ld32(timer + kRemaining),

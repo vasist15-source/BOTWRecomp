@@ -881,7 +881,7 @@ extern "C" void hook_0203593C(Cpu* c) {
             static FILE* out = getenv("WWHD_COUNTDOWN_TRACE") ? fopen(getenv("WWHD_COUNTDOWN_TRACE"), "w") : nullptr;
             if (!out) return;
             const uint32_t timer = ld32(GD(0x1046F0B0) + 0x5CF0);
-            if (timer < mem::kMem2Start || timer >= mem::kMem2End - 0x136) return;
+            if (timer < mem::kMem2Start || timer >= mem::mem2_end() - 0x136) return;
             static bool paced = false;
             if (!paced && getenv("WWHD_COUNTDOWN_REALTIME")) {
                 gx2::set_uncapped(false);

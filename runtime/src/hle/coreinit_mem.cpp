@@ -163,10 +163,10 @@ uint32_t frm_alloc(uint32_t heap, uint32_t size, int32_t align) {
 void mem_setup_heaps(uint32_t data_end) {
     uint32_t start = (data_end + 0xFFF) & ~0xFFFu;
     g_mem2_start = start;
-    g_default_heap = create_exp(start, mem::kMem2End - start);
+    g_default_heap = create_exp(start, mem::mem2_end() - start);
     g_mem1_heap = create_frm(mem::kMem1, mem::kMem1Size);
     g_fg_heap = create_frm(mem::kFgBucket, mem::kFgBucketSize);
-    LOG("[mem] default heap %08X-%08X", start, mem::kMem2End);
+    LOG("[mem] default heap %08X-%08X", start, mem::mem2_end());
 }
 
 uint32_t mem_default_alloc(uint32_t size, int32_t align) { return exp_alloc(g_default_heap, size, align); }
@@ -301,22 +301,22 @@ HLE(coreinit, MEMFreeToAllocator) {
 HLE(coreinit, OSGetMemBound) {
     uint32_t type = arg(c, 0), start = 0, size = 0;
     if (type == 1) start = mem::kMem1, size = mem::kMem1Size;
-    else if (type == 2) start = g_mem2_start, size = mem::kMem2End - g_mem2_start;
+    else if (type == 2) start = g_mem2_start, size = mem::mem2_end() - g_mem2_start;
     LOG("[mem] OSGetMemBound(%u) -> %08X size %08X lr=%08X", type, start, size, c->lr);
     if (arg(c, 1)) st32(arg(c, 1), start);
     if (arg(c, 2)) st32(arg(c, 2), size);
     ret(c, start ? 0 : (uint32_t)-1);
 }
 
-// Overlay arena (BotW enables it): 0xA0000000, 0x1C000000 bytes, as in Cemu. Guest memory there is
+// Overlay arena (BotW enables it): 0xA0000000, 0x1C000000 bytes (0x40000000 with More memory), as in Cemu. Guest memory there is
 // reserved like the rest of the 4 GiB, but is not yet mapped for the GPU (gfx/metal_main.mm).
 static bool g_overlay_arena;
 HLE(coreinit, OSIsEnabledOverlayArena) { ret(c, g_overlay_arena); }
 HLE(coreinit, OSEnableOverlayArena) {
     g_overlay_arena = true;
-    if (arg(c, 1)) st32(arg(c, 1), 0xA0000000u);
-    if (arg(c, 2)) st32(arg(c, 2), 0x1C000000u);
-    LOG("[mem] overlay arena enabled: A0000000 size 1C000000 lr=%08X", c->lr);
+    if (arg(c, 1)) st32(arg(c, 1), mem::kOverlayStart);
+    if (arg(c, 2)) st32(arg(c, 2), mem::overlay_size());
+    LOG("[mem] overlay arena enabled: %08X size %08X lr=%08X", mem::kOverlayStart, mem::overlay_size(), c->lr);
 }
 HLE(coreinit, OSDisableOverlayArena) { g_overlay_arena = false; }
 namespace mem { bool overlay_arena_enabled() { return g_overlay_arena; } }

@@ -904,10 +904,13 @@ void init() {
     R.queue = [R.device newCommandQueue];
     display_init();
     // GPU-visible guest memory: MEM2 (code data + heaps), runtime objects, foreground bucket, MEM1
-    map_guest_range(0x10000000, 0x40000000);
-    map_guest_range(0x60000000, 0x10000000);
-    map_guest_range(0xA0000000, 0x1C000000);  // overlay arena (OSEnableOverlayArena, BotW)
+    // (runtime.h mem::Layout: with More memory MEM2 runs to the overlay arena and the runtime's region
+    // follows the foreground bucket)
+    map_guest_range(mem::kMem2Start, mem::mem2_end() - mem::kMem2Start);
+    if (!mem::more_memory()) map_guest_range(mem::runtime_start(), mem::kRuntimeSize);
+    map_guest_range(mem::kOverlayStart, mem::overlay_size());  // overlay arena (OSEnableOverlayArena, BotW)
     map_guest_range(0xE0000000, 0x04000000);
+    if (mem::more_memory()) map_guest_range(mem::runtime_start(), mem::kRuntimeSize);
     map_guest_range(0xF4000000, 0x02000000);
     make_guest_residency();
     attach_guest_residency(R.queue);

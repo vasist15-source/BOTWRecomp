@@ -5,18 +5,30 @@
 // Every choice applies at once and is saved in the host settings (drawActors, drawObjects, drawTrees,
 // drawGrass, textureDetail). The defaults are the game's own: its code runs unchanged.
 //   WWHD_DISTANCE=off: the game's own for this run (saved choices are kept, not applied)
+// More memory (host setting moreMemory, read once at boot; WWHD_MORE_MEMORY=0/1 for one run): the guest
+// layout of Cemu's Extended Memory pack and its larger game heaps (runtime.h mem::Layout, botw_memory.h),
+// which lift the actor slider to 2x and the object slider to 1.5x as the pack's presets do.
 #pragma once
 
 namespace mods::distance {
 
-// slider ranges (the pack's presets that need no Extended Memory pack)
-constexpr float kActorMin = 0.5f, kActorMax = 1.5f;    // 1: the game's own (with its load balancing)
-constexpr float kObjectMin = 0.75f, kObjectMax = 1.25f;  // 1: the game's own; below 0.75 events break
+// slider ranges (the pack's presets; the larger maxima need More memory, the pack's Extended Memory)
+constexpr float kActorMin = 0.5f, kActorMax = 1.5f, kActorMaxMore = 2.0f;      // 1: the game's own (with its load balancing)
+constexpr float kObjectMin = 0.75f, kObjectMax = 1.25f, kObjectMaxMore = 1.5f;  // 1: the game's own; below 0.75 events break
 constexpr int kTreeLevels = 6, kTreeDefault = 2;         // Potato .. Extreme
 constexpr int kGrassLevels = 6, kGrassDefault = 2;
 constexpr int kTextureMin = -3, kTextureMax = 2;         // levels; negative: sharper in the distance
 extern const char* const kTreeNames[kTreeLevels];
 extern const char* const kGrassNames[kGrassLevels];
+
+// boot, before mem::init: whether this run has More memory (the saved choice, or WWHD_MORE_MEMORY)
+bool more_memory_at_boot();
+bool more_memory();          // this run's
+bool more_memory_saved();    // the saved choice (applies at the next start)
+bool more_memory_from_env();
+void set_more_memory(bool on);  // saves it (main thread)
+float actor_max();   // the slider maxima of this run
+float object_max();
 
 // main thread, after the game's code is loaded, before the game runs: the saved choices
 void startup();

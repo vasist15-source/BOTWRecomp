@@ -404,8 +404,8 @@ HLE(coreinit, COSWarn) {
 namespace mem { bool overlay_arena_enabled(); }
 HLE(coreinit, OSIsAddressValid) {
     const uint32_t a = arg(c, 0);
-    const bool ok = (a >= 0x01000000u && a < mem::kMem2End) || (a >= mem::kRuntimeStart && a < 0x70000000u) ||
-                    (mem::overlay_arena_enabled() && a >= 0xA0000000u && a < 0xBC000000u) ||
+    const bool ok = (a >= 0x01000000u && a < mem::mem2_end()) || (a >= mem::runtime_start() && a < mem::runtime_end()) ||
+                    (mem::overlay_arena_enabled() && a - mem::kOverlayStart < mem::overlay_size()) ||
                     (a >= mem::kFgBucket && a < mem::kFgBucket + mem::kFgBucketSize) || (a >= mem::kMem1 && a < mem::kMem1 + mem::kMem1Size);
     ret(c, ok);
 }

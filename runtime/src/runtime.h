@@ -11,12 +11,27 @@
 
 // ---- guest memory layout ----
 namespace mem {
+// Two layouts, chosen at boot (mem::init) and fixed for the run. The Wii U's: MEM2 0x10000000-0x50000000,
+// the overlay arena 0xA0000000 + 0x1C000000, the runtime's own objects at 0x60000000-0x70000000. With
+// "More memory" (Settings > Graphics > View distance, host setting moreMemory; WWHD_MORE_MEMORY=0/1),
+// Cemu's Extended Memory pack: MEM2 to 0xA0000000, the overlay arena 0xA0000000 + 0x40000000 (to the
+// foreground bucket), and the runtime's region moved to 0xE4000000-0xF4000000, out of their way. The
+// game's heaps grow at the sites of tools/botw_cheat_patches.py MEMORY_SITES (botw_memory.h).
+struct Layout {
+    uint32_t mem2_end, runtime_start, host_start, fixed_start, overlay_size;
+    bool more;
+};
+inline Layout g_layout{0x50000000, 0x60000000, 0x68000000, 0x6FFF0000, 0x1C000000, false};
 constexpr uint32_t kMem2Start = 0x10000000;   // app data + heap (MEM2)
-constexpr uint32_t kMem2End = 0x50000000;
-constexpr uint32_t kRuntimeStart = 0x60000000; // runtime-owned guest objects (stacks, OS structs)
-constexpr uint32_t kRuntimeEnd = 0x70000000;
-constexpr uint32_t kHostStart = 0x68000000;    // ... of them host-only (not part of save states)
-constexpr uint32_t kFixedStart = 0x6FFF0000;   // fixed slots for small buffers the guest may keep pointers to
+constexpr uint32_t kRuntimeSize = 0x10000000;  // runtime-owned guest objects (stacks, OS structs) ...
+inline uint32_t mem2_end() { return g_layout.mem2_end; }
+inline uint32_t runtime_start() { return g_layout.runtime_start; }
+inline uint32_t runtime_end() { return g_layout.runtime_start + kRuntimeSize; }
+inline uint32_t host_start() { return g_layout.host_start; }    // ... of them host-only (not part of save states)
+inline uint32_t fixed_start() { return g_layout.fixed_start; }  // fixed slots for small buffers the guest may keep pointers to
+inline uint32_t overlay_size() { return g_layout.overlay_size; }  // the overlay arena at 0xA0000000
+inline bool more_memory() { return g_layout.more; }
+constexpr uint32_t kOverlayStart = 0xA0000000;
 constexpr uint32_t kFixedSize = 0x10000;
 constexpr uint32_t kFgBucket = 0xE0000000;     // foreground bucket
 constexpr uint32_t kFgBucketSize = 0x02800000;
@@ -24,6 +39,8 @@ constexpr uint32_t kMem1 = 0xF4000000;         // MEM1, 32 MiB
 constexpr uint32_t kMem1Size = 0x02000000;
 constexpr uint32_t kHleFuncBase = 0xC2000000;  // synthetic addresses of host functions
 
+// before init: the More memory layout (true) or the Wii U's
+void choose_layout(bool more);
 void init();
 // bump allocator for runtime-owned guest memory (never freed). Guest-visible objects (the game may
 // keep pointers to them) go through runtime_alloc and are part of save states; scratch memory that
@@ -32,9 +49,9 @@ uint32_t runtime_alloc(uint32_t size, uint32_t align = 16);
 uint32_t host_alloc(uint32_t size, uint32_t align = 16);
 // fixed 0x100-byte guest buffer number `id` (lazily used features: same address in every session)
 enum FixedSlot : uint32_t { kFixInterpEye = 0, kFixInterpMtx, kFixFxMidPos, kFixLinkScratch, kFixCount };
-inline uint32_t fixed_slot(FixedSlot id) { return kFixedStart + 0x100 * id; }
+inline uint32_t fixed_slot(FixedSlot id) { return fixed_start() + 0x100 * id; }
 uint32_t runtime_top();
-bool overlay_arena_enabled();  // OSEnableOverlayArena was called (0xA0000000, 0x1C000000 bytes)
+bool overlay_arena_enabled();  // OSEnableOverlayArena was called (kOverlayStart, overlay_size() bytes)
 void raise_runtime_top(uint32_t top);
 struct AllocRec { uint32_t addr, size; uint64_t tag; };
 std::vector<AllocRec> runtime_alloc_log();  // sorted by address

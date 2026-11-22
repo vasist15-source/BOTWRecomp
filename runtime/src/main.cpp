@@ -19,6 +19,7 @@
 #include "mods/code_mods.h"
 #include "mods/code_patches.h"
 #include "mods/distance.h"
+#include "botw_memory.h"
 #include "platform/host.h"
 #include "platform/app_launch.h"
 #ifdef _WIN32
@@ -503,11 +504,17 @@ int main(int argc, char** argv) {
     mods::packages::set_code_mod_support(guestmods::hooks_built() && mods::code::enabled());
     mods::packages::initialize();
     mods::loader::startup();  // Settings > Mods: merge the enabled content mods before the game reads files
+    // More memory (Settings > Graphics > View distance): the guest layout and the game's heap sizes, for the run
+    mem::choose_layout(mods::distance::more_memory_at_boot());
+    botw_more_memory_on = mem::more_memory();
     mem::init();
+    if (mem::more_memory())
+        LOG("[mem] More memory: MEM2 %08X-%08X, overlay arena %08X size %08X, runtime objects %08X-%08X", mem::kMem2Start,
+            mem::mem2_end(), mem::kOverlayStart, mem::overlay_size(), mem::runtime_start(), mem::runtime_end());
     auto valid_mod_memory = [](uint32_t address, size_t size) {
         if (size > 1024 * 1024) return false;
         uint64_t end = uint64_t(address) + size;
-        return (address >= mem::kMem2Start && end <= mem::kMem2End) ||
+        return (address >= mem::kMem2Start && end <= mem::mem2_end()) ||
                (address >= mem::kMem1 && end <= uint64_t(mem::kMem1) + mem::kMem1Size) ||
                (address >= mem::kFgBucket && end <= uint64_t(mem::kFgBucket) + mem::kFgBucketSize);
     };

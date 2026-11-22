@@ -359,7 +359,7 @@ void init_buffers() {
 // The game's output mode, from its sound player's master faders (audio_output_mode.h): the player
 // is ((sound manager 1018EC64)->+0x10)->+4 (Snd_player 020307F8 -> 0202BF78 -> 0202BC80), its
 // TV fader at +0x194 and GamePad fader at +0x1AC (Player_fadeMaster 0202F14C).
-bool guest_obj(uint32_t a) { return a >= mem::kMem2Start && a < mem::kMem2End - 0x400 && !(a & 3); }
+bool guest_obj(uint32_t a) { return a >= mem::kMem2Start && a < mem::mem2_end() - 0x400 && !(a & 3); }
 bool read_game_faders(audio::Fader& tv, audio::Fader& drc) {
     return false;  // BotW: the WWHD sound-manager address below is Wind Waker's; output stays on the TV path
     uint32_t mgr = ld32(GD(0x1018EC64));

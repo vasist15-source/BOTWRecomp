@@ -439,7 +439,7 @@ struct KankyoTrace { int moving = 0, words = 0; double frac = 0; };
 void kankyo_move(Cpu* c, int k, void (*orig)(Cpu*)) {
     const KankyoKind& kk = kKankyo[k];
     uint32_t pk = ld32(kEnvLight + kk.env_off);
-    if (!on(32) || !interp::logic_pass() || pk < 0x10000000 || pk >= 0x50000000) {
+    if (!on(32) || !interp::logic_pass() || pk < 0x10000000 || pk >= mem::mem2_end()) {
         orig(c);
         return;
     }
@@ -549,7 +549,7 @@ extern "C" void hook_0256A448(Cpu* c) {
     Cpu tmp = *c;
     f_02555D0C(&tmp);
     uint32_t pk = tmp.r[3] ? ld32(tmp.r[3] + 0xAA0) : 0;
-    if (pk < 0x10000000 || pk >= 0x50000000) pk = 0;
+    if (pk < 0x10000000 || pk >= mem::mem2_end()) pk = 0;
     g_wave_env_pkt = pk;
     // debug: WWHD_WAVE_RAW=n dumps, after n logic-pass wave_move calls, the raw words of the first crests
     static int raw_left = getenv("WWHD_WAVE_RAW") ? atoi(getenv("WWHD_WAVE_RAW")) : 0;
@@ -760,7 +760,7 @@ extern "C" void hook_0251D864(Cpu* c) {
     static int tr = trace_left(6);
     for (uint32_t arr = 0; arr < 3; arr++) {  // positions, normals, back normals
         uint32_t now = ld32(pk + kClothPos + 8 * arr + 4 * cur), prev = ld32(pk + kClothPos + 8 * arr + 4 * (cur ^ 1));
-        if (now < 0x10000000 || now >= 0x50000000 || prev < 0x10000000 || prev >= 0x50000000) continue;
+        if (now < 0x10000000 || now >= mem::mem2_end() || prev < 0x10000000 || prev >= mem::mem2_end()) continue;
         uint32_t* b = (uint32_t*)ppc_ptr(now);
         const uint32_t* a = (const uint32_t*)ppc_ptr(prev);
         saved.emplace_back(now, std::vector<uint32_t>(b, b + n));
@@ -1362,7 +1362,7 @@ std::unordered_map<uint32_t, AttRec> g_att;
 extern "C" void hook_024EC1C8(Cpu* c) {
     uint32_t self = c->r[3], pos = c->r[4];
     uint32_t morf = ld32(self);
-    if (!true60::enabled() || !interp::enabled() || !on(16) || morf < 0x10000000 || morf >= 0x50000000) {
+    if (!true60::enabled() || !interp::enabled() || !on(16) || morf < 0x10000000 || morf >= mem::mem2_end()) {
         f_024EC1C8_orig(c);
         return;
     }

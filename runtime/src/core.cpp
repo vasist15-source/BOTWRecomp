@@ -97,7 +97,14 @@ void fatal(const char* fmt, ...) {
 
 // ---------------------------------------------------------------- memory
 namespace mem {
-static std::atomic<uint32_t> g_runtime_top{kRuntimeStart};
+static std::atomic<uint32_t> g_runtime_top{0x60000000};
+static std::atomic<uint32_t> g_host_top{0x68000000};
+
+void choose_layout(bool more) {
+    if (more) g_layout = {0xA0000000, 0xE4000000, 0xEC000000, 0xF3FF0000, 0x40000000, true};
+    g_runtime_top = runtime_start();
+    g_host_top = host_start();
+}
 
 void init() {
 #ifdef __APPLE__
@@ -141,7 +148,7 @@ static uint32_t bump(std::atomic<uint32_t>& top, uint32_t size, uint32_t align, 
 }
 
 __attribute__((noinline)) uint32_t runtime_alloc(uint32_t size, uint32_t align) {
-    uint32_t a = bump(g_runtime_top, size, align, kHostStart);
+    uint32_t a = bump(g_runtime_top, size, align, host_start());
     // who allocated (relative to the executable, stable across runs of one build): a loaded save
     // state requires the same guest-visible allocations at the same addresses
     uint64_t tag = (uint64_t)((uintptr_t)__builtin_return_address(0) - host::executable_base());
@@ -150,8 +157,7 @@ __attribute__((noinline)) uint32_t runtime_alloc(uint32_t size, uint32_t align) 
     return a;
 }
 
-static std::atomic<uint32_t> g_host_top{kHostStart};
-uint32_t host_alloc(uint32_t size, uint32_t align) { return bump(g_host_top, size, align, kFixedStart); }
+uint32_t host_alloc(uint32_t size, uint32_t align) { return bump(g_host_top, size, align, fixed_start()); }
 
 uint32_t runtime_top() { return g_runtime_top.load(); }
 void raise_runtime_top(uint32_t top) {

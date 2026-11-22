@@ -383,6 +383,11 @@ void init() {
         }
         return ids;
     });
+    // More memory (runtime.h mem::Layout): MEM2 covers the module region 7F000000-80000000, so no module loads
+    if(mem::more_memory()) {
+        LOG("[guestmods] More memory is on: the game's heaps use the mod region, no Mod SDK module is loaded");
+        return;
+    }
     packages::start_guests(inspect,[build](const packages::GuestPackage& pkg,uint32_t base) {
         auto result=build(pkg,base);std::string error;
         if(result.module.empty()||!load_one(result.module,error,pkg,base,result.allocation_size))

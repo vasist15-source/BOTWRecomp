@@ -100,6 +100,46 @@ DISTANCE_SITES = {
 }
 SITES.update(DISTANCE_SITES)
 
+# More memory of Settings > Graphics > View distance (runtime/include/botw_memory.h, runtime/src/runtime.h
+# mem::Layout): the heap sizes of Cemu's Extended Memory pack (src/BreathOfTheWild/Mods/ExtendedMemory,
+# BotW_ExtendedMemory_V208, CC0-1.0), whose [RAM] mappings the runtime makes instead (MEM2 to 0xA0000000,
+# a 1 GiB overlay arena). The switch is set at boot and never changes in a run. Where this differs from
+# the pack:
+# - "Main" and MovableMemory sizes (in MiB, 0340F31C-0340F33C): the pack sets the first choice and nops the
+#   rest (compare, flag load, branch, second choice); here both choices are its value, so the flag load and
+#   the compare stay the game's.
+# - TexArcWork (034ECED8) is set twice in the pack; its last value (0x600) is the one it applies.
+MEMORY_SITES = {
+    0x02C5E660: (0x3D203B60, 'botw_more_memory()', 0x3D208B60),  # main game heap: lis r9, 0x3B60 -> 0x8B60
+    0x032015E0: (0x3C60004D, 'botw_more_memory()', 0x3C600100),  # GameDataHeap: 8 + 8 MiB
+    0x03201A44: (0x3C600024, 'botw_more_memory()', 0x3C600080),  # SaveArea: 8 MiB (lis r3, 0x80 ...)
+    0x03201A5C: (0x38632000, 'botw_more_memory()', 0x38630000),  # ... addi r3, r3, 0)
+    0x037FD6A4: (0x3CC001E0, 'botw_more_memory()', 0x3CC00500),  # HavokMainHeap: 80 MiB
+    0x037FD758: (0x3C600002, 'botw_more_memory()', 0x3C600008),  # PhysicsTempLow: 512 KiB
+    0x037FD6D4: (0x3C600002, 'botw_more_memory()', 0x3C600008),  # PhysicsSystem: 512 KiB
+    0x02C5A208: (0x3C600140, 'botw_more_memory()', 0x3C600400),  # terrain scene
+    0x0338CDBC: (0x3C600030, 'botw_more_memory()', 0x3C600080),  # ForestRenderer
+    0x033C9D80: (0x3C60000C, 'botw_more_memory()', 0x3C600020),  # ForestRenderer WorkHeap
+    0x030AA5F4: (0x3CE01C00, 'botw_more_memory()', 0x3CE04000),  # overlay arena root heap: 1 GiB
+    0x034ED614: (0x3C600C20, 'botw_more_memory()', 0x3C601C20),  # overlay arena FixedHeap: +256 MiB
+    0x034ED66C: (0x3C600FD0, 'botw_more_memory()', 0x3C601FD0),  # overlay arena MoveableMemoryHeap: +256 MiB
+    0x034ED55C: (0x3C600040, 'botw_more_memory()', 0x3C600060),  # FixedHeap GameDataWork
+    0x034ECED8: (0x3C600200, 'botw_more_memory()', 0x3C600600),  # FixedHeap TexArcWork: +64 MiB
+    0x034ED1E4: (0x3CC001A0, 'botw_more_memory()', 0x3CC003A0),  # FixedHeap Audio: +32 MiB
+    0x0340F31C: (0x38E00069, 'botw_more_memory()', 0x38E000A7),  # "Main" (MiB): li r7, 0x87 + 0x20
+    0x0340F32C: (0x38E00087, 'botw_more_memory()', 0x38E000A7),
+    0x0340F334: (0x392000FB, 'botw_more_memory()', 0x392001FB),  # MovableMemory (MiB): li r9, 0xFB + 0x100
+    0x0340F33C: (0x39200137, 'botw_more_memory()', 0x392001FB),
+    0x0340F3F4: (0x3C000940, 'botw_more_memory()', 0x3C001940),  # ForResourceS: +256 MiB
+    0x0340F370: (0x3F5A0020, 'botw_more_memory()', 0x3F402200),  # ForResourceL: addis r26, r26, 0x20 -> lis r26, 0x2200
+    0x037C0F30: (0x3B9C0005, 'botw_more_memory()', 0x3B80009A),  # PlacementMgr heap (MiB): li r28, 0x5A + 0x40
+    0x02C4136C: (0x39401000, 'botw_more_memory()', 0x39401400),  # PlacementMgr pools: li r10, 0x1000 + 0x400
+    0x02C413F0: (0x39401000, 'botw_more_memory()', 0x39401400),
+    0x02C43E64: (0x39401000, 'botw_more_memory()', 0x39401400),
+    0x02C46340: (0x39401000, 'botw_more_memory()', 0x39401400),
+}
+SITES.update(MEMORY_SITES)
+
 
 def apply(source, sites, translate):
     """Wrap the given sites of one function's C text. translate(address, word) is the C of one
@@ -128,4 +168,4 @@ def apply(source, sites, translate):
             body = f'if ({on}) {{ {translate(address, change)} }} else {{ {original} }}'
         lines[index] = (f'    /* BOTW_CHEAT_BEGIN {address:08X} */\n    {body} {marker}'
                         f'\n    /* BOTW_CHEAT_END {address:08X} */')
-    return '#include "botw_cheats.h"\n#include "botw_distance.h"\n' + '\n'.join(lines)
+    return '#include "botw_cheats.h"\n#include "botw_distance.h"\n#include "botw_memory.h"\n' + '\n'.join(lines)

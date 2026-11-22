@@ -1013,20 +1013,20 @@ void tab_graphics() {
         ImGui::BeginDisabled(!en);
         float a = dist::actors();
         ImGui::SetNextItemWidth(320);
-        if (const int r = slider_float("People, enemies and animals", &a, dist::kActorMin, dist::kActorMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp, 0.05f))
+        if (const int r = slider_float("People, enemies and animals", &a, dist::kActorMin, dist::actor_max(), "%.2fx", ImGuiSliderFlags_AlwaysClamp, 0.05f))
             dist::set_actors(std::round(a * 20.0f) / 20.0f, r == 2);
         if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_actors(dist::actors(), true);
         help("How far away characters, enemies, animals and other things that move are drawn and run.\n"
              "1.00x is the game's own: it also pulls them in when the scene is busy. Any other value is\n"
              "used all the time. Higher costs processor time and memory (the game's memory is that of a\n"
-             "Wii U, so 1.5x is the most offered).");
+             "Wii U, so 1.5x is the most offered; 2x with More memory).");
         float o = dist::objects();
         ImGui::SetNextItemWidth(320);
-        if (const int r = slider_float("Buildings, rocks and bushes", &o, dist::kObjectMin, dist::kObjectMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp, 0.05f))
+        if (const int r = slider_float("Buildings, rocks and bushes", &o, dist::kObjectMin, dist::object_max(), "%.2fx", ImGuiSliderFlags_AlwaysClamp, 0.05f))
             dist::set_objects(std::round(o * 20.0f) / 20.0f, r == 2);
         if (ImGui::IsItemDeactivatedAfterEdit()) dist::set_objects(dist::objects(), true);
         help("How far away buildings, rocks, bushes and other placed objects are drawn. 1.00x is the\n"
-             "game's own. Below 0.75x some events stop starting, above 1.25x the game can run out of memory.");
+             "game's own. Below 0.75x some events stop starting; above 1.25x needs More memory.");
         int t = dist::trees();
         ImGui::SetNextItemWidth(320);
         if (const int r = slider_int("Trees", &t, 0, dist::kTreeLevels - 1, dist::kTreeNames[t], ImGuiSliderFlags_AlwaysClamp))
@@ -1054,6 +1054,19 @@ void tab_graphics() {
                  "fine patterns while moving, and uses a little more graphics chip time.");
         }
         ImGui::EndDisabled();
+        // More memory: read at start (runtime.h mem::Layout), so a change waits for a restart
+        bool more;
+        if (check("More memory", dist::more_memory_saved(), &more, !dist::more_memory_from_env()))
+            hostui::post([more] { dist::set_more_memory(more); });
+        help("Gives the game more memory than a Wii U has, as Cemu's Extended Memory pack does: 2.25 GB of main\n"
+             "memory instead of 1 GB and larger game heaps. Unlocks 2x for people, enemies and animals and 1.5x\n"
+             "for buildings, rocks and bushes. The Mac only uses the memory the game fills. Mod SDK modules\n"
+             "do not load while it is on. Takes effect after a restart.");
+        if (dist::more_memory_from_env()) note("Set by WWHD_MORE_MEMORY this run.");
+        else if (dist::more_memory_saved() != dist::more_memory()) {
+            warn("Restart the game to apply More memory.");
+            if (hostui::can_restart() && primary_button("Restart now##memory")) hostui::post([] { hostui::restart_game(); });
+        }
         if (ImGui::Button("Game's own view distances")) dist::reset();
         help("All of the above back to the game's own.");
         if (!en) note("WWHD_DISTANCE=off: the game's own view distances this run.");

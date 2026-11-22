@@ -151,7 +151,7 @@ uint64_t g_link_steps = 0;  // Link's full-pass executes since the last save-sta
 
 uint32_t actor_execute_fn(uint32_t proc) {
     uint32_t sub = ld32(proc + kSubMethod);
-    if (sub < 0x10000000 || sub >= 0x50000000) return 0;
+    if (sub < 0x10000000 || sub >= mem::mem2_end()) return 0;
     return ld32(sub + 8);
 }
 
@@ -316,7 +316,7 @@ bool cam_has_nan(uint32_t proc) {
 }
 bool is_camera(uint32_t proc) {
     uint32_t m = ld32(proc + kCamMtd);
-    return m >= 0x10000000 && m < 0x50000000 && ld32(m + 8) == kCameraExecute;
+    return m >= 0x10000000 && m < mem::mem2_end() && ld32(m + 8) == kCameraExecute;
 }
 
 // step length a process executes with on this pass
@@ -473,9 +473,9 @@ void link_preview_begin(uint32_t proc) {
         if (sz) region_begin(g_snap.regions[3], lo, sz);
     }
     uint32_t h = ld32(proc + kActorHeap);
-    if (h >= mem::kMem2Start && h < mem::kMem2End) {
+    if (h >= mem::kMem2Start && h < mem::mem2_end()) {
         uint32_t start = ld32(h + 0x8), size = ld32(h + 0x20) & ~3u;
-        if (start >= mem::kMem2Start && (start & 3) == 0 && size > 0 && size <= 0x200000 && start + size <= mem::kMem2End)
+        if (start >= mem::kMem2Start && (start & 3) == 0 && size > 0 && size <= 0x200000 && start + size <= mem::mem2_end())
             region_begin(g_snap.regions[2], h, start + size - h);  // (from the heap object: its allocation state too)
     }
     static bool warned = false;
@@ -1180,7 +1180,7 @@ extern "C" void hook_025DF904(Cpu* c) {
         // its culling matrix (fopAc_ac_c +0x348, the model's base matrix: fopAcM_cullingCheck 025D6D08),
         // which some draws set (spinning rupees): the next full pass culls with the previous step's
         cull_mtx = ld32(proc + 0x348);
-        if (cull_mtx >= mem::kMem2Start && cull_mtx < mem::kMem2End && (cull_mtx & 3) == 0)
+        if (cull_mtx >= mem::kMem2Start && cull_mtx < mem::mem2_end() && (cull_mtx & 3) == 0)
             memcpy(cull_before, ppc_ptr(cull_mtx), 0x30);
         else
             cull_mtx = 0;
@@ -1226,12 +1226,12 @@ extern "C" void hook_025DF904(Cpu* c) {
         auto entered_packet = [&](uint32_t i) {
             if (i * 4 < 0x94) return false;
             uint32_t slot = __builtin_bswap32(cur[i]);
-            if (slot < mem::kMem2Start || slot >= mem::kMem2End || (slot & 3)) return false;
+            if (slot < mem::kMem2Start || slot >= mem::mem2_end() || (slot & 3)) return false;
             uint32_t pkt = proc + 4 * i - 0x94;
             uint32_t q = ld32(slot);
             for (int n = 0; q && n < 4096; n++) {
                 if (q == pkt) return true;
-                if (q < mem::kMem2Start || q >= mem::kMem2End || (q & 3)) return false;
+                if (q < mem::kMem2Start || q >= mem::mem2_end() || (q & 3)) return false;
                 q = ld32(q + 0x10);
             }
             return false;
