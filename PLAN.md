@@ -974,7 +974,7 @@ better").
   Left on a slider no longer leaves the page (`PaneFocus::keep_left`). Not play-tested with a controller yet.
 - Frame time and CPU % at the higher settings not measured.
 
-### 2026-11-22: More memory (Settings > Graphics > View distance; not play-tested)
+### 2026-11-22: More memory (Settings > Graphics > View distance; play-tested: works)
 - Cemu's Extended Memory pack (Mods/ExtendedMemory, CC0) as a boot-time switch (host setting moreMemory,
   WWHD_MORE_MEMORY=0/1 for a run). On: MEM2 0x10000000-0xA0000000 (OSGetMemBound, the default heap and the GPU
   mapping follow), overlay arena 0xA0000000 + 0x40000000, and the pack's 27 heap sizes (main game heap +1.25 GiB,
@@ -986,7 +986,8 @@ better").
   bucket's GPU mapping). Data-import storage moved from 0xC1000000 (inside the larger overlay arena) to 0xF6000000
   for both layouts (`DATA_IMPORT_BASE`, recomp.py). Import and host-function numbers (0xC0000000, 0xC2000000) are
   call targets only, never memory. The Mod SDK region 0x7F000000 is inside MEM2, so no SDK module loads with it on.
-- Host footprint, frame time and CPU % with it on: not measured yet.
+- Play-tested 2026-11-22: works. Log of that run: OSGetMemBound(2) 105DC000 size 8FA24000, overlay arena
+  A0000000 size 40000000, 68k+ frames without a fault. Host footprint, frame time and CPU % at 2x / 1.5x not measured.
 
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
