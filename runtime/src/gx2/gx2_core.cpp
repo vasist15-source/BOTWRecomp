@@ -41,6 +41,7 @@
 #include "gfx/renderer.h"
 #include "platform/perf_hint.h"
 #include "render_prof.h"
+#include "draw_run_census.h"
 
 using namespace Latte;
 
@@ -589,6 +590,18 @@ static void execute_op(Op op, const uint32* p, uint32 n);
 // calls are not timed themselves: their ops are
 static void execute_one(Op op, const uint32* p, uint32 n) {
     rprof::Op kind;
+    if (run_census::on()) [[unlikely]] {  // (diagnostics, WWHD_DRAW_RUN_CENSUS=1: draw_run_census.h)
+        if (op == OP_SET_REGS || op == OP_SET_PROJ_REGS) {
+            if (n && p[0] < kNumRegs && n - 1 <= kNumRegs - p[0]) run_census::regs(g_regs, p[0], p + 1, n - 1);
+        } else if (op == OP_DRAW || op == OP_DRAW_INDEXED) {
+            run_census::draw(g_regs, op, p, n, op == OP_DRAW_INDEXED);
+        } else if (op == OP_SWAP) {
+            run_census::other_op(op);
+            run_census::frame_end();
+        } else if (op != OP_NOP && op != OP_CALL && op != OP_FENCE) {
+            run_census::other_op(op);
+        }
+    }
     switch (op) {
     case OP_CALL: execute_op(op, p, n); return;
     case OP_SET_REGS: case OP_SET_PROJ_REGS: kind = rprof::kOpRegs; break;
