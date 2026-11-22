@@ -34,6 +34,12 @@ extern "C" uint64_t wwhd_query_counts(uint64_t* conditional);  // gx2_core.cpp
 
 // texture invalidation statistics (see invalidate, note_surface_range)
 static uint64_t g_inval_texture = 0, g_inval_passed = 0, g_pages_marked = 0;
+namespace gx2 {  // (gx2_core.cpp: index runs, draw_runs.h; render thread)
+bool index_runs_on();
+void index_runs_set(bool on);
+void index_runs_totals(uint64_t& runs, uint64_t& pieces, uint64_t& copied, uint64_t& refused);
+}  // namespace gx2
+
 namespace gfx {
 Renderer R;
 // GPU depth peeks for the game's sun visibility test (fork 73b54e1, Metal adaptation).
@@ -1266,6 +1272,9 @@ void pass_timing_arm(double lastFrameMs);
 //     inline, program hashes found through a small table) or the old paths, with the shader lookups each
 //     stage made (the generation's fast path, full lookups, and those that found the previous draw's
 //     shader again).
+//   WWHD_INDEX_RUNS_AB=1 ([index-ab]): index runs (gx2 draw_runs.h: consecutive indexed lists and strips with no state
+//     change drawn as one draw) on or off, with the runs, the draws in them, the runs whose indices were copied and
+//     those refused (drawn piece by piece).
 // Each line: process CPU, frame time, render thread CPU time, the encoding thread's busy time (executing
 // records) and CPU time (its waits included), GPU busy and the span from a frame's first GPU start to its
 // last end, command buffers and draws, how often the encoding thread was woken and slept, and the render
@@ -1289,7 +1298,7 @@ extern uint64_t g_tex_checks_all, g_tex_gpu_checks_all, g_tex_unarmed_all, g_tex
     g_tex_hash_ns_all, g_tex_uploads_all;
 extern uint64_t g_tex_write_checks_all, g_tex_partial_all, g_tex_pieces_all, g_tex_upload_bytes_all, g_tex_decode_ns_all;
 static void ab_frame() {
-    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES, AB_PARTIAL, AB_LOOKUP, AB_RT_TRIM };
+    enum { AB_NONE, AB_BUFFERS, AB_ENCODE, AB_TEXTURES, AB_PARTIAL, AB_LOOKUP, AB_RT_TRIM, AB_INDEX_RUNS };
     static const int ab = [] {
         auto on = [](const char* name) { const char* e = getenv(name); return e && !strcmp(e, "1"); };
         return on("WWHD_ENCODE_AB")    ? AB_ENCODE
@@ -1298,6 +1307,7 @@ static void ab_frame() {
                : on("WWHD_PARTIAL_AB") ? AB_PARTIAL
                : on("WWHD_LOOKUP_AB")  ? AB_LOOKUP
                : on("WWHD_RT_TRIM_AB") ? AB_RT_TRIM
+               : on("WWHD_INDEX_RUNS_AB") ? AB_INDEX_RUNS
                                        : AB_NONE;
     }();
     if (ab == AB_NONE || (ab == AB_ENCODE && !g_eq)) return;
@@ -1319,9 +1329,10 @@ static void ab_frame() {
         uint64_t frame, gpuNs, spanNs, gpuFrames, encTicks, encCpuNs, cmds, draws, wakes, encSleeps, syncs, syncNs, rtSleeps;
         uint64_t faults, protectedPages, texChecks, gpuChecks, unarmed, became, hashed, hashNs, uploads;
         uint64_t writeChecks, partial, pieces, upBytes, decodeNs;
-        uint64_t guestNs, cycles, instructions;
+        uint64_t guestNs, cycles, instructions, energyNj;
         objtable::Counts lookups;
         ShaderLookups shaders;
+        uint64_t runs, runPieces, runCopied, runRefused;
     };
     auto take = [] {
         Mark m;
@@ -1359,12 +1370,14 @@ static void ab_frame() {
         m.upBytes = g_tex_upload_bytes_all;
         m.decodeNs = g_tex_decode_ns_all;
         m.guestNs = objtable::guest_cpu_ns();
-        rusage_info_v4 ri{};
-        const bool riOk = proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t*)&ri) == 0;
+        rusage_info_v6 ri{};
+        const bool riOk = proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t*)&ri) == 0;
         m.cycles = riOk ? ri.ri_cycles : 0;
+        m.energyNj = riOk ? ri.ri_energy_nj : 0;
         m.instructions = riOk ? ri.ri_instructions : 0;
         m.lookups = objtable::counts();
         m.shaders = shader_lookups();
+        gx2::index_runs_totals(m.runs, m.runPieces, m.runCopied, m.runRefused);
         return m;
     };
     static Mark start = take();
@@ -1441,6 +1454,21 @@ static void ab_frame() {
             over25, over45, longest, secs, ++window);
         g_rt_trim = !g_rt_trim;
         rt_trim_applied(g_rt_trim);
+        over25 = over45 = 0;
+        longest = 0;
+        start = now;
+        return;
+    }
+    if (ab == AB_INDEX_RUNS) {
+        LOG("[index-ab] %s: %.0f%% CPU, %.2f ms/frame, render thread %.2f ms/frame, GPU busy %.2f ms/frame, %.0f draws/frame; "
+            "index runs per frame %.1f of %.1f draws (%.1f copied, %.1f refused); %.2f mJ/frame; %u frames over 25 ms, %u over "
+            "45 ms, longest %.0f ms (%.1f s, window %d)",
+            gx2::index_runs_on() ? "runs" : "off", 100 * (now.cpu - start.cpu) / secs, 1000 * secs / frames,
+            1000 * (now.rt - start.rt) / frames, (now.gpuNs - start.gpuNs) / 1e6 / gpuFrames, (now.draws - start.draws) / frames,
+            (now.runs - start.runs) / frames, (now.runPieces - start.runPieces) / frames, (now.runCopied - start.runCopied) / frames,
+            (now.runRefused - start.runRefused) / frames, (now.energyNj - start.energyNj) / 1e6 / frames, over25, over45, longest,
+            secs, ++window);
+        gx2::index_runs_set(!gx2::index_runs_on());
         over25 = over45 = 0;
         longest = 0;
         start = now;

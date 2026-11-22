@@ -328,6 +328,7 @@ static inline uint32* record_space(Recording* rec, uint32 words) {
 }
 
 static void execute_one(Op op, const uint32* p, uint32 n);
+namespace draw_runs { inline void index_flush(); }  // (draw_runs.h)
 
 // ---------------------------------------------------------------- render thread
 // Like the real GPU, command execution runs asynchronously to the game: GX2 calls append to a
@@ -382,7 +383,10 @@ static void render_thread_main() {
         }
         {
             std::lock_guard<std::recursive_mutex> lk(g_exec_mutex);
-            render::with_autorelease_pool([] { execute(g_q_work.data(), (uint32)g_q_work.size()); });
+            render::with_autorelease_pool([] {
+                execute(g_q_work.data(), (uint32)g_q_work.size());
+                draw_runs::index_flush();  // (a held run drawn before waiting for more work)
+            });
         }
         g_q_work.clear();
     }
@@ -586,10 +590,13 @@ static bool lazy_draw_done() {
 }
 
 static void execute_op(Op op, const uint32* p, uint32 n);
+// index runs (draw_runs.h; on by default, WWHD_INDEX_RUNS=0 off, WWHD_INDEX_RUNS_AB=1 alternates)
+#include "draw_runs.h"
 // every op is counted and (sampled) timed for the render-thread profiler (render_prof.h); display-list
 // calls are not timed themselves: their ops are
 static void execute_one(Op op, const uint32* p, uint32 n) {
     rprof::Op kind;
+    if (draw_runs::g_index_on && draw_runs::before_op(op, p, n)) return;  // (draw_runs.h)
     if (run_census::on()) [[unlikely]] {  // (diagnostics, WWHD_DRAW_RUN_CENSUS=1: draw_run_census.h)
         if (op == OP_SET_REGS || op == OP_SET_PROJ_REGS) {
             if (n && p[0] < kNumRegs && n - 1 <= kNumRegs - p[0]) run_census::regs(g_regs, p[0], p + 1, n - 1);
@@ -817,6 +824,15 @@ using namespace gx2;
 // vsync at the current rate is a granule of 4/rate ticks, and every vsync count below is in ticks,
 // rounded to granules, so at 30/60 fps (granule 4) the timing is the 59.94 Hz one exactly.
 static uint64_t g_swap_count = 0, g_flip_count = 0;
+namespace gx2 {
+// index runs for the in-run A/B (render thread: metal_main.mm's ab_frame at the swap, after the swap flushed the run)
+bool index_runs_on() { return draw_runs::g_index_on; }
+void index_runs_set(bool on) { draw_runs::g_index_on = on; }
+void index_runs_totals(uint64_t& runs, uint64_t& pieces, uint64_t& copied, uint64_t& refused) {
+    runs = draw_runs::g_stats.runs, pieces = draw_runs::g_stats.pieces, copied = draw_runs::g_stats.copied,
+    refused = draw_runs::g_stats.refused;
+}
+}  // namespace gx2
 namespace gx2 { uint64_t flips_presented() { return __atomic_load_n(&g_flip_count, __ATOMIC_RELAXED); } }  // live fps in the title
 namespace gx2 { uint64_t game_frames() { return __atomic_load_n(&g_swap_count, __ATOMIC_RELAXED); } }  // frames the game submitted
 static uint32 g_swap_interval = 1;  // as set by the game (frame interpolation halves it)

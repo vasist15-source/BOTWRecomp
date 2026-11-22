@@ -2883,7 +2883,7 @@ static bool expand_indices(uint32_t prim, uint32_t count, bool indexed, Idx idx,
 static bool build_indices(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, std::vector<uint32_t>& out,
                           MTLPrimitiveType& type) {
     if (!indexAddr) return expand_indices(prim, count, false, [](uint32_t i) { return i; }, out, type);
-    const uint8_t* p = mem::ptr(indexAddr);
+    const uint8_t* p = render::g_host_indices ? render::g_host_indices : mem::ptr(indexAddr);  // (an index run's copy)
     switch (indexType) {
     case 0: return expand_indices(prim, count, true, [p](uint32_t i) -> uint32_t { return ((const uint16_t*)p)[i]; }, out, type);
     case 1: return expand_indices(prim, count, true, [p](uint32_t i) -> uint32_t { return ((const uint32_t*)p)[i]; }, out, type);
@@ -3883,7 +3883,7 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     if (idx16) {
         rprof::UploadKind uploads(rprof::kUpIndex);
         Upload idx16Buf = reserve(count * 2);
-        const uint16_t* src = (const uint16_t*)mem::ptr(indexAddr);
+        const uint16_t* src = (const uint16_t*)(render::g_host_indices ? render::g_host_indices : mem::ptr(indexAddr));
         uint16_t* dst = (uint16_t*)((uint8_t*)idx16Buf.buf.contents + idx16Buf.offset);
         if (indexType == 0) memcpy(dst, src, (size_t)count * 2);
         else for (uint32_t i = 0; i < count; i++) dst[i] = __builtin_bswap16(src[i]);

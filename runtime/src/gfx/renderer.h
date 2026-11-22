@@ -111,6 +111,9 @@ bool restart();
 // ---- dispatch
 // base instance of the draw being issued (GX2DrawIndexedEx2); 0 otherwise. Metal only so far.
 inline uint32_t g_base_instance = 0;
+// the draw's indices in host memory, in the guest's index format (gx2 draw_runs.h: a run's copied indices); nullptr:
+// read them at indexAddr. Metal only.
+inline const uint8_t* g_host_indices = nullptr;
 inline void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
                  uint32_t baseVertex, uint32_t instances) {
     g_backend->draw(regs, prim, count, indexType, indexAddr, baseVertex, instances);

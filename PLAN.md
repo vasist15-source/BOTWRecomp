@@ -989,6 +989,20 @@ better").
 - Play-tested 2026-11-22: works. Log of that run: OSGetMemBound(2) 105DC000 size 8FA24000, overlay arena
   A0000000 size 40000000, 68k+ frames without a fault. Host footprint, frame time and CPU % at 2x / 1.5x not measured.
 
+### 2026-11-23: index runs (Metal; on by default; play-tested: picture fine)
+- Draw-run census (`WWHD_DRAW_RUN_CENSUS=1`, `gx2/draw_run_census.h`): upstream's instanced rule (draws differing only in
+  VS uniform block addresses) joins ~1 draw/frame in BotW, so only the index runs were ported (ZeldaWWHDRecomp
+  546255ba, `gx2/draw_runs.h`). Consecutive indexed triangle lists/strips (same primitive, index type, base vertex and
+  base instance, one instance) with no register value changed and no command between them become one draw: one
+  contiguous range, or the indices copied into host scratch that metal_draw reads (`render::g_host_indices`; no guest
+  ring). Strips are joined with zero-area triangles at each piece's parity. Non-indexed lists whose vertices follow on
+  are joined too. Breakers: changed register writes, every other op (fences, invalidates, queries...), the end of a
+  render-thread batch; no runs with a geometry shader or stream out on; a restart index in a strip draws piece by piece.
+- Town A/B (`WWHD_INDEX_RUNS_AB=1`, 7 on / 8 off windows, 60 fps cap): draws 4,230 -> 3,730/frame (~670 draws in ~172
+  runs, 69 copied, 0 refused), render thread 6.65 -> 6.47 ms/frame (lower in 7 of 7), GPU busy 13.74 -> 13.49 ms,
+  CPU 200 -> 199 % and 102.6 -> 102.4 mJ/frame (noise). Joins ~500/frame vs the census's 700 (fences break runs here).
+  `WWHD_INDEX_RUNS=0` turns them off.
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
