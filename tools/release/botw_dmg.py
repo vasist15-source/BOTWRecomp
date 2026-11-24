@@ -97,6 +97,11 @@ def build_kit(version, work):
             out_link.append("@KIT@/lib/" + a)
         elif a.endswith("/libz.tbd"):
             out_link.append("-lz")
+        elif a.startswith(os.path.join(ROOT, "runtime", "data", "controllers") + "/") and a.endswith(".heic"):
+            # a controller picture linked in as a section (-sectcreate __PADS): shipped in the kit
+            os.makedirs(os.path.join(kit, "data", "controllers"), exist_ok=True)
+            shutil.copy2(a, os.path.join(kit, "data", "controllers", os.path.basename(a)))
+            out_link.append("@KIT@/data/controllers/" + os.path.basename(a))
         elif a.startswith("/") or a.startswith("-isysroot"):
             raise SystemExit("unexpected absolute path in the link line: " + a)
         else:
@@ -136,6 +141,7 @@ def check_package(res):
                          r"tools/botw_code_mods\.py|tools/cemu_patches\.py|tools/rpx\.py|"
                          r"tools/recomp/(analyze|builds|ppc2c|recomp|crlive|leaflocal)\.py|tools/recomp/builds/[a-z]+\.json|"
                          r"kit/kit\.json|kit/lib/lib(botw_runtime|cemu_latte|imgui)\.a|kit/include/[a-z_]+\.h|"
+                         r"kit/data/controllers/[a-z0-9]+\.heic|"
                          r"LICENSE|README\.md)$")
     bad = [os.path.relpath(os.path.join(d, n), res) for d, _, ns in os.walk(res) for n in ns]
     bad = [p for p in bad if not allowed.match(p)]

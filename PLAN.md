@@ -1003,6 +1003,14 @@ better").
   CPU 200 -> 199 % and 102.6 -> 102.4 mJ/frame (noise). Joins ~500/frame vs the census's 700 (fences break runs here).
   `WWHD_INDEX_RUNS=0` turns them off.
 
+### 2026-11-24: release 0.4.0: view distance, More memory, controller pictures, time played
+- BOTWRecomp-0.4.0.dmg (6,539,688 bytes, tag v0.4.0): everything since 0.3.1 (view distance sliders, More memory,
+  Controls page pictures, Settings with a controller, time played, the play report lock, index runs, the SDK 26
+  build fix of issue #6). The kit now carries the controller pictures (`kit/data/controllers/*.heic`, linked as
+  `__PADS` sections from `@KIT@`); the first build stopped on their absolute paths in the link line. The player's path
+  from the DMG in a scratch home with an empty environment: installed in 390 s, the binary has all four `__PADS`
+  sections at their file sizes. The Steam Input pad (5ead565) is still unplayed (no Steam Controller).
+
 ## Audio investigation (parked 2026-10-11)
 Symptom: no world audio. AX stats (`WWHD_AX_STATS=1`): zero voices ever acquired outside the menu.
 Menu cursor sounds untested.
