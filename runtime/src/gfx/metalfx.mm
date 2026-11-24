@@ -559,9 +559,15 @@ bool frame(float boxW, float boxH, Picture* real, Picture* mid) {
         fi.jitterOffsetY = 0.0f;
         fi.shouldResetHistory = NO;
         // macOS 27: the region to interpolate (left at 0 it is empty, and the output is a copy of the colour)
+        // (an older SDK, building from source, doesn't declare them: set by name, issue #6)
         if (@available(macOS 27.0, *)) {
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
             fi.contentWidth = picW;
             fi.contentHeight = picH;
+#else
+            [(id)fi setValue:@(picW) forKey:@"contentWidth"];
+            [(id)fi setValue:@(picH) forKey:@"contentHeight"];
+#endif
         }
         [fi encodeToCommandBuffer:command_buffer()];
     }
